@@ -69,6 +69,7 @@ func (w *webAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, 
 	resp, err := w.client.GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{
 		ChannelID: req.Channel,
 		Oldest:    req.Oldest,
+		Latest:    req.Latest,
 		Cursor:    req.Cursor,
 		Limit:     req.Limit,
 	})
@@ -79,21 +80,68 @@ func (w *webAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, 
 	page := HistoryPage{
 		Messages:   make([]candidate, 0, len(resp.Messages)),
 		NextCursor: resp.ResponseMetaData.NextCursor,
+		HasMore:    resp.HasMore,
 	}
 	for _, m := range resp.Messages {
-		page.Messages = append(page.Messages, candidate{
-			// history results are scoped to the requested channel, and
-			// Slack does not echo it back on each message.
-			Channel:  req.Channel,
-			User:     m.User,
-			BotID:    m.BotID,
-			SubType:  m.SubType,
-			Text:     m.Text,
-			TS:       m.Timestamp,
-			ThreadTS: m.ThreadTimestamp,
-		})
+		page.Messages = append(page.Messages, toCandidate(req.Channel, m))
 	}
 	return page, nil
+}
+
+func (w *webAPI) Replies(ctx context.Context, req RepliesRequest) (HistoryPage, error) {
+	msgs, hasMore, nextCursor, err := w.client.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
+		ChannelID: req.Channel,
+		Timestamp: req.ThreadTS,
+		Oldest:    req.Oldest,
+		Latest:    req.Latest,
+		Limit:     req.Limit,
+	})
+	if err != nil {
+		return HistoryPage{}, fmt.Errorf("conversations.replies: %w", err)
+	}
+
+	page := HistoryPage{
+		Messages:   make([]candidate, 0, len(msgs)),
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	}
+	for _, m := range msgs {
+		page.Messages = append(page.Messages, toCandidate(req.Channel, m))
+	}
+	return page, nil
+}
+
+// UserName prefers the name the person chose to show over their real name,
+// and falls back to the ID so a caller always has something to print.
+func (w *webAPI) UserName(ctx context.Context, userID string) (string, error) {
+	user, err := w.client.GetUserInfoContext(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("users.info: %w", err)
+	}
+
+	for _, name := range []string{user.Profile.DisplayName, user.Profile.RealName, user.RealName, user.Name} {
+		if name != "" {
+			return name, nil
+		}
+	}
+	return userID, nil
+}
+
+// toCandidate normalises a Web API message. The channel is passed in because
+// results are scoped to the channel that was asked for, and Slack does not
+// echo it back on each message.
+func toCandidate(channel string, m slack.Message) candidate {
+	return candidate{
+		Channel:    channel,
+		User:       m.User,
+		BotID:      m.BotID,
+		SubType:    m.SubType,
+		Text:       m.Text,
+		TS:         m.Timestamp,
+		ThreadTS:   m.ThreadTimestamp,
+		Username:   m.Username,
+		ReplyCount: m.ReplyCount,
+	}
 }
 
 func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (string, error) {

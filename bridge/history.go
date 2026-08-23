@@ -1,0 +1,227 @@
+package bridge
+
+import (
+	"context"
+	"log"
+	"sort"
+	"sync"
+)
+
+// Bounds on one slack_history read. The default is a screenful of
+// conversation; the ceiling is Slack's own page size, and also about as much
+// channel text as is worth putting into a model's context in one go.
+const (
+	MinHistoryLimit     = 1
+	MaxHistoryLimit     = 200
+	DefaultHistoryLimit = 50
+)
+
+// ReadRequest is what slack_history asks for. Every field is optional.
+type ReadRequest struct {
+	// Limit caps how many messages come back, newest-end first if the window
+	// holds more.
+	Limit int
+	// Oldest and Latest bound the window, as Slack timestamps.
+	Oldest string
+	Latest string
+	// ThreadTS reads that thread's replies instead of the channel surface.
+	ThreadTS string
+}
+
+// HistoryMessage is one message as slack_history reports it. Unlike Message,
+// which is the relay's shape and only ever carries the owner, this describes
+// whoever wrote it — including bots and incoming webhooks.
+type HistoryMessage struct {
+	TS string `json:"ts"`
+	// User is the author's Slack user ID, absent on webhook posts that have no
+	// user behind them.
+	User string `json:"user,omitempty"`
+	// UserName is the name a person would recognise, resolved from the ID or
+	// taken from the name a bot posted under. It falls back to the raw ID.
+	UserName string `json:"user_name"`
+	Text     string `json:"text"`
+	ThreadTS string `json:"thread_ts,omitempty"`
+	// Bot marks a post written by an app rather than a person.
+	Bot bool `json:"bot"`
+	// ReplyCount is set on messages that have a thread hanging off them, so
+	// the caller knows there is more to read behind this one.
+	ReplyCount int `json:"reply_count,omitempty"`
+}
+
+// HistoryResult is what slack_history returns.
+type HistoryResult struct {
+	Messages []HistoryMessage `json:"messages"`
+	// HasMore reports that the window was cut short, either by Slack or by the
+	// limit.
+	HasMore bool `json:"has_more"`
+}
+
+// History reads the channel — or one thread of it — and returns what everyone
+// said, not just the owner.
+//
+// It exists for the one thing the relay cannot do: the owner asks the agent to
+// read a discussion it was not part of. That makes it deliberately inert. It
+// does not move the cursor, does not touch the pending backlog, does not start
+// or stop the indicator, and does not react to anything. Calling it changes
+// nothing about what the next slack_wait will deliver.
+func (b *Bridge) History(ctx context.Context, req ReadRequest) (HistoryResult, error) {
+	api, channel, err := b.apiForCall()
+	if err != nil {
+		return HistoryResult{}, err
+	}
+
+	limit := clampHistoryLimit(req.Limit)
+
+	var page HistoryPage
+	if req.ThreadTS != "" {
+		page, err = api.Replies(ctx, RepliesRequest{
+			Channel:  channel,
+			ThreadTS: req.ThreadTS,
+			Oldest:   req.Oldest,
+			Latest:   req.Latest,
+			Limit:    limit,
+		})
+	} else {
+		page, err = api.History(ctx, HistoryRequest{
+			Channel: channel,
+			Oldest:  req.Oldest,
+			Latest:  req.Latest,
+			Limit:   limit,
+		})
+	}
+	if err != nil {
+		return HistoryResult{}, err
+	}
+
+	messages := page.Messages
+	hasMore := page.HasMore
+	// Slack's own limit is a request, not a promise, and conversations.replies
+	// counts the parent message against it. Trimming here keeps the contract
+	// the tool advertises.
+	if len(messages) > limit {
+		messages = messages[:limit]
+		hasMore = true
+	}
+
+	result := HistoryResult{
+		Messages: b.describe(ctx, api, messages),
+		HasMore:  hasMore,
+	}
+	return result, nil
+}
+
+// describe turns raw messages into the reported form, oldest first, resolving
+// each distinct author's name once.
+func (b *Bridge) describe(ctx context.Context, api API, messages []candidate) []HistoryMessage {
+	// A name Slack refuses this time is not worth asking about again within
+	// the same call; the shared cache keeps only the answers that worked, so a
+	// scope granted later still takes effect without a restart.
+	failed := make(map[string]bool)
+
+	out := make([]HistoryMessage, 0, len(messages))
+	for _, m := range messages {
+		if m.TS == "" {
+			continue
+		}
+		out = append(out, HistoryMessage{
+			TS:         m.TS,
+			User:       m.User,
+			UserName:   b.authorName(ctx, api, m, failed),
+			Text:       m.Text,
+			ThreadTS:   m.ThreadTS,
+			Bot:        m.BotID != "" || m.SubType == "bot_message",
+			ReplyCount: m.ReplyCount,
+		})
+	}
+
+	sort.SliceStable(out, func(i, j int) bool { return tsLess(out[i].TS, out[j].TS) })
+	return out
+}
+
+// authorName works out what to call whoever wrote a message.
+func (b *Bridge) authorName(ctx context.Context, api API, m candidate, failed map[string]bool) string {
+	// A webhook post has no user to look up and carries the name it wants to
+	// be shown under, which is the only name there is.
+	if m.Username != "" {
+		return m.Username
+	}
+	if m.User == "" {
+		if m.BotID != "" {
+			return m.BotID
+		}
+		return "unknown"
+	}
+	if failed[m.User] {
+		return m.User
+	}
+
+	name, err := b.names().lookup(ctx, api, m.User)
+	if err != nil {
+		// Most likely the users:read scope is missing, which is a setup
+		// choice rather than a fault: the IDs are still readable, so the tool
+		// keeps working with them.
+		failed[m.User] = true
+		log.Printf("could not resolve a display name, using the user ID: %s", logSafe(err.Error(), maxLoggedError))
+		return m.User
+	}
+	return name
+}
+
+// names returns the bridge's display-name cache, creating it on first use.
+func (b *Bridge) names() *nameCache {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.nameCache == nil {
+		b.nameCache = &nameCache{names: make(map[string]string)}
+	}
+	return b.nameCache
+}
+
+// nameCache remembers user IDs the bridge has already resolved. Display names
+// change rarely, a session is short-lived, and the alternative is a users.info
+// call per message in a busy channel.
+type nameCache struct {
+	mu    sync.Mutex
+	names map[string]string
+}
+
+// lookup returns the cached name or fetches it. Two callers racing on the same
+// unknown ID both fetch, which costs one extra call and keeps the Slack round
+// trip out from under the lock.
+func (c *nameCache) lookup(ctx context.Context, api API, userID string) (string, error) {
+	c.mu.Lock()
+	name, ok := c.names[userID]
+	c.mu.Unlock()
+	if ok {
+		return name, nil
+	}
+
+	name, err := api.UserName(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if name == "" {
+		name = userID
+	}
+
+	c.mu.Lock()
+	c.names[userID] = name
+	c.mu.Unlock()
+	return name, nil
+}
+
+// clampHistoryLimit keeps a caller's limit inside the supported range rather
+// than rejecting it, the way the wait timeout is handled.
+func clampHistoryLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return DefaultHistoryLimit
+	case limit < MinHistoryLimit:
+		return MinHistoryLimit
+	case limit > MaxHistoryLimit:
+		return MaxHistoryLimit
+	default:
+		return limit
+	}
+}

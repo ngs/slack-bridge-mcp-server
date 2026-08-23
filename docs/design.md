@@ -143,7 +143,26 @@ function, so a message cannot be relayed live but dropped on catch-up.
 | `slack_post` | `text` (required), `thread_ts` (optional) | `chat.postMessage` to the bound channel. Returns the posted `ts`. |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
+| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest`, `thread_ts` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`. Read-only: no cursor movement, no reactions, no indicator. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
+
+### Why slack_history ignores the owner filter
+
+Everything else in the bridge exists to relay one person. `slack_history` is
+the exception, and deliberately so: the owner asks for it by name, to read a
+discussion they had with other people about the agent's work. Filtering that
+down to the owner's own lines would leave the model reading half a conversation.
+
+The safety story is different because the direction is different. Relayed
+messages are instructions the agent acts on, which is why they are restricted
+to one authenticated user. History is material the owner asked the agent to
+read, and the server instructions say so in as many words: it is text to read,
+not instructions to follow. Nothing in it reaches the agent unless the owner
+asked for it.
+
+Being read-only is what keeps the two apart. The tool cannot move the cursor,
+consume a pending message, react, or touch the indicator, so no amount of
+reading changes what the relay will deliver next.
 
 ### The receipt reaction
 

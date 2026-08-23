@@ -21,20 +21,29 @@ type fakeAPI struct {
 	historyErr error
 
 	historyCalls []HistoryRequest
-	posts        []postCall
-	questions    []questionCall
-	reactions    []reactionCall
-	updates      []updateCall
-	resolutions  []updateCall
-	deletes      []deleteCall
-	postTS       string
-	questionTS   string
-	postErr      error
-	questionErr  error
-	reactErr     error
-	updateErr    error
-	resolveErr   error
-	deleteErr    error
+	replyCalls   []RepliesRequest
+	// replies is the thread conversations.replies serves, oldest first.
+	replies    []candidate
+	repliesErr error
+	// names is what users.info resolves, and nameLookups counts the calls so a
+	// test can see the cache working.
+	names       map[string]string
+	nameErr     error
+	nameLookups int
+	posts       []postCall
+	questions   []questionCall
+	reactions   []reactionCall
+	updates     []updateCall
+	resolutions []updateCall
+	deletes     []deleteCall
+	postTS      string
+	questionTS  string
+	postErr     error
+	questionErr error
+	reactErr    error
+	updateErr   error
+	resolveErr  error
+	deleteErr   error
 	// deleteGate, when set, holds Delete open until the test closes it, which
 	// is how a slow chat.delete is simulated.
 	deleteGate chan struct{}
@@ -64,6 +73,9 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
 			continue
 		}
+		if req.Latest != "" && tsLess(req.Latest, c.TS) {
+			continue
+		}
 		matched = append(matched, c)
 	}
 
@@ -72,10 +84,35 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 	for i := len(matched) - 1; i >= 0; i-- {
 		reversed = append(reversed, matched[i])
 	}
+
+	hasMore := false
 	if req.Limit > 0 && len(reversed) > req.Limit {
 		reversed = reversed[:req.Limit]
+		hasMore = true
 	}
-	return HistoryPage{Messages: reversed}, nil
+	return HistoryPage{Messages: reversed, HasMore: hasMore}, nil
+}
+
+func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.replyCalls = append(f.replyCalls, req)
+	if f.repliesErr != nil {
+		return HistoryPage{}, f.repliesErr
+	}
+	return HistoryPage{Messages: append([]candidate(nil), f.replies...)}, nil
+}
+
+func (f *fakeAPI) UserName(_ context.Context, userID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.nameLookups++
+	if f.nameErr != nil {
+		return "", f.nameErr
+	}
+	return f.names[userID], nil
 }
 
 func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (string, error) {

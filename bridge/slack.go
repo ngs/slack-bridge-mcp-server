@@ -7,14 +7,31 @@ import "context"
 type HistoryPage struct {
 	Messages   []candidate
 	NextCursor string
+	// HasMore reports that Slack held messages back from this page, which
+	// slack_history passes on so the caller knows it is reading a window
+	// rather than everything.
+	HasMore bool
 }
 
-// HistoryRequest asks for messages after Oldest, exclusive.
+// HistoryRequest asks for messages between Oldest and Latest, exclusive of
+// Oldest. Either bound may be empty.
 type HistoryRequest struct {
 	Channel string
 	Oldest  string
+	Latest  string
 	Cursor  string
 	Limit   int
+}
+
+// RepliesRequest asks for the replies to one thread.
+type RepliesRequest struct {
+	Channel string
+	// ThreadTS is the parent message's timestamp, which Slack also returns as
+	// the first message of the thread.
+	ThreadTS string
+	Oldest   string
+	Latest   string
+	Limit    int
 }
 
 // Question is the message slack_ask posts: one line of mrkdwn and one button
@@ -42,6 +59,10 @@ type QuestionOption struct {
 type API interface {
 	// History fetches one page of channel history.
 	History(ctx context.Context, req HistoryRequest) (HistoryPage, error)
+	// Replies fetches one thread, parent message included.
+	Replies(ctx context.Context, req RepliesRequest) (HistoryPage, error)
+	// UserName resolves a Slack user ID to the name a person would recognise.
+	UserName(ctx context.Context, userID string) (string, error)
 	// Post sends a message to a channel, optionally into a thread, and
 	// returns the timestamp of the posted message.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)

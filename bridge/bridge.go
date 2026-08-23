@@ -29,7 +29,7 @@ const (
 	maxHistoryPages  = 5
 )
 
-// Bridge owns the Slack connection and the message cursor. All five MCP tools
+// Bridge owns the Slack connection and the message cursor. All six MCP tools
 // go through it.
 type Bridge struct {
 	cfg       Config
@@ -64,6 +64,9 @@ type Bridge struct {
 	// is outstanding: a second question while one is pending is refused rather
 	// than queued, so a click is never ambiguous.
 	ask *pendingAsk
+	// nameCache holds display names resolved for slack_history. It has its own
+	// lock, so a users.info call never happens under b.mu.
+	nameCache *nameCache
 }
 
 // New returns a Bridge that connects on first use. cfg may be incomplete; the

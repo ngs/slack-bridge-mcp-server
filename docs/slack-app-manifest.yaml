@@ -2,7 +2,7 @@
 #
 # Create the app from this file at https://api.slack.com/apps → Create New App
 # → From an app manifest, and it arrives with Socket Mode on, interactivity
-# enabled, the three bot scopes the server actually calls, and the one message
+# enabled, the four bot scopes the server actually calls, and the one message
 # event it listens for.
 # You still have to generate the app-level token and install the app; see
 # docs/setup.md.
@@ -34,6 +34,9 @@ oauth_config:
       # reactions.add: the automatic receipt reaction on every delivered
       # message, and whatever slack_ack asks for on top of it.
       - reactions:write
+      # users.info, which turns the user IDs in slack_history results into
+      # names. Optional in practice: without it the tool falls back to IDs.
+      - users:read
 settings:
   event_subscriptions:
     bot_events:

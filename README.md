@@ -61,9 +61,9 @@ brew install ngs/tap/slack-bridge-mcp-server   # or: go install go.ngs.io/slack-
 ```
 
 Create a Slack app with Socket Mode and interactivity on, an app-level token
-with `connections:write`, the bot scopes `chat:write`, `groups:history` and
-`reactions:write`, and the `message.groups` bot event. Install it, invite it to
-a private channel, and set the four variables below.
+with `connections:write`, the bot scopes `chat:write`, `groups:history`,
+`reactions:write` and `users:read`, and the `message.groups` bot event. Install
+it, invite it to a private channel, and set the four variables below.
 
 ## Configuration
 
@@ -131,11 +131,29 @@ problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 | `slack_post` | `text` (required), `thread_ts` (optional) | The posted `ts` |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
+| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest`, `thread_ts` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
 `timed_out: true` result is not an error — just call it again.
+
+## Reading the channel
+
+`slack_wait` relays only your messages, which is the right rule for a relay and
+the wrong one for "summarise what we decided up there". `slack_history` is the
+other mode: ask the agent to read the channel and it gets everything, including
+the colleagues, the bots and the incoming webhooks, with display names resolved
+and a `reply_count` pointing at any thread worth opening (`thread_ts` reads
+that thread).
+
+It is strictly a read. It does not consume anything `slack_wait` would have
+delivered, does not move the cursor, does not react, and does not disturb the
+indicator — calling it changes nothing except what the model knows.
+
+Names come from `users.info`, which needs the `users:read` scope. Without it
+the tool still works and shows raw user IDs, so an app installed before this
+existed keeps working until it suits you to reinstall it with the scope.
 
 ## Receipt and progress
 
@@ -222,7 +240,7 @@ Then message the channel from anywhere.
 ## Manual smoke test
 
 With the binary built, this drives the MCP handshake by hand and should list
-the five tools. It needs no Slack credentials, since nothing connects until
+the six tools. It needs no Slack credentials, since nothing connects until
 `slack_wait` is called:
 
 ```sh
