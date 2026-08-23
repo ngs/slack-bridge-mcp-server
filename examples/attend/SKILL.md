@@ -28,6 +28,12 @@ not a reason to end the session — go back to waiting.
 
 ## Replying
 
+Messages do not only come from the home channel. The owner can also open a
+conversation by mentioning the app in any other channel it has joined, and from
+then on that thread reaches you too; every message carries the `channel` it
+came from. Reply into that channel's thread, never back in the home channel —
+which keeps working as it always has, with no mention needed.
+
 Pass the message's `channel` back, and its `thread_ts` if it has one. That is
 what puts your answer under the message it answers instead of on the channel
 surface. When the message has no `thread_ts`, its own `ts` is the thread to
