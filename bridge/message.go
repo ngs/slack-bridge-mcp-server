@@ -23,19 +23,53 @@ type Message struct {
 	Channel string `json:"channel"`
 	// User is the Slack user ID of the author. Always the configured owner.
 	User string `json:"user"`
-	// Text is the message body as Slack stores it (mrkdwn source).
+	// Text is the message body as Slack stores it (mrkdwn source). An upload
+	// with no caption has none, in which case Files is what the message says.
 	Text string `json:"text"`
+	// Files describes what the owner attached, and is absent from the message
+	// they did not attach anything to. The bridge does not download anything:
+	// the caller decides whether an attachment is worth fetching, and fetches
+	// it itself from URLPrivate.
+	Files []File `json:"files,omitempty"`
+}
+
+// File is one attachment, as metadata. Only the fields a caller can act on are
+// carried: what it is called, what it is, how big it is, and the two links —
+// one to the bytes, one to the message in Slack. Slack's own file object has
+// forty more fields, thumbnails and preview HTML among them, and putting those
+// in front of a model would cost more context than the attachment is worth.
+type File struct {
+	Name     string `json:"name,omitempty"`
+	Mimetype string `json:"mimetype,omitempty"`
+	// Size is the file's length in bytes.
+	Size int `json:"size,omitempty"`
+	// URLPrivate is where the bytes are, and it is not a public link: fetching
+	// it needs the bot token in an Authorization header and the files:read
+	// scope. Without the scope the request lands on a login page instead of
+	// the file.
+	URLPrivate string `json:"url_private,omitempty"`
+	// Permalink is the link a person opens in Slack, useful for pointing the
+	// owner back at their own attachment.
+	Permalink string `json:"permalink,omitempty"`
 }
 
 // allowedSubtypes are the message subtypes the bridge relays. A plain channel
 // message and a plain thread reply both carry no subtype at all;
 // thread_broadcast is a thread reply that the author also sent to the channel,
-// which is still owner-authored text and worth relaying. Everything else
-// (message_changed, message_deleted, channel_join, bot_message, file_share
-// notices and so on) is either not new text or not the owner speaking.
+// and file_share is the owner attaching something, with or without a caption.
+// All three are the owner speaking. Everything else (message_changed,
+// message_deleted, channel_join, bot_message and so on) is either not new text
+// or not the owner.
+//
+// file_share is a live-stream concern more than a history one: the message
+// event for an upload carries the subtype, while the same message read back
+// from conversations.history carries no subtype at all and only the files
+// array. Accepting both shapes is what keeps an upload from being relayed by
+// one path and dropped by the other.
 var allowedSubtypes = map[string]bool{
 	"":                 true,
 	"thread_broadcast": true,
+	"file_share":       true,
 }
 
 // candidate is the common shape of a message arriving from either source: the
@@ -61,6 +95,9 @@ type candidate struct {
 	// thread. It is how catch-up spots a thread that has been talked in since
 	// the cursor was last moved, without reading every thread in the channel.
 	LatestReply string
+	// Files are the attachments the message carries, already narrowed to the
+	// fields the bridge reports.
+	Files []File
 }
 
 // accept reports whether the candidate is owner text worth relaying, returning
@@ -88,7 +125,12 @@ func accept(c candidate, channel, owner string) (Message, bool) {
 	if !allowedSubtypes[c.SubType] {
 		return Message{}, false
 	}
-	if c.TS == "" || strings.TrimSpace(c.Text) == "" {
+	if c.TS == "" {
+		return Message{}, false
+	}
+	// An upload with no caption is still the owner handing something over, so
+	// only a message carrying neither text nor files has nothing to relay.
+	if strings.TrimSpace(c.Text) == "" && len(c.Files) == 0 {
 		return Message{}, false
 	}
 	// The channel asked for is the authority when the candidate does not carry
@@ -105,6 +147,7 @@ func accept(c candidate, channel, owner string) (Message, bool) {
 		User:     c.User,
 		Text:     c.Text,
 		Channel:  from,
+		Files:    c.Files,
 	}, true
 }
 

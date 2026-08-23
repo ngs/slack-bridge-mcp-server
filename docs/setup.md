@@ -50,7 +50,8 @@ at [Generate the two tokens](#generate-the-two-tokens).
    | `channels:history` | The same in public channels. Needed if your home channel is public, and for any public channel you add the app to |
    | `channels:read`, `groups:read` | `users.conversations`, which is how the search for [mentions](../README.md#talking-to-the-agent-in-other-channels) sent while you were away knows which channels to look in |
    | `reactions:write` | `reactions.add`, for the automatic 👀 receipt and for `slack_ack` |
-   | `users:read` | `users.info`, which turns user IDs into names in [`slack_history`](../README.md#reading-the-channel) results. The only optional one: without it the tool falls back to raw IDs |
+   | `users:read` | `users.info`, which turns user IDs into names in [`slack_history`](../README.md#reading-the-channel) results. Optional: without it the tool falls back to raw IDs |
+   | `files:read` | Downloading an [attachment](../README.md#attachments) from its `url_private`. Optional, and only for the download: Slack reports a message's files either way, so uploads are delivered with their names, sizes and links whether or not you add it — without it, fetching the file itself gets a login page instead |
 
    Nothing else is called. There is no user token, and the server never reads a
    channel it is not bound to.
@@ -77,7 +78,7 @@ was added only needs the toggle flipped — no reinstall, no new token.
   approve. The **Bot User OAuth Token** (`xoxb-…`) is `SLACK_BOT_TOKEN`.
 
 If you change scopes later, reinstall the app; the existing token does not
-gain them on its own. Two upgrades need one:
+gain them on its own. Three upgrades need one:
 
 - `users:read`, if you are coming from a version before `slack_history` existed
   — though that tool works without it too, showing raw user IDs instead of
@@ -88,6 +89,9 @@ gain them on its own. Two upgrades need one:
   existed. Without them the home channel works exactly as before and nothing
   else does, which is a perfectly good place to stay until you want the rest;
   the server says once on stderr which scope it was refused.
+- `files:read`, if you want the session to be able to open the screenshots you
+  send it. Uploads are relayed without it — the file's name, type, size and
+  links all arrive — so this one buys the download and nothing else.
 
 Event subscriptions and interactivity, by contrast, are settings rather than
 scopes: adding `app_mention` or turning interactivity on needs no reinstall.
@@ -292,7 +296,14 @@ the event subscription is `message.channels` while the channel is private (or
 the reverse). Only plain messages and thread replies from that one user are
 relayed — edits, deletions, joins and anything posted by a bot are dropped on
 purpose, the last of these so the agent never reads its own replies back as new
-instructions.
+instructions. Uploads count as messages: a screenshot arrives with or without a
+caption.
+
+**The agent sees my screenshot but cannot open it.** The `files:read` scope is
+missing, so the `url_private` link in the message answers with a Slack login
+page rather than the file. Add it under **OAuth & Permissions** and reinstall.
+Everything else about the message — its caption, the file's name, type and size,
+and the `permalink` you can both open in Slack — works without the scope.
 
 **Nothing came through while the laptop was asleep.** It will. The WebSocket
 dies with the network, and on reconnect the bridge re-reads the window after

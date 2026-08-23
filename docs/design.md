@@ -181,11 +181,17 @@ holds in every channel the app is in. Everything else is dropped:
 - **Bot messages**, identified by a non-empty `bot_id`. This is what stops the
   bridge from feeding the agent's own `slack_post` output back to it as new
   input, which would otherwise loop.
-- **Subtypes** other than none and `thread_broadcast`. `message_changed`,
-  `message_deleted`, `channel_join`, `file_share` and the rest are either not
-  new text or not the owner speaking. A plain message and a plain thread reply
-  both carry no subtype at all, so both pass.
-- **Empty bodies**, which have nothing to transport.
+- **Subtypes** other than none, `thread_broadcast` and `file_share`.
+  `message_changed`, `message_deleted`, `channel_join` and the rest are either
+  not new text or not the owner speaking. A plain message and a plain thread
+  reply both carry no subtype at all, so both pass; `file_share` is the owner
+  attaching something, which is them speaking too. The two sources disagree
+  about that last one — the live message event carries the subtype, while the
+  same message read back from `conversations.history` carries none and only the
+  `files` array — so both shapes are accepted, or an upload would be relayed by
+  one path and dropped by the other.
+- **Empty bodies with no files**, which have nothing to transport. An upload
+  sent without a caption is relayed on the strength of its attachment.
 
 Thread replies are relayed and carry their `thread_ts`, so the agent can reply
 into the same thread, and every message carries its `channel` for the same
@@ -428,8 +434,12 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
   the model a transcript.)
 - **Direct messages.** Channels only, which keeps the app out of the scopes and
   events that reach a DM.
-- **Attachments and files.** Text only. Messages whose body is empty because
-  the content is a file are dropped rather than relayed as an empty string.
+- **Fetching attachments.** A message carries its files as metadata — name,
+  type, size, `url_private`, `permalink` — and the bridge downloads none of
+  them. Whether an attachment is worth opening is a judgement about the
+  conversation, which belongs to the agent and not to the transport; nothing is
+  written to disk, and the `files:read` scope stays optional for anyone who
+  never wants the bytes.
 - **Block Kit and interactive components.** Replies are plain mrkdwn. No
   buttons, no modals, no slash commands, and so no interactivity payloads to
   handle.
