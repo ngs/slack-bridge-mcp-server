@@ -20,9 +20,10 @@ channel through this server.
 
 ## 1. Create the Slack app
 
-The app is yours alone: it exists to sit in one private channel and relay your
-own messages. It needs four bot scopes, one event subscription, two settings
-toggles, and two tokens.
+The app is yours alone: it exists to relay your own messages, from your home
+channel and from any conversation you open by mentioning it elsewhere. It needs
+a handful of bot scopes, three event subscriptions, two settings toggles, and
+two tokens.
 
 ### The quick way: from the manifest
 
@@ -45,15 +46,19 @@ at [Generate the two tokens](#generate-the-two-tokens).
    | Scope | Why the server needs it |
    |---|---|
    | `chat:write` | `chat.postMessage` for replies, plus `chat.update` and `chat.delete` for the [processing indicator](../README.md#processing-indicator) |
-   | `groups:history` | `conversations.history`, which is how the bridge catches up on everything sent while your machine was asleep. Use `channels:history` instead if your bridge channel is public |
+   | `groups:history` | `conversations.history` and `conversations.replies` in private channels, which is how the bridge catches up on everything sent while your machine was asleep |
+   | `channels:history` | The same in public channels. Needed if your home channel is public, and for any public channel you add the app to |
+   | `channels:read`, `groups:read` | `users.conversations`, which is how the search for [mentions](../README.md#talking-to-the-agent-in-other-channels) sent while you were away knows which channels to look in |
    | `reactions:write` | `reactions.add`, for the automatic 👀 receipt and for `slack_ack` |
    | `users:read` | `users.info`, which turns user IDs into names in [`slack_history`](../README.md#reading-the-channel) results. The only optional one: without it the tool falls back to raw IDs |
 
    Nothing else is called. There is no user token, and the server never reads a
    channel it is not bound to.
-3. **Event Subscriptions** → turn it **on** and subscribe to the bot event
-   `message.groups` (or `message.channels` for a public channel). This is the
-   live half; history covers the rest.
+3. **Event Subscriptions** → turn it **on** and subscribe to the bot events
+   `message.groups` and `message.channels` — the live half, for the home
+   channel — and `app_mention`, which is how the app hears the mention that
+   opens a conversation in any other channel. History covers what the socket
+   misses.
 4. **Interactivity & Shortcuts** → turn it **on**. Leave the request URL empty:
    with Socket Mode the button clicks come down the same WebSocket as the
    messages, and Slack does not ask for a URL. This is what
@@ -72,17 +77,30 @@ was added only needs the toggle flipped — no reinstall, no new token.
   approve. The **Bot User OAuth Token** (`xoxb-…`) is `SLACK_BOT_TOKEN`.
 
 If you change scopes later, reinstall the app; the existing token does not
-gain them on its own. That applies to `users:read` if you are upgrading from a
-version before `slack_history` existed — though it is worth knowing that
-`slack_history` works without it too, showing raw user IDs instead of names, so
-the reinstall can wait until it suits you. Interactivity, by contrast, is a
-setting and not a scope: turning it on needs no reinstall at all.
+gain them on its own. Two upgrades need one:
+
+- `users:read`, if you are coming from a version before `slack_history` existed
+  — though that tool works without it too, showing raw user IDs instead of
+  names, so the reinstall can wait until it suits you.
+- `channels:history`, `channels:read` and `groups:read`, if you are coming from
+  a version before conversations outside the home channel existed. Without them
+  the home channel works exactly as before and nothing else does, which is a
+  perfectly good place to stay until you want the rest.
+
+Event subscriptions and interactivity, by contrast, are settings rather than
+scopes: adding `app_mention` or turning interactivity on needs no reinstall.
 
 ## 2. Create the channel and collect the two IDs
 
 Create a **private channel** for the conversation — `#agent` or similar — and
 invite the app to it with `/invite @your-app-name`. A bot can only read
 channels it is a member of, so this step is not optional.
+
+This is the **home channel**: everything you say in it reaches the agent. You
+can invite the app to other channels later and talk to it there by mentioning
+it — see [Talking to the agent in other
+channels](../README.md#talking-to-the-agent-in-other-channels) — but the home
+channel is the one the bridge is configured with and the one it guarantees.
 
 Then collect:
 
@@ -178,8 +196,8 @@ via direnv or your shell profile.
 Restart the CLI and ask it to call `slack_status`. On a fresh session it
 answers `"connected": false`, and **that is the expected answer**: the server
 does not open a socket until the first tool call that actually needs Slack —
-`slack_wait`, `slack_post`, `slack_ack`, `slack_ask` or `slack_history`,
-whichever you reach first — so that it can sit in every project's `.mcp.json`
+`slack_wait`, `slack_post`, `slack_ack`, `slack_ask`, `slack_history`, or
+`slack_progress` when it has to start an indicator, whichever you reach first — so that it can sit in every project's `.mcp.json`
 without connecting in
 sessions that never use it. `slack_status` itself never connects, which is what
 makes it useful when something is misconfigured. What matters at this point is

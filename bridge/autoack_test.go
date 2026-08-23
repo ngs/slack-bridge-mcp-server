@@ -202,7 +202,7 @@ func TestAckTreatsAnExistingReactionAsSuccess(t *testing.T) {
 	api.reactErr = ErrAlreadyReacted
 	api.mu.Unlock()
 
-	if err := b.React(ctx, "100.000200", "eyes"); err != nil {
+	if err := b.React(ctx, ReactRequest{TS: "100.000200", Emoji: "eyes"}); err != nil {
 		t.Errorf("React() = %v, want an existing reaction treated as success", err)
 	}
 
@@ -210,7 +210,7 @@ func TestAckTreatsAnExistingReactionAsSuccess(t *testing.T) {
 	api.reactErr = errors.New("channel_not_found")
 	api.mu.Unlock()
 
-	if err := b.React(ctx, "100.000200", "eyes"); err == nil {
+	if err := b.React(ctx, ReactRequest{TS: "100.000200", Emoji: "eyes"}); err == nil {
 		t.Error("React() = nil error on a real failure, want it surfaced")
 	}
 }

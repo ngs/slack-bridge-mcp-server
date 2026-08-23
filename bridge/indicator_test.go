@@ -149,7 +149,7 @@ func TestAFailedReplyPutsTheIndicatorBack(t *testing.T) {
 	api.postErr = errors.New("channel_not_found")
 	api.mu.Unlock()
 
-	if _, err := b.Post(ctx, "here you go", ""); err == nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "here you go", ThreadTS: ""}); err == nil {
 		t.Fatal("Post() = nil error, want the failure surfaced")
 	}
 
@@ -170,7 +170,7 @@ func TestAFailedReplyDoesNotInventAnIndicator(t *testing.T) {
 	api.postErr = errors.New("channel_not_found")
 	api.mu.Unlock()
 
-	if _, err := b.Post(ctx, "unprompted", ""); err == nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "unprompted", ThreadTS: ""}); err == nil {
 		t.Fatal("Post() = nil error, want the failure surfaced")
 	}
 
@@ -223,7 +223,7 @@ func TestNoIndicatorForRepliesFasterThanTheGracePeriod(t *testing.T) {
 	b, api, _ := indicatorBridge(ctx, t)
 	waitForMessages(ctx, t, b)
 
-	if _, err := b.Post(ctx, "here you go", ""); err != nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "here you go", ThreadTS: ""}); err != nil {
 		t.Fatalf("Post() error = %v", err)
 	}
 
@@ -271,7 +271,7 @@ func TestIndicatorPostsTicksAndIsDeletedOnReply(t *testing.T) {
 		return false
 	})
 
-	if _, err := b.Post(ctx, "done", ""); err != nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "done", ThreadTS: ""}); err != nil {
 		t.Fatalf("Post() error = %v", err)
 	}
 
@@ -365,7 +365,7 @@ func TestARestoredIndicatorGoesBackToItsThread(t *testing.T) {
 	api.postErr = errors.New("channel_not_found")
 	api.mu.Unlock()
 
-	if _, err := b.Post(ctx, "here you go", "100.000200"); err == nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "here you go", ThreadTS: "100.000200"}); err == nil {
 		t.Fatal("Post() = nil error, want the failure surfaced")
 	}
 
@@ -446,7 +446,7 @@ func TestReactDoesNotStopTheIndicator(t *testing.T) {
 
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
 
-	if err := b.React(ctx, "100.000200", "eyes"); err != nil {
+	if err := b.React(ctx, ReactRequest{TS: "100.000200", Emoji: "eyes"}); err != nil {
 		t.Fatalf("React() error = %v", err)
 	}
 
@@ -487,7 +487,7 @@ func TestIndicatorFailuresDoNotReachTheTools(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the indicator to try an update", func() bool { return len(api.snapshotUpdates()) > 1 })
 
-	if _, err := b.Post(ctx, "the answer", ""); err != nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "the answer", ThreadTS: ""}); err != nil {
 		t.Fatalf("Post() error = %v, want the reply to succeed despite the indicator failing", err)
 	}
 	if _, err := b.Wait(ctx, 10*time.Millisecond); err != nil {
@@ -520,7 +520,7 @@ func TestIndicatorGivesUpWhenItCannotPost(t *testing.T) {
 	api.mu.Lock()
 	api.postErr = nil
 	api.mu.Unlock()
-	if _, err := b.Post(ctx, "the answer", ""); err != nil {
+	if _, err := b.Post(ctx, PostRequest{Text: "the answer", ThreadTS: ""}); err != nil {
 		t.Fatalf("Post() error = %v", err)
 	}
 }

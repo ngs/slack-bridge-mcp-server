@@ -40,7 +40,12 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 
 	// Fail here rather than on the first tool call, so a bad token is
 	// reported as "cannot connect" instead of a confusing empty history.
-	if _, err := api.AuthTestContext(ctx); err != nil {
+	//
+	// The answer is also where the bridge learns its own user ID, which is what
+	// a mention looks like in message text and therefore what opens a
+	// conversation outside the home channel.
+	auth, err := api.AuthTestContext(ctx)
+	if err != nil {
 		return nil, nil, fmt.Errorf("authenticating with Slack: %w", err)
 	}
 
@@ -48,7 +53,6 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 	stream := &socketModeStream{
 		events:       make(chan StreamEvent, liveEventBuffer),
 		interactions: make(chan Interaction, liveInteractionBuffer),
-		channel:      cfg.Channel,
 		owner:        cfg.Owner,
 	}
 
@@ -64,12 +68,41 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 		}
 	}()
 
-	return &webAPI{client: api}, stream, nil
+	return &webAPI{client: api, botUserID: auth.UserID}, stream, nil
 }
 
 // webAPI adapts *slack.Client to the API interface.
 type webAPI struct {
 	client *slack.Client
+	// botUserID comes from the auth.test made when the connection was opened,
+	// so recognising a mention costs no extra call.
+	botUserID string
+}
+
+func (w *webAPI) BotUserID() string { return w.botUserID }
+
+// JoinedChannels lists the conversations the bot is a member of, one page of
+// them. Public and private alike, since the owner can add the app to either,
+// and archived ones left out: nobody is going to mention the bot in there.
+//
+// One page is the whole story here on purpose. This feeds a best-effort scan
+// for mentions the session slept through, and paging through a workspace with
+// a thousand channels to find one would cost far more than the scan is worth.
+func (w *webAPI) JoinedChannels(ctx context.Context, limit int) ([]string, error) {
+	channels, _, err := w.client.GetConversationsForUserContext(ctx, &slack.GetConversationsForUserParameters{
+		Types:           []string{"public_channel", "private_channel"},
+		ExcludeArchived: true,
+		Limit:           limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("users.conversations: %w", err)
+	}
+
+	ids := make([]string, 0, len(channels))
+	for _, c := range channels {
+		ids = append(ids, c.ID)
+	}
+	return ids, nil
 }
 
 func (w *webAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, error) {
@@ -269,12 +302,15 @@ var permanentThreadErrors = map[string]bool{
 	"not_in_channel":    true,
 }
 
-// socketModeStream translates socketmode events into StreamEvents, applying
-// the owner filter before anything is queued.
+// socketModeStream translates socketmode events into StreamEvents.
+//
+// It applies the rules that hold everywhere — the owner wrote it, an app did
+// not, it is plain text — and no others. Which conversations are open changes
+// while the session runs, and the socket has no business knowing: the bridge
+// decides what to do with each message, and drops what it has no use for.
 type socketModeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
-	channel      string
 	owner        string
 	// dropped is set when an event could not be queued. It is sticky rather
 	// than an event of its own because the queue being full is exactly when
@@ -343,19 +379,13 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 			ack(*evt.Request)
 		}
 
-		inner, ok := api.InnerEvent.Data.(*slackevents.MessageEvent)
+		c, ok := toEventCandidate(api.InnerEvent.Data)
 		if !ok {
 			return
 		}
-		msg, ok := accept(candidate{
-			Channel:  inner.Channel,
-			User:     inner.User,
-			BotID:    inner.BotID,
-			SubType:  inner.SubType,
-			Text:     inner.Text,
-			TS:       inner.TimeStamp,
-			ThreadTS: inner.ThreadTimeStamp,
-		}, s.channel, s.owner)
+		// An empty channel accepts any: the bridge sorts out which conversation
+		// this belongs to, and whether it belongs to one at all.
+		msg, ok := accept(c, "", s.owner)
 		if !ok {
 			return
 		}
@@ -408,6 +438,43 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 		if evt.Request != nil && evt.Type != socketmode.EventTypeHello {
 			ack(*evt.Request)
 		}
+	}
+}
+
+// toEventCandidate normalises the two events that can carry owner text.
+//
+// A message in a channel the app is in arrives as a message event; a message
+// that mentions the app arrives as an app_mention as well, and in a channel
+// subscribed to only for mentions it is the only one that arrives at all. Both
+// are handled, and a message that produces both is deduplicated downstream by
+// channel and timestamp like any other overlap.
+//
+// app_mention carries no subtype, which is correct: Slack only sends it for a
+// real message, and the subtypes the relay rejects — edits, joins, bot posts —
+// do not produce one.
+func toEventCandidate(data any) (candidate, bool) {
+	switch evt := data.(type) {
+	case *slackevents.MessageEvent:
+		return candidate{
+			Channel:  evt.Channel,
+			User:     evt.User,
+			BotID:    evt.BotID,
+			SubType:  evt.SubType,
+			Text:     evt.Text,
+			TS:       evt.TimeStamp,
+			ThreadTS: evt.ThreadTimeStamp,
+		}, true
+	case *slackevents.AppMentionEvent:
+		return candidate{
+			Channel:  evt.Channel,
+			User:     evt.User,
+			BotID:    evt.BotID,
+			Text:     evt.Text,
+			TS:       evt.TimeStamp,
+			ThreadTS: evt.ThreadTimeStamp,
+		}, true
+	default:
+		return candidate{}, false
 	}
 }
 
