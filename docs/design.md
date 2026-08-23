@@ -70,7 +70,8 @@ Decision 3 makes that cost small.
 ### 2. Lazy connect
 
 Nothing touches the network at process startup. The Socket Mode connection is
-opened on the first `slack_wait` call.
+opened by the first tool call that needs Slack — `slack_wait` in a resident
+session, but any of the others will do it just as well.
 
 This is what lets the server sit in every project's `.mcp.json` unconditionally.
 Most sessions never call `slack_wait`, and those sessions never open a socket,
@@ -299,9 +300,10 @@ transport's.
 
 ### Single instance
 
-The first `slack_wait` takes an exclusive `flock` on a lock file next to the
-state file. A second concurrent bridge fails immediately with a clear error
-instead of starting.
+The first tool call that connects to Slack takes an exclusive `flock` on a
+lock file next to the state file — the lock is part of the lazy connect, so it
+is whichever call gets there first, not `slack_wait` specifically. A second
+concurrent bridge fails immediately with a clear error instead of starting.
 
 Two bridges on one channel would each receive some fraction of the live events
 and would race on the cursor, so the owner would see the agent answer some

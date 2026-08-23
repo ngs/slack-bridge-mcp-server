@@ -93,9 +93,9 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 
 - `state.json` — `{"channels": {"<channel_id>": {"last_ts": "…"}}}`, the cursor
   into the channel, created `0600`.
-- `bridge.lock` — an exclusive lock taken by the first `slack_wait`. A second
-  concurrent bridge fails immediately rather than splitting your messages
-  between two listeners.
+- `bridge.lock` — an exclusive lock taken by the first tool call that connects
+  to Slack, whichever that is. A second concurrent bridge fails immediately
+  rather than splitting your messages between two listeners.
 
 ## Wiring it into Claude Code
 

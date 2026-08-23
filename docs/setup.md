@@ -200,15 +200,19 @@ Four behaviours are worth knowing before you wonder about them:
   reaction means "delivered" and the ⏳ that may follow means "still working".
   See [Receipt and progress](../README.md#receipt-and-progress).
 - **Your old messages are not replayed.** The very first `slack_wait` against a
-  channel records the newest existing message as the starting point and returns
-  nothing. A fresh install joins the conversation rather than dumping the
+  channel records where the conversation already is — the newest message or
+  thread reply — as its starting point, and returns nothing. A fresh install joins the conversation rather than dumping the
   channel's history into the model's context. Everything sent *after* that
   point is delivered.
 - **The cursor is a file, not memory.** It lives in
   `~/.config/slack-bridge/state.json` (honouring `XDG_CONFIG_HOME`) and moves
-  only once messages have actually been handed to the agent. A crash costs you
-  a duplicate, never a lost message.
-- **One session at a time.** The first `slack_wait` takes an exclusive `flock`
+  only as messages are handed over, so a restart picks up where the last
+  session left off instead of replaying the channel or starting from now. It is
+  not a delivery receipt: the cursor is written just before the messages reach
+  the session, so a crash in that instant leaves them behind. Anything that
+  matters is still in Slack, where you can see it and say it again.
+- **One session at a time.** The first tool call that connects to Slack —
+  usually `slack_wait`, but any of them will do it — takes an exclusive `flock`
   on `~/.config/slack-bridge/bridge.lock`. A second bridge would split your
   messages between two listeners, each seeing half the conversation, so it
   refuses to start instead. The operating system drops the lock when the
