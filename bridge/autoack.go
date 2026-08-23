@@ -34,26 +34,35 @@ func (b *Bridge) autoAck(msgs []Message) {
 	}
 
 	b.mu.Lock()
-	disabled, api, channel, emoji := b.cfg.AutoAckDisabled, b.api, b.cfg.Channel, b.cfg.autoAckEmoji()
+	disabled, api, emoji := b.cfg.AutoAckDisabled, b.api, b.cfg.autoAckEmoji()
+	home := b.cfg.Channel
 	b.mu.Unlock()
 
 	if disabled || api == nil {
 		return
 	}
 
-	timestamps := make([]string, 0, len(msgs))
+	// A batch can span conversations, and a reaction has to go to the channel
+	// its message is in: a ts means nothing anywhere else.
+	type receipt struct{ channel, ts string }
+	receipts := make([]receipt, 0, len(msgs))
 	for _, m := range msgs {
-		if m.TS != "" {
-			timestamps = append(timestamps, m.TS)
+		if m.TS == "" {
+			continue
 		}
+		channel := m.Channel
+		if channel == "" {
+			channel = home
+		}
+		receipts = append(receipts, receipt{channel: channel, ts: m.TS})
 	}
 
 	go func() {
 		ctx, cancel := context.WithTimeout(b.ctx, autoAckTimeout)
 		defer cancel()
 
-		for _, ts := range timestamps {
-			err := api.React(ctx, channel, ts, emoji)
+		for _, r := range receipts {
+			err := api.React(ctx, r.channel, r.ts, emoji)
 			switch {
 			case err == nil, errors.Is(err, ErrAlreadyReacted):
 				// Already marked is the state we wanted anyway; a backlog

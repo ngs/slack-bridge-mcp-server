@@ -175,8 +175,8 @@ that the owner never authorised.
 
 ### 5. Owner filter
 
-Only messages where `user` equals `SLACK_BRIDGE_OWNER` and `channel` equals
-`SLACK_BRIDGE_CHANNEL` are relayed. Everything else is dropped:
+Only messages where `user` equals `SLACK_BRIDGE_OWNER` are relayed, and that
+holds in every channel the app is in. Everything else is dropped:
 
 - **Bot messages**, identified by a non-empty `bot_id`. This is what stops the
   bridge from feeding the agent's own `slack_post` output back to it as new
@@ -188,21 +188,107 @@ Only messages where `user` equals `SLACK_BRIDGE_OWNER` and `channel` equals
 - **Empty bodies**, which have nothing to transport.
 
 Thread replies are relayed and carry their `thread_ts`, so the agent can reply
-into the same thread.
+into the same thread, and every message carries its `channel` for the same
+reason.
 
 The same filter is applied to history results and to live events, from one
 function, so a message cannot be relayed live but dropped on catch-up.
+
+Where a message was sent is a second question, answered in decision 6.
+
+### 6. One home channel, and a mention everywhere else
+
+`SLACK_BRIDGE_CHANNEL` is the home channel and behaves as it always has: every
+owner message in it is relayed, with the catch-up guarantees below. In every
+other channel the app has been added to, an owner message that mentions the app
+opens a conversation thread — under that message, or the thread it was already
+in — and from then on every owner message in that thread is relayed without
+another mention.
+
+Three things fall out of that, and all three are deliberate.
+
+**A mention opens a thread rather than a channel.** The alternative, relaying
+the channel from the mention onwards, would put a room full of colleagues into
+the agent's context because the owner asked it one question. A thread is a
+conversation with an edge around it, and it is where the reply belongs anyway.
+
+**Only the owner is heard, in the conversation as well as at its door.** A
+colleague cannot open one by mentioning the app, and cannot join one by replying
+in the thread. This is the same filter that has always guarded the home channel,
+applied in more places; the way to read what other people said is still to ask
+for it, which is `slack_history`.
+
+**Threads do not expire in this version.** A conversation stays open until its
+thread is deleted or the app is removed from the channel. That is a
+simplification, and the cost of it is that a thread from last month still relays
+if the owner types in it. An expiry would need a rule nobody has needed yet, and
+adding one later costs nothing: the state file already carries a timestamp per
+thread.
+
+### 7. Catch-up outside the home channel is best effort
+
+The home channel's promise is that nothing said while the machine slept is lost.
+That promise cannot be extended to the whole workspace at a reasonable cost, and
+pretending otherwise would be worse than saying so.
+
+What the bridge does on reconnect, after the home channel's own catch-up:
+
+1. **Open threads.** `conversations.replies` for each one from its own cursor,
+   up to twenty threads. Each thread's cursor lives in the state file, so this
+   survives a restart.
+2. **Missed mentions.** `users.conversations` for the channels the app is in,
+   then the newest hundred messages of up to twenty of them, looking for owner
+   messages that mention the app and are newer than a single global mention
+   cursor. A Slack timestamp is a moment, so one cursor across channels is
+   coherent.
+
+Both caps are logged when they bite. A mention older than a hundred messages in
+a busy channel, or in the twenty-first channel, is simply not found — and the
+answer to that is to mention the app again, which costs the owner one line.
+
+The scan runs against a cursor rather than a window of time, and a first run
+seeds that cursor instead of delivering anything, for the same reason the
+channel cursor is seeded: a fresh install should join the workspace, not replay
+every mention in its history.
+
+The mention cursor is only ever moved by the scan, never by a message delivered
+live. Moving it on delivery would step over an older mention in another channel
+that the scan has not reached yet, and the duplicate it avoids costs nothing:
+a mention found twice is behind its thread's cursor the second time, and
+dropped.
 
 ## Tools
 
 | Tool | Arguments | Behaviour |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text"}, …], "timed_out": false}`, oldest first. |
-| `slack_post` | `text` (required), `thread_ts` (optional) | `chat.postMessage` to the bound channel. Returns the posted `ts`. |
-| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
-| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
-| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}, …], "timed_out": false}`, oldest first, across every conversation. |
+| `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `chat.postMessage`, to the home channel unless `channel` names another. Returns `{"ts", "channel"}`. |
+| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
+| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts`, `channel` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
+| `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, and starts one when none is running. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
+
+### Why slack_progress is a label and not a message
+
+The obvious shape for "tell the owner what you are waiting on" is a second
+message the agent posts and later deletes. It is the wrong one. Two messages
+means two lifetimes to get right, and the failure mode is a stale "waiting for
+CI" left in the channel long after the agent moved on — precisely what the
+indicator's single-owner-goroutine design exists to prevent.
+
+So the label is state on the indicator, and the server keeps owning the
+display. The agent says the thing once; the message that already exists picks it
+up on its next render, carries it through every update, and takes it away when
+the turn ends. There is nothing for the agent to clean up, and no way for it to
+leave two progress messages behind.
+
+Cutting the grace period short falls out of the same reasoning. The grace period
+is a bet that the answer is seconds away and the channel is better off quiet;
+`slack_progress` is the agent saying that bet is lost. Waiting it out anyway
+would hold back the one message the owner is now waiting for. The predecessor
+handover is not skipped with it: that one is not a bet but an invariant, and
+"never two indicators at once" outranks being prompt.
 
 ### Why slack_history ignores the owner filter
 
@@ -272,19 +358,24 @@ call it again. The timeout is a keepalive, not an error.
 The bridge is a private, single-owner tool, and its safety rests on three
 things:
 
-**A private channel.** The bot is invited to one private channel. It has no
-scopes for anything else, and `groups:history` only reaches private channels it
-is a member of.
+**Channels the owner chose.** The bot reads only channels it has been invited
+to: the history scopes reach nothing else. Being in a channel is not the same as
+relaying it, either — outside the home channel only a thread the owner opened
+with a mention is relayed, so adding the app to a team channel does not put that
+team's conversation into the agent's context.
 
-**The owner filter.** Even inside that channel, only one Slack user ID is
-relayed. Someone else invited to the channel can read the conversation but
-cannot drive the agent — and that includes tapping a `slack_ask` button, which
-carries the clicker's user ID and is checked against the owner exactly as a
-message is.
+**The owner filter.** Inside those channels, only one Slack user ID is relayed,
+and that has not been relaxed by any of the above: a colleague can neither open
+a conversation by mentioning the app nor join one by replying in its thread.
+That includes tapping a `slack_ask` button, which carries the clicker's user ID
+and is checked against the owner exactly as a message is — and against the
+channel the question was asked in, so a stale question elsewhere cannot be the
+answer to this one.
 
 **Credentials stay in the environment.** Tokens are read from the process
 environment and never written to the state file or logged. The state file holds
-only a timestamp cursor per channel, and is created `0600`.
+timestamp cursors and the identifiers of the threads left open, and is created
+`0600`.
 
 ### The external-input caveat
 
@@ -331,11 +422,12 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
 
 - **Threads as conversation context.** Thread replies are relayed and carry
   `thread_ts` so the agent can reply in place, but the bridge does not fetch a
-  thread's history or present a thread as a distinct conversation.
-- **Multiple channels.** One channel per process. The state file is already
-  keyed by channel so this can be added without a migration.
-- **Direct messages.** Only a channel, which keeps the required scopes to
-  `groups:history` and the event subscription to `message.groups`.
+  thread's history to give the agent what was said before it was invited.
+  (Outside the home channel a thread *is* a distinct conversation, as of
+  decision 6, but that is about which messages are relayed, not about handing
+  the model a transcript.)
+- **Direct messages.** Channels only, which keeps the app out of the scopes and
+  events that reach a DM.
 - **Attachments and files.** Text only. Messages whose body is empty because
   the content is a file are dropped rather than relayed as an empty string.
 - **Block Kit and interactive components.** Replies are plain mrkdwn. No

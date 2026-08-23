@@ -107,11 +107,16 @@ func TestAcceptFiltersToOwnerMessages(t *testing.T) {
 
 // An unconfigured bridge must not relay anything. Without this, an empty owner
 // would match the empty User on Slack's own bot notices.
+//
+// The channel is a different matter, and deliberately so: an empty one means
+// any channel, which is what the live stream passes. Which conversations are
+// open changes while the session runs, so that decision belongs to the bridge
+// rather than to the socket.
 func TestAcceptRejectsEverythingWhenUnconfigured(t *testing.T) {
 	c := candidate{Channel: testChannel, User: testOwner, Text: "hello", TS: "100.000100"}
 
-	if _, ok := accept(c, "", testOwner); ok {
-		t.Error("accept() with no channel configured returned a message")
+	if _, ok := accept(c, "", testOwner); !ok {
+		t.Error("accept() rejected a message when no channel was asked for; want any channel accepted")
 	}
 	if _, ok := accept(c, testChannel, ""); ok {
 		t.Error("accept() with no owner configured returned a message")

@@ -2,22 +2,24 @@
 #
 # Create the app from this file at https://api.slack.com/apps → Create New App
 # → From an app manifest, and it arrives with Socket Mode on, interactivity
-# enabled, the four bot scopes the server actually calls, and the one message
-# event it listens for.
+# enabled, the bot scopes the server actually calls, and the events it listens
+# for.
 # You still have to generate the app-level token and install the app; see
 # docs/setup.md.
 #
-# This manifest is written for a PRIVATE bridge channel. For a public one,
-# replace groups:history with channels:history and message.groups with
-# message.channels.
+# The home channel may be private or public: both history scopes are here, so
+# the same app works either way. The public ones also cover the other half of
+# the bridge — the channels the app is added to, where the owner opens a
+# conversation by mentioning it.
 display_information:
   name: Slack Bridge
-  description: Bridges a resident Claude CLI session to a private Slack channel
+  description: Bridges a resident Claude CLI session to your Slack
   long_description: >-
-    slack-bridge-mcp-server relays messages between one private Slack channel
-    and a Claude CLI session running on your own machine, so you can talk to
-    that session from your phone. Only messages from the configured owner in
-    the configured channel are relayed.
+    slack-bridge-mcp-server relays messages between Slack and a Claude CLI
+    session running on your own machine, so you can talk to that session from
+    your phone. Everything the configured owner says in the configured home
+    channel is relayed; anywhere else, mentioning the app opens a conversation
+    thread. Nobody else's messages are relayed.
   background_color: "#1f2933"
 features:
   bot_user:
@@ -29,8 +31,16 @@ oauth_config:
       # chat.postMessage for replies, chat.update and chat.delete for the
       # processing indicator. All three are covered by chat:write.
       - chat:write
-      # conversations.history, used for catch-up after sleep or a restart.
+      # conversations.history and conversations.replies, for catch-up after
+      # sleep or a restart. Both kinds of channel, since the home channel may be
+      # either and the app can be added to either.
       - groups:history
+      - channels:history
+      # users.conversations, which is how the search for mentions missed while
+      # the session was down knows which channels to look in. The read scopes
+      # are what let it name them.
+      - channels:read
+      - groups:read
       # reactions.add: the automatic receipt reaction on every delivered
       # message, and whatever slack_ack asks for on top of it.
       - reactions:write
@@ -40,7 +50,12 @@ oauth_config:
 settings:
   event_subscriptions:
     bot_events:
+      # The home channel, where every message from the owner is relayed.
       - message.groups
+      - message.channels
+      # Everywhere else the app has been added: a mention is what opens a
+      # conversation, and app_mention is the event that carries one.
+      - app_mention
   interactivity:
     # Required for slack_ask: without it Slack refuses to deliver the button
     # clicks. Socket Mode apps need no request URL, since the clicks arrive

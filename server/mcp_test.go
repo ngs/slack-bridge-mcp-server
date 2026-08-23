@@ -49,9 +49,9 @@ func unconfiguredBridge(t *testing.T) *bridge.Bridge {
 	return b
 }
 
-// The six tool names are the server's contract with the resident session's
-// prompt loop; renaming one silently breaks every .mcp.json in the wild.
-func TestServerExposesTheSixBridgeTools(t *testing.T) {
+// The tool names are the server's contract with the resident session's prompt
+// loop; renaming one silently breaks every .mcp.json in the wild.
+func TestServerExposesTheBridgeTools(t *testing.T) {
 	session := connect(t, unconfiguredBridge(t))
 
 	result, err := session.ListTools(context.Background(), nil)
@@ -64,7 +64,7 @@ func TestServerExposesTheSixBridgeTools(t *testing.T) {
 		got[tool.Name] = tool
 	}
 
-	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_history", "slack_status"}
+	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_history", "slack_progress", "slack_status"}
 	if len(got) != len(want) {
 		t.Errorf("ListTools() returned %d tools, want %d", len(got), len(want))
 	}
@@ -143,6 +143,45 @@ func TestWaitToolAdvertisesAnOptionalTimeout(t *testing.T) {
 		return
 	}
 	t.Fatal("slack_wait was not listed")
+}
+
+// The label is the whole point of slack_progress, so the schema has to say it
+// is required — a call without one has nothing to show.
+func TestProgressToolRequiresItsText(t *testing.T) {
+	session := connect(t, unconfiguredBridge(t))
+
+	result, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+
+	for _, tool := range result.Tools {
+		if tool.Name != "slack_progress" {
+			continue
+		}
+
+		schema, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling the schema: %v", err)
+		}
+
+		var decoded struct {
+			Properties map[string]any `json:"properties"`
+			Required   []string       `json:"required"`
+		}
+		if err := json.Unmarshal(schema, &decoded); err != nil {
+			t.Fatalf("decoding the schema: %v", err)
+		}
+
+		if _, ok := decoded.Properties["thread_ts"]; !ok {
+			t.Errorf("slack_progress schema has no thread_ts property: %s", schema)
+		}
+		if len(decoded.Required) != 1 || decoded.Required[0] != "text" {
+			t.Errorf("slack_progress requires %v, want text and nothing else", decoded.Required)
+		}
+		return
+	}
+	t.Fatal("slack_progress was not listed")
 }
 
 // slack_status is the diagnostic path: it must answer over MCP even though no
