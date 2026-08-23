@@ -28,7 +28,7 @@ func connect(t *testing.T, b *bridge.Bridge) *mcp.ClientSession {
 	if err != nil {
 		t.Fatalf("connecting the server: %v", err)
 	}
-	t.Cleanup(func() { serverSession.Close() })
+	t.Cleanup(func() { _ = serverSession.Close() })
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.0"}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)

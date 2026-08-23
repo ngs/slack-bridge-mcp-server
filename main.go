@@ -30,7 +30,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Fprintln(os.Stdout, server.VERSION)
+		_, _ = fmt.Fprintln(os.Stdout, server.VERSION)
 		return
 	}
 

@@ -172,7 +172,7 @@ func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Even
 		// every events_api envelope, including those the owner filter
 		// discards, so unrelated channel traffic is not redelivered.
 		if evt.Request != nil {
-			client.Ack(*evt.Request)
+			_ = client.Ack(*evt.Request)
 		}
 
 		inner, ok := api.InnerEvent.Data.(*slackevents.MessageEvent)
@@ -200,7 +200,7 @@ func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Even
 		// Slash commands, interactive payloads and the connection
 		// lifecycle chatter are not part of the bridge.
 		if evt.Request != nil && evt.Type != socketmode.EventTypeHello {
-			client.Ack(*evt.Request)
+			_ = client.Ack(*evt.Request)
 		}
 	}
 }

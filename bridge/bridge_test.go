@@ -160,7 +160,7 @@ func TestFirstEverWaitSeedsTheCursorInsteadOfReplaying(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, testConfig(t), connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	result, err := b.Wait(ctx, 20*time.Millisecond)
 	if err != nil {
@@ -197,7 +197,7 @@ func TestFirstWaitReturnsTheBacklogMissedWhileDown(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	result, err := b.Wait(ctx, MaxWaitTimeout)
 	if err != nil {
@@ -245,7 +245,7 @@ func TestWaitReturnsLiveMessages(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -569,13 +569,13 @@ func TestWaitRefusesASecondConcurrentBridge(t *testing.T) {
 	defer cancel()
 
 	first := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
-	defer first.Close()
+	defer func() { _ = first.Close() }()
 	if _, err := first.Wait(ctx, 10*time.Millisecond); err != nil {
 		t.Fatalf("first Wait() error = %v", err)
 	}
 
 	second := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
-	defer second.Close()
+	defer func() { _ = second.Close() }()
 
 	_, err := second.Wait(ctx, 10*time.Millisecond)
 	if !errors.Is(err, ErrAlreadyLocked) {
