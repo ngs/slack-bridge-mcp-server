@@ -91,6 +91,12 @@ All configuration is environment variables:
 | `SLACK_BRIDGE_CHANNEL` | yes | Channel ID to bridge, `C…` |
 | `SLACK_BRIDGE_OWNER` | yes | Your Slack user ID, `U…`. Only this user's messages are relayed. |
 | `SLACK_BRIDGE_STATE_DIR` | no | Override the state directory |
+| `SLACK_BRIDGE_INDICATOR` | no | `off` disables the processing indicator. Enabled by default. |
+| `SLACK_BRIDGE_INDICATOR_GRACE` | no | Seconds before the indicator appears. Default 10, clamped to 3–120. |
+| `SLACK_BRIDGE_INDICATOR_INTERVAL` | no | Seconds between indicator updates. Default 10, clamped to 5–60. |
+
+An unusable value for either number falls back to the default with a note on
+stderr; these settings can never keep the bridge from starting.
 
 If any required variable is missing, the process still starts and serves MCP —
 `slack_status` will tell you exactly which ones are unset. The other tools fail
@@ -137,6 +143,23 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
 `timed_out: true` result is not an error — just call it again.
+
+## Processing indicator
+
+Once `slack_wait` hands the agent a message, the bridge keeps the channel
+posted on how long the answer is taking:
+
+> ⏳ Working… (1m 29s)
+
+It is posted only if the agent is still busy after the grace period, so a quick
+reply leaves no trace. From then on the same message is updated in place every
+interval, and it is deleted as soon as the agent replies with `slack_post` or
+goes back to `slack_wait`. An ack (`slack_ack`) leaves it running — "seen, still
+working" is exactly when the elapsed time is worth showing.
+
+The whole feature is best effort: if Slack refuses any of these calls, the
+failure is logged to stderr and the tools carry on unaffected. Set
+`SLACK_BRIDGE_INDICATOR=off` to turn it off.
 
 ## Running a resident session
 

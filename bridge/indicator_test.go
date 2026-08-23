@@ -1,0 +1,346 @@
+package bridge
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// The indicator is deliberately slow to appear, so the tests drive it with
+// durations short enough to observe without sleeping through a real grace
+// period.
+const (
+	testGrace    = 20 * time.Millisecond
+	testInterval = 20 * time.Millisecond
+)
+
+func (f *fakeAPI) snapshotPosts() []postCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]postCall(nil), f.posts...)
+}
+
+func (f *fakeAPI) snapshotUpdates() []updateCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]updateCall(nil), f.updates...)
+}
+
+func (f *fakeAPI) snapshotDeletes() []deleteCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]deleteCall(nil), f.deletes...)
+}
+
+// eventually polls because the indicator's Slack calls happen on its own
+// goroutine: the tool call that starts or stops it returns first, by design.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// indicatorBridge returns a bridge whose next Wait hands over one message, with
+// the indicator wound down to test speed.
+func indicatorBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI) {
+	t.Helper()
+
+	cfg := testConfig(t)
+	cfg.IndicatorGrace = testGrace
+	cfg.IndicatorInterval = testInterval
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		history: []candidate{
+			ownerMsg("100.000100", "already answered"),
+			ownerMsg("100.000200", "please look into this"),
+		},
+		postTS: "100.000900",
+	}
+
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+	return b, api
+}
+
+// waitForMessages performs the Wait that hands messages to the agent, which is
+// what starts the clock.
+func waitForMessages(ctx context.Context, t *testing.T, b *Bridge) {
+	t.Helper()
+
+	result, err := b.Wait(ctx, MaxWaitTimeout)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if len(result.Messages) == 0 {
+		t.Fatal("Wait() returned no messages, so the indicator would never start")
+	}
+}
+
+// indicatorPost finds the indicator among the fake's posts. The reply the agent
+// sends is a post too, so they are told apart by their text.
+func indicatorPosts(api *fakeAPI) []postCall {
+	var found []postCall
+	for _, p := range api.snapshotPosts() {
+		if strings.HasPrefix(p.Text, "⏳") {
+			found = append(found, p)
+		}
+	}
+	return found
+}
+
+// The common case is a reply within seconds. Nothing should reach the channel
+// then, or the owner gets a "working…" note that is gone before it can be read.
+func TestNoIndicatorForRepliesFasterThanTheGracePeriod(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	if _, err := b.Post(ctx, "here you go", ""); err != nil {
+		t.Fatalf("Post() error = %v", err)
+	}
+
+	// Well past the grace period: if the indicator were going to appear, it
+	// would have by now.
+	time.Sleep(5 * testGrace)
+
+	if got := indicatorPosts(api); len(got) != 0 {
+		t.Errorf("indicator posted %+v, want nothing for a reply inside the grace period", got)
+	}
+	if got := api.snapshotUpdates(); len(got) != 0 {
+		t.Errorf("indicator updated %+v, want nothing", got)
+	}
+	if got := api.snapshotDeletes(); len(got) != 0 {
+		t.Errorf("indicator deleted %+v, want nothing", got)
+	}
+}
+
+// The full life of a slow turn: appear once, tick with a growing elapsed time,
+// and disappear when the answer arrives.
+func TestIndicatorPostsTicksAndIsDeletedOnReply(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+	posted := indicatorPosts(api)[0]
+	if posted.Channel != testChannel || posted.ThreadTS != "" {
+		t.Errorf("indicator posted as %+v, want a plain message on the bound channel", posted)
+	}
+	if !strings.Contains(posted.Text, "Working") {
+		t.Errorf("indicator text = %q, want it to say what is happening", posted.Text)
+	}
+
+	// The elapsed time is only rendered to the second, so the first tick that
+	// crosses a second boundary is the one that must show a different value.
+	eventually(t, "the elapsed time to advance", func() bool {
+		for _, u := range api.snapshotUpdates() {
+			if u.TS == "100.000900" && u.Text != posted.Text {
+				return true
+			}
+		}
+		return false
+	})
+
+	if _, err := b.Post(ctx, "done", ""); err != nil {
+		t.Fatalf("Post() error = %v", err)
+	}
+
+	eventually(t, "the indicator to be deleted", func() bool {
+		for _, d := range api.snapshotDeletes() {
+			if d.Channel == testChannel && d.TS == "100.000900" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Only ever one indicator message, however long the turn ran.
+	if got := indicatorPosts(api); len(got) != 1 {
+		t.Errorf("indicator posted %d times, want exactly 1", len(got))
+	}
+}
+
+// Going back to waiting without replying still ends the turn, so the indicator
+// must not be left counting in the channel.
+func TestNextWaitRemovesTheIndicator(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if _, err := b.Wait(ctx, 10*time.Millisecond); err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+
+	eventually(t, "the indicator to be deleted", func() bool { return len(api.snapshotDeletes()) == 1 })
+}
+
+// slack_ack means "seen, still working", which is precisely when the owner
+// wants the clock to keep running.
+func TestReactDoesNotStopTheIndicator(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if err := b.React(ctx, "100.000200", "eyes"); err != nil {
+		t.Fatalf("React() error = %v", err)
+	}
+
+	// The ticker must still be running after the ack.
+	eventually(t, "the indicator to keep ticking", func() bool { return len(api.snapshotUpdates()) > 0 })
+	if got := api.snapshotDeletes(); len(got) != 0 {
+		t.Errorf("indicator deleted %+v after an ack, want it left running", got)
+	}
+}
+
+func TestIndicatorCanBeTurnedOff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	b.cfg.IndicatorDisabled = true
+
+	waitForMessages(ctx, t, b)
+	time.Sleep(5 * testGrace)
+
+	if got := indicatorPosts(api); len(got) != 0 {
+		t.Errorf("indicator posted %+v with the feature off, want nothing", got)
+	}
+}
+
+// The indicator is a convenience; a Slack failure in it must never cost the
+// owner a reply.
+func TestIndicatorFailuresDoNotReachTheTools(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	api.mu.Lock()
+	api.updateErr = errors.New("slack said no")
+	api.deleteErr = errors.New("slack said no again")
+	api.mu.Unlock()
+
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to try an update", func() bool { return len(api.snapshotUpdates()) > 1 })
+
+	if _, err := b.Post(ctx, "the answer", ""); err != nil {
+		t.Fatalf("Post() error = %v, want the reply to succeed despite the indicator failing", err)
+	}
+	if _, err := b.Wait(ctx, 10*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v, want it unaffected by the indicator", err)
+	}
+}
+
+// A failed chat.postMessage leaves nothing to update or delete, so the
+// indicator gives up quietly rather than hammering Slack.
+func TestIndicatorGivesUpWhenItCannotPost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := indicatorBridge(ctx, t)
+	api.mu.Lock()
+	api.postErr = errors.New("slack is down")
+	api.mu.Unlock()
+
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to attempt its post", func() bool { return len(indicatorPosts(api)) == 1 })
+	time.Sleep(3 * testInterval)
+
+	if got := api.snapshotUpdates(); len(got) != 0 {
+		t.Errorf("indicator updated %+v after failing to post, want nothing", got)
+	}
+	if got := api.snapshotDeletes(); len(got) != 0 {
+		t.Errorf("indicator deleted %+v after failing to post, want nothing", got)
+	}
+
+	api.mu.Lock()
+	api.postErr = nil
+	api.mu.Unlock()
+	if _, err := b.Post(ctx, "the answer", ""); err != nil {
+		t.Fatalf("Post() error = %v", err)
+	}
+}
+
+func TestFormatElapsed(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{-time.Second, "0s"},
+		{45 * time.Second, "45s"},
+		{59*time.Second + 999*time.Millisecond, "59s"},
+		{time.Minute, "1m 00s"},
+		{65 * time.Second, "1m 05s"},
+		{12*time.Minute + 30*time.Second, "12m 30s"},
+		{time.Hour + 2*time.Minute + 45*time.Second, "1h 02m"},
+		{25 * time.Hour, "25h 00m"},
+	}
+
+	for _, tt := range tests {
+		if got := formatElapsed(tt.d); got != tt.want {
+			t.Errorf("formatElapsed(%v) = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
+func TestIndicatorSettingsFromTheEnvironment(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg := LoadConfig()
+		if cfg.IndicatorDisabled {
+			t.Error("the indicator is disabled by default, want it on")
+		}
+		grace, interval := cfg.indicatorTimings()
+		if grace != DefaultIndicatorGrace || interval != DefaultIndicatorInterval {
+			t.Errorf("timings = %v/%v, want %v/%v", grace, interval, DefaultIndicatorGrace, DefaultIndicatorInterval)
+		}
+	})
+
+	t.Run("off", func(t *testing.T) {
+		t.Setenv(EnvIndicator, "off")
+		if !LoadConfig().IndicatorDisabled {
+			t.Error("SLACK_BRIDGE_INDICATOR=off did not disable the indicator")
+		}
+	})
+
+	// Out-of-range and nonsense values must never keep a session from
+	// starting; they fall back to something workable.
+	t.Run("clamped and tolerant", func(t *testing.T) {
+		t.Setenv(EnvIndicatorGrace, "1")
+		t.Setenv(EnvIndicatorInterval, "600")
+		grace, interval := LoadConfig().indicatorTimings()
+		if grace != MinIndicatorGrace || interval != MaxIndicatorInterval {
+			t.Errorf("timings = %v/%v, want them clamped to %v/%v", grace, interval, MinIndicatorGrace, MaxIndicatorInterval)
+		}
+
+		t.Setenv(EnvIndicatorGrace, "soon")
+		t.Setenv(EnvIndicatorInterval, "-5")
+		grace, interval = LoadConfig().indicatorTimings()
+		if grace != DefaultIndicatorGrace || interval != DefaultIndicatorInterval {
+			t.Errorf("timings = %v/%v, want the defaults for unusable values", grace, interval)
+		}
+	})
+}

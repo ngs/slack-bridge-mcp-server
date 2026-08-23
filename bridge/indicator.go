@@ -1,0 +1,158 @@
+package bridge
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+)
+
+// Indicator timing. The grace period is what keeps the channel quiet for the
+// common case: most answers come back in a few seconds, and a "working…" note
+// that appears and disappears before it can be read is pure noise. The interval
+// is bounded on the low end because every tick is a chat.update, and Slack
+// rate-limits that per channel.
+const (
+	DefaultIndicatorGrace = 10 * time.Second
+	MinIndicatorGrace     = 3 * time.Second
+	MaxIndicatorGrace     = 120 * time.Second
+
+	DefaultIndicatorInterval = 10 * time.Second
+	MinIndicatorInterval     = 5 * time.Second
+	MaxIndicatorInterval     = 60 * time.Second
+)
+
+// indicatorDeleteTimeout bounds the best-effort chat.delete the indicator makes
+// on its way out. It runs on a context of its own because the usual reason the
+// indicator is torn down at shutdown is that the session's context was just
+// cancelled, and the message would then be left behind in the channel forever.
+const indicatorDeleteTimeout = 5 * time.Second
+
+// indicator is the "⏳ Working… (1m 05s)" message the owner sees while the
+// agent is busy with what slack_wait handed it.
+//
+// One goroutine owns the whole lifecycle: it sleeps out the grace period, posts
+// once, updates in place on a ticker, and deletes the message when it is told
+// to stop. Keeping the Slack calls in that goroutine is what lets stop() be a
+// non-blocking channel close, so a reply is never held up by the indicator's
+// own bookkeeping.
+type indicator struct {
+	api      API
+	channel  string
+	ctx      context.Context
+	grace    time.Duration
+	interval time.Duration
+	// startedAt is when the agent received the messages, which is the elapsed
+	// time the owner cares about — not when the first message was posted.
+	startedAt time.Time
+
+	stopOnce sync.Once
+	stopped  chan struct{}
+}
+
+func newIndicator(ctx context.Context, api API, channel string, grace, interval time.Duration) *indicator {
+	return &indicator{
+		api:       api,
+		channel:   channel,
+		ctx:       ctx,
+		grace:     grace,
+		interval:  interval,
+		startedAt: time.Now(),
+		stopped:   make(chan struct{}),
+	}
+}
+
+// start launches the goroutine. ctx must be the bridge's long-lived context,
+// not a per-tool-call one: the tool call that starts the indicator returns
+// immediately, and its context is cancelled right after.
+func (in *indicator) start() {
+	go in.run()
+}
+
+// stop is idempotent and safe from any goroutine. It returns as soon as the
+// goroutine has been told to wind down; the chat.delete happens there.
+func (in *indicator) stop() {
+	in.stopOnce.Do(func() { close(in.stopped) })
+}
+
+func (in *indicator) run() {
+	grace := time.NewTimer(in.grace)
+	defer grace.Stop()
+
+	select {
+	case <-in.stopped:
+		// Answered inside the grace period, which is the case worth keeping
+		// silent: nothing was ever posted, so there is nothing to clean up.
+		return
+	case <-in.ctx.Done():
+		return
+	case <-grace.C:
+	}
+
+	ts, err := in.api.Post(in.ctx, in.channel, "", in.text())
+	if err != nil {
+		// Without a message there is nothing to update or delete, so give up
+		// on this round rather than retrying into a rate limit.
+		log.Printf("could not post the processing indicator: %v", err)
+		return
+	}
+	defer in.remove(ts)
+
+	ticker := time.NewTicker(in.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-in.stopped:
+			return
+		case <-in.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := in.api.Update(in.ctx, in.channel, ts, in.text()); err != nil {
+				// One failed tick is not worth tearing the indicator down;
+				// the next one may well land.
+				log.Printf("could not update the processing indicator: %v", err)
+			}
+		}
+	}
+}
+
+// remove deletes the indicator message on a context of its own, so it still
+// runs when the reason for stopping was the session shutting down.
+func (in *indicator) remove(ts string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(in.ctx), indicatorDeleteTimeout)
+	defer cancel()
+
+	if err := in.api.Delete(ctx, in.channel, ts); err != nil {
+		log.Printf("could not delete the processing indicator: %v", err)
+	}
+}
+
+func (in *indicator) text() string {
+	return fmt.Sprintf("⏳ Working… (%s)", formatElapsed(time.Since(in.startedAt)))
+}
+
+// formatElapsed renders a duration the way a person reads a stopwatch: seconds
+// while that is the interesting number, minutes and seconds once it has been a
+// while, and hours and minutes past the hour, where a seconds count says
+// nothing except that the agent is still going.
+func formatElapsed(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	total := int(d.Seconds())
+
+	hours := total / 3600
+	minutes := (total % 3600) / 60
+	seconds := total % 60
+
+	switch {
+	case hours > 0:
+		return fmt.Sprintf("%dh %02dm", hours, minutes)
+	case minutes > 0:
+		return fmt.Sprintf("%dm %02ds", minutes, seconds)
+	default:
+		return fmt.Sprintf("%ds", seconds)
+	}
+}

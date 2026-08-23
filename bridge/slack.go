@@ -28,6 +28,10 @@ type API interface {
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, channel, ts, emoji string) error
+	// Update rewrites the text of a message the bridge posted.
+	Update(ctx context.Context, channel, ts, text string) error
+	// Delete removes a message the bridge posted.
+	Delete(ctx context.Context, channel, ts string) error
 }
 
 // StreamEventKind distinguishes the things that can happen on the Socket Mode

@@ -2,9 +2,12 @@ package bridge
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Environment variable names. These are the only configuration surface in v1;
@@ -14,6 +17,10 @@ const (
 	EnvAppToken = "SLACK_APP_TOKEN"
 	EnvChannel  = "SLACK_BRIDGE_CHANNEL"
 	EnvOwner    = "SLACK_BRIDGE_OWNER"
+
+	EnvIndicator         = "SLACK_BRIDGE_INDICATOR"
+	EnvIndicatorGrace    = "SLACK_BRIDGE_INDICATOR_GRACE"
+	EnvIndicatorInterval = "SLACK_BRIDGE_INDICATOR_INTERVAL"
 )
 
 // Config is the resolved environment configuration.
@@ -31,6 +38,18 @@ type Config struct {
 	// StateDir holds state.json and the lock file. Empty means the default
 	// location under the user's config directory.
 	StateDir string
+
+	// IndicatorDisabled turns the "⏳ Working…" message off. The field is
+	// phrased negatively on purpose: the zero Config, which the tests and any
+	// programmatic caller build, then has the indicator enabled, matching the
+	// documented default.
+	IndicatorDisabled bool
+	// IndicatorGrace is how long the agent may take before the indicator is
+	// posted at all. Zero means DefaultIndicatorGrace.
+	IndicatorGrace time.Duration
+	// IndicatorInterval is the gap between chat.update ticks. Zero means
+	// DefaultIndicatorInterval.
+	IndicatorInterval time.Duration
 }
 
 // LoadConfig reads the configuration from the process environment. It never
@@ -44,7 +63,65 @@ func LoadConfig() Config {
 		Channel:  strings.TrimSpace(os.Getenv(EnvChannel)),
 		Owner:    strings.TrimSpace(os.Getenv(EnvOwner)),
 		StateDir: strings.TrimSpace(os.Getenv("SLACK_BRIDGE_STATE_DIR")),
+
+		IndicatorDisabled: indicatorDisabled(os.Getenv(EnvIndicator)),
+		IndicatorGrace: durationSetting(
+			EnvIndicatorGrace, DefaultIndicatorGrace, MinIndicatorGrace, MaxIndicatorGrace),
+		IndicatorInterval: durationSetting(
+			EnvIndicatorInterval, DefaultIndicatorInterval, MinIndicatorInterval, MaxIndicatorInterval),
 	}
+}
+
+// indicatorDisabled reads the on/off switch. Only the documented "off" and the
+// obvious synonyms turn the indicator off; anything else, including a typo,
+// leaves the default in place, because silently losing a feature is worse than
+// ignoring a value nobody meant.
+func indicatorDisabled(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "off", "false", "0", "no":
+		return true
+	default:
+		return false
+	}
+}
+
+// durationSetting reads an optional number of seconds, falling back to the
+// default and saying so on stderr rather than refusing to start. These settings
+// are never required, so a bad value must not be able to break a session.
+func durationSetting(name string, fallback, lowest, highest time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		log.Printf("%s = %q is not a positive number of seconds; using %s", name, raw, fallback)
+		return fallback
+	}
+
+	d := time.Duration(seconds) * time.Second
+	if d < lowest {
+		return lowest
+	}
+	if d > highest {
+		return highest
+	}
+	return d
+}
+
+// indicatorTimings resolves the durations actually used, so a Config built in
+// code rather than from the environment still gets the documented defaults
+// instead of a zero grace period that would post immediately.
+func (c Config) indicatorTimings() (grace, interval time.Duration) {
+	grace, interval = c.IndicatorGrace, c.IndicatorInterval
+	if grace <= 0 {
+		grace = DefaultIndicatorGrace
+	}
+	if interval <= 0 {
+		interval = DefaultIndicatorInterval
+	}
+	return grace, interval
 }
 
 // MissingVars lists the required environment variables that are unset or

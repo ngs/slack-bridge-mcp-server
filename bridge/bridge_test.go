@@ -23,13 +23,19 @@ type fakeAPI struct {
 	historyCalls []HistoryRequest
 	posts        []postCall
 	reactions    []reactionCall
+	updates      []updateCall
+	deletes      []deleteCall
 	postTS       string
 	postErr      error
 	reactErr     error
+	updateErr    error
+	deleteErr    error
 }
 
 type postCall struct{ Channel, ThreadTS, Text string }
 type reactionCall struct{ Channel, TS, Emoji string }
+type updateCall struct{ Channel, TS, Text string }
+type deleteCall struct{ Channel, TS string }
 
 func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, error) {
 	f.mu.Lock()
@@ -76,6 +82,22 @@ func (f *fakeAPI) React(_ context.Context, channel, ts, emoji string) error {
 
 	f.reactions = append(f.reactions, reactionCall{Channel: channel, TS: ts, Emoji: emoji})
 	return f.reactErr
+}
+
+func (f *fakeAPI) Update(_ context.Context, channel, ts, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.updates = append(f.updates, updateCall{Channel: channel, TS: ts, Text: text})
+	return f.updateErr
+}
+
+func (f *fakeAPI) Delete(_ context.Context, channel, ts string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.deletes = append(f.deletes, deleteCall{Channel: channel, TS: ts})
+	return f.deleteErr
 }
 
 func (f *fakeAPI) calls() []HistoryRequest {

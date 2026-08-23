@@ -108,6 +108,20 @@ func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (stri
 	return ts, nil
 }
 
+func (w *webAPI) Update(ctx context.Context, channel, ts, text string) error {
+	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts, slack.MsgOptionText(text, false)); err != nil {
+		return fmt.Errorf("chat.update: %w", err)
+	}
+	return nil
+}
+
+func (w *webAPI) Delete(ctx context.Context, channel, ts string) error {
+	if _, _, err := w.client.DeleteMessageContext(ctx, channel, ts); err != nil {
+		return fmt.Errorf("chat.delete: %w", err)
+	}
+	return nil
+}
+
 func (w *webAPI) React(ctx context.Context, channel, ts, emoji string) error {
 	if err := w.client.AddReactionContext(ctx, emoji, slack.NewRefToMessage(channel, ts)); err != nil {
 		return fmt.Errorf("reactions.add: %w", err)

@@ -53,6 +53,9 @@ type Bridge struct {
 	// pending holds messages read from the stream while merging, so nothing
 	// is lost if a later step fails.
 	pending []Message
+	// indicator is the live "⏳ Working…" message, if one is running. At most
+	// one exists at a time; see indicator.go.
+	indicator *indicator
 }
 
 // New returns a Bridge that connects on first use. cfg may be incomplete; the
@@ -111,6 +114,7 @@ func (b *Bridge) Close() error {
 	defer b.mu.Unlock()
 
 	b.connected = false
+	b.stopIndicatorLocked()
 	if b.lock == nil {
 		return nil
 	}
@@ -180,6 +184,10 @@ type WaitResult struct {
 // trickling in. After that it waits on the live stream, running catch-up again
 // on every reconnect.
 func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, error) {
+	// Waiting again means the agent is done with whatever it was given last
+	// time, even if it never posted a reply.
+	b.stopIndicator()
+
 	b.mu.Lock()
 	if err := b.ensure(); err != nil {
 		b.mu.Unlock()
@@ -199,6 +207,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return WaitResult{}, err
 		}
 		if len(msgs) > 0 {
+			// From here the agent is working on these messages, which is the
+			// span the owner sees counted in the channel.
+			b.startIndicator()
 			return WaitResult{Messages: msgs}, nil
 		}
 
@@ -388,6 +399,10 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 		return "", errors.New("text is required")
 	}
 
+	// The reply is the answer the indicator was standing in for, so retire it
+	// before the reply lands rather than after.
+	b.stopIndicator()
+
 	api, channel, err := b.apiForCall()
 	if err != nil {
 		return "", err
@@ -397,6 +412,9 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"
 // without posting a message.
+//
+// It deliberately leaves the processing indicator alone: an ack means "seen,
+// still working", which is exactly the situation the indicator is there for.
 func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 	if ts == "" {
 		return errors.New("ts is required")
@@ -410,6 +428,44 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 		return err
 	}
 	return api.React(ctx, channel, ts, emoji)
+}
+
+// startIndicator begins counting for the messages just handed to the agent,
+// replacing any indicator still running so two of them can never coexist in the
+// channel.
+//
+// The indicator is given the bridge's own context rather than the tool call's:
+// the call that starts it returns immediately, and a per-call context would be
+// cancelled before the first tick.
+func (b *Bridge) startIndicator() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.stopIndicatorLocked()
+	if b.cfg.IndicatorDisabled || b.api == nil {
+		return
+	}
+
+	grace, interval := b.cfg.indicatorTimings()
+	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval)
+	b.indicator.start()
+}
+
+// stopIndicator retires the running indicator, if any. It returns without
+// waiting for the chat.delete, so no tool call is ever slowed down by it.
+func (b *Bridge) stopIndicator() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopIndicatorLocked()
+}
+
+// stopIndicatorLocked is stopIndicator for callers that already hold b.mu.
+func (b *Bridge) stopIndicatorLocked() {
+	if b.indicator == nil {
+		return
+	}
+	b.indicator.stop()
+	b.indicator = nil
 }
 
 // apiForCall connects if necessary and returns the Web API handle.
