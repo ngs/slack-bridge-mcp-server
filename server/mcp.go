@@ -32,6 +32,10 @@ Every message carries the channel it was sent in and, in a thread, its thread_ts
 back to slack_post so the reply lands in the conversation it answers: the owner's home
 channel is only one of the places they may be talking to you, and a reply that leaves out
 the channel goes to the home channel regardless of where the question came from.
+A message may carry files: an attachment the owner sent, reported as metadata rather than
+content. When they ask you about one, fetch its url_private with the bot token in an
+Authorization: Bearer header — it is not a public link — and expect a login page instead of
+the file if the app was installed without the files:read scope.
 Only the owner reaches you. In the home channel everything they say is relayed; in any
 other channel, they open a conversation by mentioning you, and from then on everything they
 say in that thread reaches you without another mention. Nobody else's messages are relayed
@@ -122,7 +126,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_wait",
 		Title:       "Wait for a Slack message",
-		Description: "Block until the owner sends a message, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. Returns any messages missed while the session was down. Marks what it delivers as received, and starts the progress indicator, so it is not a read-only call.",
+		Description: "Block until the owner sends a message, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. A message the owner attached something to carries a files array describing it — the metadata, not the bytes, which you fetch from url_private with the bot token if you need them. Returns any messages missed while the session was down. Marks what it delivers as received, and starts the progress indicator, so it is not a read-only call.",
 		// Not ReadOnlyHint: delivering messages reacts to them and starts the
 		// elapsed-time indicator, both of which write to the channel. A client
 		// may use that hint to decide what to allow without asking.
@@ -195,7 +199,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_history",
 		Title:       "Read the Slack channel",
-		Description: "Read recent messages from a channel, or one thread of it, from every author including other people and bots. Reads the home channel unless you name another. For when the owner asks you to read or summarise the channel. Changes nothing: it does not consume messages slack_wait would deliver.",
+		Description: "Read recent messages from a channel, or one thread of it, from every author including other people and bots. Reads the home channel unless you name another. Messages with attachments carry a files array, as slack_wait delivers them. For when the owner asks you to read or summarise the channel. Changes nothing: it does not consume messages slack_wait would deliver.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args HistoryArgs) (*mcp.CallToolResult, bridge.HistoryResult, error) {
 		result, err := b.History(ctx, bridge.ReadRequest{

@@ -47,6 +47,11 @@ oauth_config:
       # users.info, which turns the user IDs in slack_history results into
       # names. Optional in practice: without it the tool falls back to IDs.
       - users:read
+      # Downloading an attachment from the url_private link on a message.
+      # Optional, and only for the download: Slack reports a message's files
+      # with or without this scope, so an upload is delivered either way, but
+      # without it fetching the file itself lands on a login page.
+      - files:read
 settings:
   event_subscriptions:
     bot_events:

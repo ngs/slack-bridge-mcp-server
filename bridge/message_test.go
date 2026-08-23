@@ -65,8 +65,35 @@ func TestAcceptFiltersToOwnerMessages(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "a file share, which v1 cannot transport",
-			in:   candidate{Channel: testChannel, User: testOwner, Text: "shared a file", TS: "100.001000", SubType: "file_share"},
+			name: "a file share is the owner handing something over",
+			in: candidate{
+				Channel: testChannel, User: testOwner, Text: "look at this", TS: "100.001000", SubType: "file_share",
+				Files: []File{{Name: "screenshot.png", Mimetype: "image/png"}},
+			},
+			want: true,
+		},
+		{
+			name: "an upload with no caption still says something",
+			in: candidate{
+				Channel: testChannel, User: testOwner, TS: "100.001050", SubType: "file_share",
+				Files: []File{{Name: "screenshot.png", Mimetype: "image/png"}},
+			},
+			want: true,
+		},
+		{
+			name: "somebody else's file share is nobody's business",
+			in: candidate{
+				Channel: testChannel, User: "U0SOMEONE", Text: "look at this", TS: "100.001060", SubType: "file_share",
+				Files: []File{{Name: "screenshot.png", Mimetype: "image/png"}},
+			},
+			want: false,
+		},
+		{
+			name: "an app posting a file is still an app",
+			in: candidate{
+				Channel: testChannel, User: testOwner, BotID: "B0BRIDGE", Text: "here is the report", TS: "100.001070", SubType: "file_share",
+				Files: []File{{Name: "report.pdf", Mimetype: "application/pdf"}},
+			},
 			want: false,
 		},
 		{
@@ -100,6 +127,9 @@ func TestAcceptFiltersToOwnerMessages(t *testing.T) {
 			}
 			if got.ThreadTS != tt.in.ThreadTS {
 				t.Errorf("accept() ThreadTS = %q, want %q so the caller can reply in the thread", got.ThreadTS, tt.in.ThreadTS)
+			}
+			if !reflect.DeepEqual(got.Files, tt.in.Files) {
+				t.Errorf("accept() Files = %+v, want %+v", got.Files, tt.in.Files)
 			}
 		})
 	}
