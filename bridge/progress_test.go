@@ -465,8 +465,16 @@ func TestProgressMovesTheIndicatorToTheConversationItNames(t *testing.T) {
 	eventually(t, "the indicator left behind to be deleted", func() bool {
 		return len(api.snapshotDeletes()) == 1
 	})
-	if got := api.snapshotDeletes()[0].TS; got != "100.000900" {
-		t.Errorf("deleted ts = %q, want the indicator that was standing in the wrong conversation", got)
+	// Compared against the two messages the fake actually handed out, so this
+	// fails if the move deletes the message it has just posted rather than the
+	// one it is replacing.
+	posts := indicatorPosts(api)
+	if posts[0].TS == posts[1].TS {
+		t.Fatalf("both indicator messages have ts %q, so the check below cannot tell them apart", posts[0].TS)
+	}
+	if got := api.snapshotDeletes()[0].TS; got != posts[0].TS {
+		t.Errorf("deleted ts = %q, want %q — the indicator that was standing in the wrong conversation, not the new one at %q",
+			got, posts[0].TS, posts[1].TS)
 	}
 }
 

@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -51,7 +52,10 @@ type fakeAPI struct {
 	resolutions []updateCall
 	deletes     []deleteCall
 	postTS      string
-	questionTS  string
+	// postCount is how many messages the fake has handed a timestamp to, which
+	// is what makes each one distinct.
+	postCount  int
+	questionTS string
 	// beforeQuestionReturns runs inside PostQuestion, after Slack would have
 	// created the message but before the caller learns its ts.
 	beforeQuestionReturns func()
@@ -99,7 +103,9 @@ func (f *fakeAPI) JoinedChannels(_ context.Context, limit int) ([]string, error)
 	return append([]string(nil), joined...), nil
 }
 
-type postCall struct{ Channel, ThreadTS, Text string }
+// postCall records one chat.postMessage, TS included: a test that checks the
+// right message was deleted has to be able to tell the messages apart.
+type postCall struct{ Channel, ThreadTS, Text, TS string }
 type questionCall struct {
 	Channel  string
 	ThreadTS string
@@ -228,11 +234,34 @@ func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.posts = append(f.posts, postCall{Channel: channel, ThreadTS: threadTS, Text: text})
 	if f.postErr != nil {
+		f.posts = append(f.posts, postCall{Channel: channel, ThreadTS: threadTS, Text: text})
 		return "", f.postErr
 	}
-	return f.postTS, nil
+
+	ts := f.nextPostTSLocked()
+	f.posts = append(f.posts, postCall{Channel: channel, ThreadTS: threadTS, Text: text, TS: ts})
+	return ts, nil
+}
+
+// nextPostTSLocked mints the timestamp of the next posted message. Slack gives
+// every message its own, and a fake handing out one timestamp for all of them
+// cannot tell "the right message was deleted" from "a message was deleted" —
+// which is exactly the guarantee the indicator handover rests on. The first
+// post keeps the configured value, so a test that only ever posts once reads
+// the same way it always did. The caller must hold f.mu.
+func (f *fakeAPI) nextPostTSLocked() string {
+	n := f.postCount
+	f.postCount++
+	if f.postTS == "" || n == 0 {
+		return f.postTS
+	}
+
+	seconds, sequence, ok := splitTS(f.postTS)
+	if !ok {
+		return f.postTS + "-" + strconv.Itoa(n)
+	}
+	return strconv.FormatInt(seconds, 10) + "." + fmt.Sprintf("%06d", sequence+int64(n))
 }
 
 func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
@@ -678,7 +707,7 @@ func TestPostAndReact(t *testing.T) {
 	if ts != "100.000900" {
 		t.Errorf("Post() = %q, want the posted ts 100.000900", ts)
 	}
-	if len(api.posts) != 1 || api.posts[0] != (postCall{Channel: testChannel, ThreadTS: "100.000100", Text: "hello from the agent"}) {
+	if len(api.posts) != 1 || api.posts[0] != (postCall{Channel: testChannel, ThreadTS: "100.000100", Text: "hello from the agent", TS: "100.000900"}) {
 		t.Errorf("Post() sent %+v, want it addressed to the bound channel and thread", api.posts)
 	}
 
