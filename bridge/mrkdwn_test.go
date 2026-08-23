@@ -86,6 +86,16 @@ func TestNormalizeMrkdwnCode(t *testing.T) {
 			"start **and `**x**`",
 		},
 		{
+			"even length span inside a bold candidate does not close it",
+			"**a ``**x**`` b**",
+			"**a ``**x**`` b**",
+		},
+		{
+			"bold around a whole code span still converts",
+			"**a `x` b**",
+			"*a `x` b*",
+		},
+		{
 			"fenced block untouched",
 			"before **x**\n```\n**y**\n# not a heading\n```\nafter **z**",
 			"before *x*\n```\n**y**\n# not a heading\n```\nafter *z*",
@@ -99,6 +109,16 @@ func TestNormalizeMrkdwnCode(t *testing.T) {
 			"indented fence still opens a block",
 			"  ```\n  **x**\n  ```",
 			"  ```\n  **x**\n  ```",
+		},
+		{
+			"a longer fence contains shorter delimiter lines",
+			"````\n```\n**x**\n```\n````\n**y**",
+			"````\n```\n**x**\n```\n````\n*y*",
+		},
+		{
+			"a shorter fence is closed by a longer delimiter",
+			"```\n**x**\n`````\n**y**",
+			"```\n**x**\n`````\n*y*",
 		},
 		{
 			"unclosed fence protects the rest",

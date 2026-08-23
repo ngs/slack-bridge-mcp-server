@@ -21,13 +21,23 @@ func normalizeMrkdwn(s string) string {
 	}
 
 	lines := strings.Split(s, "\n")
-	inFence := false
+	// open is the backtick count of the fence currently holding the block, and
+	// zero when none is. Tracking the count rather than a bare in-or-out flag
+	// is what lets a block opened with four backticks contain a ``` line — the
+	// usual way to show fenced Markdown inside fenced Markdown — without that
+	// inner line being mistaken for the end of the block.
+	open := 0
 	for i, line := range lines {
-		if isFenceDelimiter(line) {
-			inFence = !inFence
+		if n, ok := fenceRun(line); ok {
+			switch {
+			case open == 0:
+				open = n
+			case n >= open:
+				open = 0
+			}
 			continue
 		}
-		if inFence {
+		if open > 0 {
 			continue
 		}
 		lines[i] = normalizeLine(line)
@@ -35,11 +45,16 @@ func normalizeMrkdwn(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-// isFenceDelimiter reports whether the line opens or closes a fenced code
-// block. An unclosed fence therefore protects the rest of the message, which is
-// the safer way to be wrong about where a code block ended.
-func isFenceDelimiter(line string) bool {
-	return strings.HasPrefix(strings.TrimLeft(line, " \t"), "```")
+// fenceRun returns the length of a line's leading backtick run, if the line is
+// a fence delimiter at all. An unclosed fence therefore protects the rest of
+// the message, which is the safer way to be wrong about where a block ended.
+func fenceRun(line string) (int, bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	n := runLength(trimmed, 0, '`')
+	if n < 3 {
+		return 0, false
+	}
+	return n, true
 }
 
 func normalizeLine(line string) string {
@@ -169,36 +184,51 @@ func normalizeInline(s string) string {
 // parseDelimited matches a `**bold**` or `__bold__` span starting at i and
 // returns its content and the index just past the closing delimiter.
 //
-// The refusals are what keep it safe. A run longer than the delimiter is
+// The search walks over code spans and escapes the same way the caller does,
+// so a `**` that only exists inside a code span is never mistaken for the
+// closing delimiter — whatever the span's own backtick run length is.
+//
+// The refusals are what keep the rest safe. A run longer than the delimiter is
 // something else (`***`, `___`). Content that is empty, that is padded with
 // spaces, or that holds another of the same delimiter character is more likely
-// arithmetic or a snippet than emphasis. And content holding an odd number of
-// backticks means the closing delimiter was found inside a code span, where it
-// was never a delimiter at all.
+// arithmetic or a snippet than emphasis.
 func parseDelimited(s string, i int, delim string) (string, int, bool) {
 	d := len(delim)
 	if !strings.HasPrefix(s[i:], delim) || runLength(s, i, delim[0]) != d {
 		return "", 0, false
 	}
 
-	for j := i + d; j+d <= len(s); j++ {
-		if s[j] != delim[0] {
-			continue
+	for j := i + d; j+d <= len(s); {
+		switch s[j] {
+		case '\\':
+			j += 2
+
+		case '`':
+			n := runLength(s, j, '`')
+			if end := findRun(s, j+n, '`', n); end >= 0 {
+				j = end + n
+				continue
+			}
+			j += n
+
+		case delim[0]:
+			n := runLength(s, j, delim[0])
+			if n != d {
+				j += n
+				continue
+			}
+			content := s[i+d : j]
+			switch {
+			case content == "",
+				strings.TrimSpace(content) != content,
+				strings.IndexByte(content, delim[0]) >= 0:
+				return "", 0, false
+			}
+			return content, j + d, true
+
+		default:
+			j++
 		}
-		n := runLength(s, j, delim[0])
-		if n != d {
-			j += n - 1
-			continue
-		}
-		content := s[i+d : j]
-		switch {
-		case content == "",
-			strings.TrimSpace(content) != content,
-			strings.IndexByte(content, delim[0]) >= 0,
-			strings.Count(content, "`")%2 != 0:
-			return "", 0, false
-		}
-		return content, j + d, true
 	}
 	return "", 0, false
 }
