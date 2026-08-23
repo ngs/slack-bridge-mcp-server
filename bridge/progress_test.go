@@ -286,6 +286,29 @@ func TestProgressDoesNothingWhenTheIndicatorIsOff(t *testing.T) {
 	}
 }
 
+// With nowhere to put a label there is nothing to do, and finding that out must
+// not drag Slack into it: a session with the indicator off and no credentials
+// at all still gets a quiet answer rather than a configuration error.
+func TestProgressWithTheIndicatorOffDoesNotConnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	connector := &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()}
+	b := New(ctx, Config{StateDir: t.TempDir(), IndicatorDisabled: true}, connector)
+	t.Cleanup(func() { _ = b.Close() })
+
+	result, err := b.Progress(ctx, progressLabel, "")
+	if err != nil {
+		t.Fatalf("Progress() error = %v, want the call to succeed quietly", err)
+	}
+	if result.OK {
+		t.Errorf("Progress() = %+v, want ok false", result)
+	}
+	if got := connector.connectCount(); got != 0 {
+		t.Errorf("the bridge connected %d times, want it to stay offline", got)
+	}
+}
+
 // A label made of nothing is not a status line, and posting "⏳ Working… (3s) —"
 // would be worse than saying nothing at all.
 func TestProgressRequiresSomethingToSay(t *testing.T) {

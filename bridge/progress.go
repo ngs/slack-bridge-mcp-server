@@ -16,10 +16,10 @@ const maxProgressLabel = 200
 
 // ProgressResult is what slack_progress returns.
 //
-// TS is the indicator message the label was attached to, and is empty when
-// there is no message to name yet: the indicator posts on its own goroutine, so
-// a label given before the first post lands on a message that does not exist
-// at the moment this call returns.
+// TS is the indicator message the label was attached to, and is left out
+// entirely when there is no message to name yet: the indicator posts on its own
+// goroutine, so a label given before the first post belongs to a message that
+// does not exist at the moment this call returns.
 type ProgressResult struct {
 	OK bool   `json:"ok"`
 	TS string `json:"ts,omitempty"`
@@ -43,37 +43,53 @@ type ProgressResult struct {
 // already exists belongs to a turn that has already chosen its surface, and
 // moving it would mean deleting and reposting the message the owner is watching.
 //
-// The call's context is unused, unlike the other tools': nothing here waits on
-// Slack. Setting a label is a handful of assignments, and the posts and updates
-// that follow belong to the indicator's goroutine, which outlives this call by
-// design and runs on the bridge's own context.
+// The call's context is unused, unlike the other tools'. Labelling a running
+// indicator is a handful of assignments, and the posts and updates that follow
+// belong to the indicator's goroutine, which outlives this call by design and
+// runs on the bridge's own context. The one thing here that can take time is
+// the lazy connect, and only when there is no indicator to label and no session
+// open yet; that runs on the bridge's context too, as it does for every other
+// tool.
 func (b *Bridge) Progress(_ context.Context, text, threadTS string) (ProgressResult, error) {
 	label := sanitizeProgressLabel(text)
 	if label == "" {
 		return ProgressResult{}, errors.New("text is required")
 	}
 
-	// Connect first, even when an indicator is already running: this may be the
-	// first call of the session, and starting one needs an API handle.
-	if _, _, err := b.apiForCall(); err != nil {
-		return ProgressResult{}, err
-	}
-
 	b.mu.Lock()
-	if b.indicator == nil {
-		// Counting from now, because now is when the agent said it was working:
-		// whatever happened before this call is not what the owner is being
-		// asked to wait for.
-		b.startIndicatorLocked(time.Now(), threadTS)
+	// Nowhere to put a label, so there is nothing to do and no reason to open a
+	// Slack connection finding that out. Said as ok:false rather than as an
+	// error: the operator turned the indicator off, nothing is broken, and a
+	// status line they chose not to have is not worth failing a call the agent
+	// made in good faith.
+	if b.cfg.IndicatorDisabled {
+		b.mu.Unlock()
+		return ProgressResult{}, nil
 	}
 	in := b.indicator
 	b.mu.Unlock()
 
 	if in == nil {
-		// The operator turned the indicator off, which leaves the label nowhere
-		// to go. Said plainly rather than as an error: nothing is broken, and a
-		// status line the owner chose not to have is not worth failing a call
-		// the agent made in good faith.
+		// Starting one needs an API handle, which on the first call of a
+		// session means opening the connection.
+		if _, _, err := b.apiForCall(); err != nil {
+			return ProgressResult{}, err
+		}
+
+		b.mu.Lock()
+		if b.indicator == nil {
+			// Counting from now, because now is when the agent said it was
+			// working: whatever happened before this call is not what the owner
+			// is being asked to wait for.
+			b.startIndicatorLocked(time.Now(), threadTS)
+		}
+		in = b.indicator
+		b.mu.Unlock()
+	}
+
+	if in == nil {
+		// Nothing was started, which at this point means the indicator was
+		// turned off while this call was connecting. Same answer as above.
 		return ProgressResult{}, nil
 	}
 

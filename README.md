@@ -132,7 +132,7 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
-| `slack_progress` | `text` (required), `thread_ts` (optional, only used if no indicator is running) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is empty while the indicator has yet to post, and `ok` is false when the indicator is turned off. |
+| `slack_progress` | `text` (required), `thread_ts` (optional, only used if no indicator is running) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the indicator is turned off. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
