@@ -593,9 +593,32 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 
 	api, channel, err := b.apiForCall()
 	if err != nil {
+		b.restoreIndicator(ctx)
 		return "", err
 	}
-	return api.Post(ctx, channel, threadTS, text)
+
+	ts, err := api.Post(ctx, channel, threadTS, text)
+	if err != nil {
+		// The answer never landed, so the agent is still on the hook for it
+		// and the channel should go back to saying so.
+		b.restoreIndicator(ctx)
+		return "", err
+	}
+	return ts, nil
+}
+
+// restoreIndicator brings the progress signal back after an attempt to speak
+// failed, so the channel does not fall silent while the agent is still
+// working.
+//
+// It stays quiet when the call was cancelled: Slack may have accepted the
+// message anyway, with the confirmation lost on the way back, and a cancelled
+// call means nobody is waiting on this turn any more either.
+func (b *Bridge) restoreIndicator(ctx context.Context) {
+	if ctx.Err() != nil || b.ctx.Err() != nil {
+		return
+	}
+	b.startIndicator()
 }
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"

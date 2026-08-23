@@ -23,8 +23,10 @@ type HistoryPage struct {
 	HasMore bool
 }
 
-// HistoryRequest asks for messages between Oldest and Latest, exclusive of
-// Oldest. Either bound may be empty.
+// HistoryRequest asks for messages between Oldest and Latest. Both bounds are
+// exclusive, which is what Slack does when `inclusive` is left off, and either
+// may be empty. Oldest exclusive is load-bearing: it is the cursor, and a
+// message the agent already has must not come back.
 type HistoryRequest struct {
 	Channel string
 	Oldest  string

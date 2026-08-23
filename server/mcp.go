@@ -67,8 +67,8 @@ type AskArgs struct {
 // HistoryArgs is the argument set for slack_history.
 type HistoryArgs struct {
 	Limit    int    `json:"limit,omitempty" jsonschema:"how many messages to return; defaults to 50 and is clamped to 1-200"`
-	Oldest   string `json:"oldest,omitempty" jsonschema:"only messages after this Slack ts"`
-	Latest   string `json:"latest,omitempty" jsonschema:"only messages up to this Slack ts"`
+	Oldest   string `json:"oldest,omitempty" jsonschema:"only messages strictly after this Slack ts"`
+	Latest   string `json:"latest,omitempty" jsonschema:"only messages strictly before this Slack ts"`
 	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"read the replies in this thread instead of the channel itself"`
 }
 

@@ -95,7 +95,7 @@ func (in *indicator) stop() {
 func (in *indicator) run() {
 	// Closed last, after any deletion below, so that whoever replaces this
 	// indicator can tell when the channel is clear again.
-	defer close(in.done)
+	defer in.finish()
 
 	grace := time.NewTimer(in.grace)
 	defer grace.Stop()
@@ -155,19 +155,46 @@ func (in *indicator) run() {
 	}
 }
 
+// finish closes done, which is the promise that the channel is clear of this
+// indicator — and of the one it replaced, since a message can only be posted
+// once its predecessor's is gone.
+//
+// That second half is why this is not a bare close. An indicator stopped
+// before it ever posted still stands between its predecessor and its
+// successor: closing done while the predecessor was mid-delete would let the
+// next indicator post into a channel that still has the old message in it. The
+// wait is bounded, because the predecessor's own work is.
+func (in *indicator) finish() {
+	if in.predecessor != nil {
+		timeout := time.NewTimer(indicatorRequestTimeout + indicatorDeleteTimeout)
+		defer timeout.Stop()
+		select {
+		case <-in.predecessor:
+		case <-timeout.C:
+		}
+	}
+	close(in.done)
+}
+
 // post publishes the indicator message.
 //
-// The request deliberately is not cancelled when the indicator is stopped: a
-// chat.postMessage abandoned in flight can still create the message, and the
-// ts needed to delete it would be lost with the response. Letting it finish
-// means the message is briefly visible after the agent has answered, and then
-// deleted — which is the smaller of the two prices.
+// It runs on a detached context on purpose. A chat.postMessage abandoned in
+// flight can still create the message, and the ts needed to delete it would be
+// lost with the response — an indicator nobody can clear. Cancelling the
+// session must not be able to orphan one, so the request is given its own
+// deadline and allowed to finish; the deletion that follows is detached for
+// the same reason.
+//
+// The cost is that the message can appear briefly after the agent has already
+// answered, and is then deleted. Briefly late beats permanently stuck.
 func (in *indicator) post() (string, error) {
-	ctx, cancel := context.WithTimeout(in.ctx, indicatorRequestTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(in.ctx), indicatorRequestTimeout)
 	defer cancel()
 	return in.api.Post(ctx, in.channel, "", in.text())
 }
 
+// update is cancellable, unlike post: there is nothing to orphan, since the
+// message it edits is already known and already scheduled for deletion.
 func (in *indicator) update(ts string) error {
 	ctx, cancel := context.WithTimeout(in.ctx, indicatorRequestTimeout)
 	defer cancel()

@@ -163,6 +163,30 @@ func TestHistoryClampsTheLimitAndPassesTheWindowThrough(t *testing.T) {
 	}
 }
 
+// Both bounds are exclusive, because Slack's are: `oldest` is the wait
+// cursor, and a message the agent already answered must not come back through
+// a different door.
+func TestHistoryWindowBoundsAreExclusive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _ := historyBridge(ctx, t)
+
+	result, err := b.History(ctx, ReadRequest{Oldest: "100.000200", Latest: "100.000500"})
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+
+	var got []string
+	for _, m := range result.Messages {
+		got = append(got, m.TS)
+	}
+	want := []string{"100.000300", "100.000400"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("History() timestamps = %v, want %v: the messages on the bounds are outside the window", got, want)
+	}
+}
+
 // Slack cutting the window short is worth reporting: the model should know it
 // is looking at part of a conversation.
 func TestHistoryReportsATruncatedWindow(t *testing.T) {

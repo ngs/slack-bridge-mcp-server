@@ -232,8 +232,10 @@ func TestCatchUpReadsNoThreadsOnTheFirstEverRun(t *testing.T) {
 }
 
 // The cap is what keeps a long absence from turning into hundreds of API
-// calls. Hitting it is not an error: what it does not recover now arrives with
-// the next reply in that thread.
+// calls. Hitting it is not an error, but it is a loss: the cursor advances
+// past the threads that were not read, so their replies are missed for good
+// rather than deferred. Catch-up says so on stderr; what must not happen is
+// the whole thing failing.
 func TestCatchUpStopsAfterTheThreadCap(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

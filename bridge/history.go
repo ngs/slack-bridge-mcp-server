@@ -26,7 +26,9 @@ type ReadRequest struct {
 	// Limit caps how many messages come back, newest-end first if the window
 	// holds more.
 	Limit int
-	// Oldest and Latest bound the window, as Slack timestamps.
+	// Oldest and Latest bound the window, as Slack timestamps. Both are
+	// exclusive, matching conversations.history: a message whose ts equals a
+	// bound is not returned.
 	Oldest string
 	Latest string
 	// ThreadTS reads that thread's replies instead of the channel surface.

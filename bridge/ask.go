@@ -112,13 +112,8 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 	ts, err := api.PostQuestion(ctx, channel, threadTS, q)
 	if err != nil {
 		// No question went up, so the agent is still the one working and the
-		// channel should say so again. Only on a confirmed refusal, though: a
-		// cancelled call may well have posted the question anyway, with the ts
-		// lost in the response nobody read, and in that case the agent's turn
-		// is over too — nobody is left waiting for an answer to give.
-		if ctx.Err() == nil && b.ctx.Err() == nil {
-			b.startIndicator()
-		}
+		// channel should say so again.
+		b.restoreIndicator(ctx)
 		return AskResult{}, err
 	}
 

@@ -77,7 +77,9 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
 			continue
 		}
-		if req.Latest != "" && tsLess(req.Latest, c.TS) {
+		// Both bounds are exclusive, the way Slack behaves with `inclusive`
+		// left off.
+		if req.Latest != "" && !tsLess(c.TS, req.Latest) {
 			continue
 		}
 		matched = append(matched, c)
@@ -107,13 +109,16 @@ func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, e
 	}
 
 	// Slack returns the parent plus the replies belonging to that thread,
-	// oldest first, honouring the same oldest bound as history.
+	// oldest first, honouring the same exclusive bounds as history.
 	matched := make([]candidate, 0, len(f.replies))
 	for _, c := range f.replies {
 		if req.ThreadTS != "" && c.ThreadTS != req.ThreadTS && c.TS != req.ThreadTS {
 			continue
 		}
 		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
+			continue
+		}
+		if req.Latest != "" && !tsLess(c.TS, req.Latest) {
 			continue
 		}
 		matched = append(matched, c)
