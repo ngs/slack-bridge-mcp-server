@@ -615,3 +615,44 @@ func TestMentionsUser(t *testing.T) {
 		t.Error("mentionsUser matched something with no user ID to match")
 	}
 }
+
+// A thread that Slack says is gone is gone: the parent was deleted, or the bot
+// was removed from the channel. Forgetting it only in memory would mean reading
+// it back on the next connect and failing on it again, for ever.
+func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := mentionBridge(ctx, t)
+
+	send(stream, otherChannel, "200.000100", "", mention("take a look"))
+	if msgs := waitFor(ctx, t, b); len(msgs) != 1 {
+		t.Fatalf("Wait() returned %v, want the mention", texts(msgs))
+	}
+
+	threads, err := NewStore(b.cfg.StateDir).Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	if len(threads) != 1 {
+		t.Fatalf("Threads() = %+v, want the conversation recorded", threads)
+	}
+
+	// The thread has been deleted since.
+	api.mu.Lock()
+	api.repliesErr = ErrThreadUnreadable
+	api.mu.Unlock()
+	stream.events <- StreamEvent{Kind: StreamConnected}
+
+	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
+		t.Errorf("Wait() returned %v from a thread that cannot be read, want nothing", texts(msgs))
+	}
+
+	threads, err = NewStore(b.cfg.StateDir).Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	if len(threads) != 0 {
+		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", threads)
+	}
+}

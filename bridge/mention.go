@@ -323,13 +323,25 @@ func (b *Bridge) scanForMentions(ctx context.Context, api API, owner string) ([]
 	return found, newest, nil
 }
 
-// closeThread forgets a conversation whose thread no longer exists.
+// closeThread forgets a conversation whose thread no longer exists, on disk as
+// well as in memory.
+//
+// Forgetting it only in memory would mean reading it back on the next connect
+// and failing on it again, on every reconnect of every session from then on —
+// the thread is not coming back, and neither should the record of it.
 func (b *Bridge) closeThread(key threadKey) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	delete(b.threads, key)
 	delete(b.threadCursors, key)
+
+	if b.store == nil {
+		return
+	}
+	if err := b.store.RemoveThread(key.channel, key.threadTS); err != nil {
+		log.Printf("could not forget a closed conversation thread: %v", err)
+	}
 }
 
 // noteMentionCursor records how far the search for mentions has looked.

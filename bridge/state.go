@@ -168,6 +168,35 @@ func (s *Store) SetThread(channel, threadTS, lastTS string) error {
 	return s.saveLocked(state)
 }
 
+// RemoveThread forgets a conversation for good. It is for a thread that is not
+// coming back — deleted, or in a channel the bot has been removed from — where
+// leaving the record behind would mean reading it again on every reconnect of
+// every session from now on.
+func (s *Store) RemoveThread(channel, threadTS string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+
+	kept := state.Threads[:0]
+	removed := false
+	for _, t := range state.Threads {
+		if t.Channel == channel && t.ThreadTS == threadTS {
+			removed = true
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if !removed {
+		return nil
+	}
+	state.Threads = kept
+	return s.saveLocked(state)
+}
+
 // MentionCursor returns how far the search for missed mentions has looked, or
 // "" when it never has.
 func (s *Store) MentionCursor() (string, error) {
