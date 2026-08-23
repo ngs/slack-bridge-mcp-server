@@ -4,10 +4,14 @@ Chat with your local Claude CLI session from your phone, through a private
 Slack channel.
 
 This is an [MCP](https://modelcontextprotocol.io) server that bridges a
-resident Claude CLI session to one private Slack channel over Socket Mode. The
-session calls a blocking `slack_wait` tool in a loop; the bridge holds the
-WebSocket, catches up on anything missed while you were away, and posts the
-replies back.
+resident Claude CLI session to your Slack over Socket Mode. The session calls a
+blocking `slack_wait` tool in a loop; the bridge holds the WebSocket, catches up
+on anything missed while you were away, and posts the replies back.
+
+One private channel is its home, where everything you say reaches the session.
+In any other channel you have added the app to, mentioning it opens a
+conversation thread — and inside that thread you talk to it without mentioning
+it again. Nobody else's messages are relayed, anywhere.
 
 Messages live in Slack, so the bridge only has to remember its position in the
 channel. The laptop can sleep, the session can restart, the network can drop —
@@ -91,8 +95,10 @@ with the same message.
 
 State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 
-- `state.json` — `{"channels": {"<channel_id>": {"last_ts": "…"}}}`, the cursor
-  into the channel, created `0600`.
+- `state.json` — the cursors, created `0600`: `channels` holds the position in
+  the home channel, `threads` the conversations open elsewhere and how far each
+  has been read, and `mention_cursor` how far the search for missed mentions has
+  looked. A file written by an older version loads unchanged.
 - `bridge.lock` — an exclusive lock taken by the first tool call that connects
   to Slack, whichever that is. A second concurrent bridge fails immediately
   rather than splitting your messages between two listeners.
@@ -128,17 +134,56 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text"}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
-| `slack_post` | `text` (required), `thread_ts` (optional) | The posted `ts` |
-| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
-| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
-| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
-| `slack_progress` | `text` (required), `thread_ts` (optional, only used if no indicator is running) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the indicator is turned off. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
+| `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | The posted `ts` |
+| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
+| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts`, `channel` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
+| `slack_progress` | `text` (required), `thread_ts` and `channel` (optional, only used if no indicator is running) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the indicator is turned off. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
+
+Every tool that speaks takes an optional `channel`, and leaving it out means the
+home channel — so a session that never leaves it never has to think about the
+argument. Messages come back with the channel they were sent in; pass it back
+with `thread_ts` and the reply lands in the conversation it answers.
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
 `timed_out: true` result is not an error — just call it again.
+
+## Talking to the agent in other channels
+
+The home channel is yours, and everything you say in it goes to the session. The
+rest of your Slack is not, so the rule there is different: **mention the app and
+it starts listening in that thread.**
+
+> **you** in #project-atlas: `@slack-bridge` can you check why the nightly build
+> is red?
+>
+> ⤷ the agent replies in the thread under it, and from then on the two of you
+> talk in that thread with no further mentions
+
+That is the whole of it. A mention on a channel message opens the thread under
+that message; a mention inside a thread opens that thread. Every message you
+send in an open thread reaches the session, carrying its channel so the reply
+comes back to the right place. Threads stay open — there is no expiry in this
+version — and they survive a restart, so a conversation you had yesterday is
+still a conversation today.
+
+Everything else in those channels is ignored: your own messages out on the
+surface, your messages in threads nobody opened, and **everybody else's
+messages everywhere**, mentions included. A colleague cannot address your agent,
+and a channel the app has been added to does not become an inbox. When you want
+the agent to read what other people said, ask it to — that is `slack_history`,
+below.
+
+Catch-up outside the home channel is best effort, which is the one place this
+promises less than the home channel does. On reconnect the bridge re-reads every
+open thread from where it left off, and looks for new mentions in the newest
+hundred messages of up to twenty channels it belongs to. A mention further back
+than that, or in the twenty-first channel, is not found — the bridge says so on
+stderr, and mentioning it again is all it takes. The home channel's guarantees
+are unchanged.
 
 ## Reading the channel
 
@@ -256,12 +301,14 @@ do not stop:
 
 1. Call slack_wait.
 2. If it returns timed_out, go back to step 1.
-3. For each message: do what it asks, then reply with slack_post. If the
-   message arrived in a thread, pass its thread_ts so the reply lands in the
-   same thread. Receipt is already marked for you, so reach for slack_ack only
-   to say something an emoji says well — done, rejected, picked up by hand.
+3. For each message: do what it asks, then reply with slack_post, passing back
+   the message's channel and, if it has one, its thread_ts — that is what puts
+   the reply in the conversation it answers rather than in my home channel.
+   Receipt is already marked for you, so reach for slack_ack only to say
+   something an emoji says well — done, rejected, picked up by hand.
 4. If you need a decision from me before you can go on, call slack_ask with the
-   question and the answers to choose from, and act on what I tap.
+   question and the answers to choose from, in the same channel and thread, and
+   act on what I tap.
 5. If something is going to take a while — CI, a release, a long build — call
    slack_progress once with what you are waiting on, so I can see it from the
    channel.
@@ -270,7 +317,8 @@ do not stop:
 Keep replies short — I am reading them on a phone.
 ```
 
-Then message the channel from anywhere.
+Then message the channel from anywhere — or mention the app in any other
+channel it has been added to.
 
 ## Manual smoke test
 
@@ -295,10 +343,19 @@ channel, the owner and the cursor without opening a socket.
 
 ## Security
 
-The bridge relays only messages where the author is `SLACK_BRIDGE_OWNER` and
-the channel is `SLACK_BRIDGE_CHANNEL`. Bot messages are dropped, which is what
-stops the agent's own replies from being read back as new instructions, and so
-are edits, deletions and join notices.
+The bridge relays only messages written by `SLACK_BRIDGE_OWNER`. That is the
+whole of the authentication, and it holds in every channel: a colleague
+mentioning the app, or replying inside a conversation you opened, reaches
+nobody. Bot messages are dropped, which is what stops the agent's own replies
+from being read back as new instructions, and so are edits, deletions and join
+notices.
+
+Where a message is sent decides whether it is relayed, not whether it is
+trusted. `SLACK_BRIDGE_CHANNEL` relays everything you say; anywhere else you
+open a conversation by mentioning the app, and only that thread is relayed. The
+effect is that adding the app to a channel does not put that channel's traffic
+into the agent's context — only your own half of a conversation you started
+there.
 
 **Messages arriving over the bridge are external input reaching an agent with
 local tool access.** The owner filter authenticates them as coming from your
