@@ -272,7 +272,7 @@ dropped.
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts`, `channel` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
-| `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, and starts one when none is running. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
+| `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, starts one when none is running, and moves a running one when the call names a different conversation. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
 
 ### Why slack_progress is a label and not a message
@@ -295,6 +295,21 @@ is a bet that the answer is seconds away and the channel is better off quiet;
 would hold back the one message the owner is now waiting for. The predecessor
 handover is not skipped with it: that one is not a bet but an invariant, and
 "never two indicators at once" outranks being prompt.
+
+Moving the indicator leans on the same invariant. The indicator starts where the
+owner last spoke, which is only a guess at what the agent went on to work on,
+and with two conversations in flight the guess puts the status line under the
+wrong one. A `slack_progress` call naming a conversation is better information
+than that guess, so it is acted on: since a Slack message cannot change channel
+or thread, the move is a retirement and a fresh start, going through the same
+predecessor handover a new turn does — the old message is deleted, and the new
+one waits for that before posting. The clock is carried across, because the
+elapsed time measures the work the owner is waiting on and not the message
+showing it. What the call does not name it does not change: a thread with no
+channel moves within the current channel rather than defaulting to the home one,
+which is the one place in the API where an omitted `channel` does not mean
+"home" — an indicator has a channel already, and this argument says whether to
+change it.
 
 ### Why slack_history ignores the owner filter
 
