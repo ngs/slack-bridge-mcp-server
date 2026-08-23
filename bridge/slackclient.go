@@ -94,9 +94,18 @@ func (w *webAPI) Replies(ctx context.Context, req RepliesRequest) (HistoryPage, 
 		Timestamp: req.ThreadTS,
 		Oldest:    req.Oldest,
 		Latest:    req.Latest,
+		Cursor:    req.Cursor,
 		Limit:     req.Limit,
 	})
 	if err != nil {
+		// A thread that is not there to be read is a different kind of
+		// problem from a thread Slack would not give us this time, and
+		// catch-up has to tell them apart: one is skipped, the other is
+		// retried.
+		var slackErr slack.SlackErrorResponse
+		if errors.As(err, &slackErr) && permanentThreadErrors[slackErr.Err] {
+			return HistoryPage{}, fmt.Errorf("%w: %s", ErrThreadUnreadable, slackErr.Err)
+		}
 		return HistoryPage{}, fmt.Errorf("conversations.replies: %w", err)
 	}
 
@@ -231,6 +240,17 @@ func (w *webAPI) React(ctx context.Context, channel, ts, emoji string) error {
 		return ErrAlreadyReacted
 	}
 	return fmt.Errorf("reactions.add: %w", err)
+}
+
+// permanentThreadErrors are the conversations.replies failures that will still
+// be failures on the next attempt: the thread, its parent, or the channel is
+// not there. Everything else — rate limits, timeouts, a Slack outage — is
+// worth another go.
+var permanentThreadErrors = map[string]bool{
+	"thread_not_found":  true,
+	"message_not_found": true,
+	"channel_not_found": true,
+	"not_in_channel":    true,
 }
 
 // socketModeStream translates socketmode events into StreamEvents, applying

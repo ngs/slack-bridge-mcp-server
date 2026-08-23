@@ -156,6 +156,9 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 				b.mu.Lock()
 				b.connected = false
 				b.mu.Unlock()
+				// The socket is gone, so no click can reach this call any
+				// more. The buttons have to go with it.
+				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 				return AskResult{}, errors.New("the Slack connection closed")
 			}
 			// absorb routes the event: clicks reach this question, messages

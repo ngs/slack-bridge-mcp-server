@@ -1,6 +1,16 @@
 package bridge
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrThreadUnreadable reports that a thread is not there to be read — the
+// parent was deleted, or the bridge is no longer in the channel. It is
+// distinguished from every other failure because catch-up answers the two
+// differently: a thread that is gone is skipped, while a thread Slack merely
+// refused this time is retried, so its replies are not stepped over.
+var ErrThreadUnreadable = errors.New("the thread cannot be read")
 
 // HistoryPage is one page of conversations.history, newest message first, as
 // Slack returns it.
@@ -31,6 +41,7 @@ type RepliesRequest struct {
 	ThreadTS string
 	Oldest   string
 	Latest   string
+	Cursor   string
 	Limit    int
 }
 

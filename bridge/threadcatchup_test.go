@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"testing"
@@ -261,9 +262,9 @@ func TestCatchUpStopsAfterTheThreadCap(t *testing.T) {
 	}
 }
 
-// One thread the bridge cannot read — a deleted parent, usually — must not
-// stop the rest of catch-up. Wedging the relay is far worse than losing that
-// thread's replies.
+// A thread that no longer exists will not exist next time either, so catch-up
+// steps over it. Wedging the relay on it forever would be far worse than
+// losing that thread's replies.
 func TestCatchUpSurvivesAnUnreadableThread(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -277,7 +278,7 @@ func TestCatchUpSurvivesAnUnreadableThread(t *testing.T) {
 		nil,
 	)
 	api.mu.Lock()
-	api.repliesErr = errors.New("thread_not_found")
+	api.repliesErr = fmt.Errorf("%w: thread_not_found", ErrThreadUnreadable)
 	api.mu.Unlock()
 
 	result, err := b.Wait(ctx, MaxWaitTimeout)
@@ -286,6 +287,78 @@ func TestCatchUpSurvivesAnUnreadableThread(t *testing.T) {
 	}
 	if got := texts(result.Messages); !reflect.DeepEqual(got, []string{"a deleted thread", "a plain message"}) {
 		t.Errorf("Wait() messages = %v, want the surface messages delivered anyway", got)
+	}
+}
+
+// A thread Slack merely refused this time is a different matter: giving up on
+// it quietly would move the cursor past replies nobody ever read. Catch-up
+// fails instead, which is what keeps it retryable.
+func TestCatchUpRetriesAfterATransientThreadFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := threadBridge(ctx, t,
+		[]candidate{
+			ownerMsg("100.000100", "already answered"),
+			threadedParent("100.000200", "here is the plan", "100.000400", 1),
+		},
+		[]candidate{
+			reply("100.000400", "100.000200", "the reply that must not be skipped"),
+		},
+	)
+	api.mu.Lock()
+	api.repliesErr = errors.New("rate_limited")
+	api.mu.Unlock()
+
+	if _, err := b.Wait(ctx, MaxWaitTimeout); err == nil {
+		t.Fatal("Wait() = nil error while a thread could not be read, want the failure surfaced")
+	}
+	if got := b.Status().LastTS; got != "100.000100" {
+		t.Errorf("last_ts = %q after a failed catch-up, want it unchanged so the reply is fetched again", got)
+	}
+
+	api.mu.Lock()
+	api.repliesErr = nil
+	api.mu.Unlock()
+
+	result, err := b.Wait(ctx, MaxWaitTimeout)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if got := texts(result.Messages); !reflect.DeepEqual(got, []string{"here is the plan", "the reply that must not be skipped"}) {
+		t.Errorf("Wait() messages = %v, want the reply recovered on the retry", got)
+	}
+}
+
+// A thread the owner worked through overnight can hold more replies than one
+// page, and the cursor is about to move past all of them.
+func TestCatchUpPagesThroughALongThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := threadBridge(ctx, t,
+		[]candidate{
+			ownerMsg("100.000100", "already answered"),
+			threadedParent("100.000200", "here is the plan", "100.000400", 2),
+		},
+		[]candidate{
+			reply("100.000300", "100.000200", "first page"),
+			reply("100.000400", "100.000200", "second page"),
+		},
+	)
+	// One reply per page, so the thread only comes back in full if the cursor
+	// Slack hands over is followed.
+	api.mu.Lock()
+	api.repliesPageSize = 1
+	api.mu.Unlock()
+
+	result, err := b.Wait(ctx, MaxWaitTimeout)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	want := []string{"here is the plan", "first page", "second page"}
+	if got := texts(result.Messages); !reflect.DeepEqual(got, want) {
+		t.Errorf("Wait() messages = %v, want %v; the thread was not paged to the end", got, want)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,8 +24,11 @@ type fakeAPI struct {
 	historyCalls []HistoryRequest
 	replyCalls   []RepliesRequest
 	// replies is the thread conversations.replies serves, oldest first.
-	replies    []candidate
-	repliesErr error
+	replies []candidate
+	// repliesPageSize, when set, makes the fake page its replies the way
+	// Slack does, handing back a cursor.
+	repliesPageSize int
+	repliesErr      error
 	// names is what users.info resolves, and nameLookups counts the calls so a
 	// test can see the cache working.
 	names       map[string]string
@@ -113,6 +117,29 @@ func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, e
 			continue
 		}
 		matched = append(matched, c)
+	}
+
+	// Slack pages long threads. The cursor here is simply how many replies the
+	// caller has already been given.
+	if size := f.repliesPageSize; size > 0 {
+		start := 0
+		if req.Cursor != "" {
+			var err error
+			if start, err = strconv.Atoi(req.Cursor); err != nil {
+				return HistoryPage{}, err
+			}
+		}
+		if start > len(matched) {
+			start = len(matched)
+		}
+		end := min(start+size, len(matched))
+
+		page := HistoryPage{Messages: matched[start:end]}
+		if end < len(matched) {
+			page.NextCursor = strconv.Itoa(end)
+			page.HasMore = true
+		}
+		return page, nil
 	}
 	return HistoryPage{Messages: matched}, nil
 }

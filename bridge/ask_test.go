@@ -372,6 +372,28 @@ func TestAskExpiresTheQuestionWhenTheCallIsAborted(t *testing.T) {
 	}
 }
 
+// A dead socket cannot deliver a click, so the buttons must not outlive it.
+func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	go func() {
+		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
+		close(stream.events)
+	}()
+
+	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err == nil {
+		t.Fatal("Ask() = nil error after the connection closed, want the disconnection reported")
+	}
+
+	resolutions := api.snapshotResolutions()
+	if len(resolutions) != 1 || !strings.Contains(resolutions[0].Text, "⌛") {
+		t.Errorf("resolutions = %+v, want the unanswerable question expired", resolutions)
+	}
+}
+
 // pendingAskTS reports the ts of the question waiting for an answer, for tests
 // that need to know the question has actually been posted.
 func (b *Bridge) pendingAskTS() string {

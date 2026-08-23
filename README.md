@@ -119,9 +119,9 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 ```
 
 `slack_status` answers `"connected": false` until the first tool call that
-needs Slack — `slack_wait`, `slack_post`, `slack_ack` or `slack_ask`, whichever
-comes first — which is the lazy connect working as intended rather than a
-problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
+needs Slack — `slack_wait`, `slack_post`, `slack_ack`, `slack_ask` or
+`slack_history`, whichever comes first — which is the lazy connect working as
+intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
 

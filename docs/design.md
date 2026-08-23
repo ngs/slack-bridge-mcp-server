@@ -125,16 +125,30 @@ keeping their `thread_ts` so the agent answers where the owner is talking.
 Two limits keep this from growing into a crawl of the channel:
 
 - Only the newest 200 surface messages are scanned for threads. A reply added
-  to a thread that has since been pushed past that window is not recovered —
-  accepted, because the alternative is walking the whole channel on every
-  reconnect.
-- At most 20 threads are read per catch-up, logged when it truncates. What is
-  missed arrives with the next reply in that thread.
+  to a thread that has since been pushed past that window is not recovered.
+- At most 20 threads are read per catch-up, newest-first, which is where a
+  conversation the owner is actually having will be.
+
+Both limits lose messages when they bite, and it is worth being exact about
+that rather than comfortable: the cursor advances to the newest message that
+*was* recovered, so replies in a skipped thread are older than the cursor from
+then on and no later pass goes back for them. The server logs the skip count
+saying as much. The alternative — a cursor per thread, or refusing to advance
+past any thread not examined — buys completeness at the price of a single
+recoverable position in the channel, which is the thing that makes sleep
+recovery simple enough to trust. Within a thread that *is* read there is no
+such gap: it is paged to the end of the window before the cursor moves.
 
 The pass is skipped entirely when there is no cursor, for the same reason the
-first run does not replay the channel. A thread that cannot be read — a deleted
-parent is the usual cause — is logged and skipped rather than failing catch-up,
-since one bad thread must never be able to wedge every later message behind it.
+first run does not replay the channel.
+
+A failure to read one thread is answered by what kind of failure it is. A
+thread that is not there — a deleted parent, or the bot no longer in the
+channel — will not be there next time either, so it is logged and skipped;
+failing forever on it would wedge every later message behind it. Anything else,
+a rate limit or a network blip, fails the whole catch-up on purpose: the cursor
+stays where it is and the next attempt asks for the same window again, rather
+than stepping over replies nobody ever read.
 
 One consequence is worth stating: the cursor can now land on a thread reply
 whose timestamp is newer than every surface message. That is correct. The

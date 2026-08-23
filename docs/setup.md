@@ -178,8 +178,9 @@ via direnv or your shell profile.
 Restart the CLI and ask it to call `slack_status`. On a fresh session it
 answers `"connected": false`, and **that is the expected answer**: the server
 does not open a socket until the first tool call that actually needs Slack —
-`slack_wait`, `slack_post`, `slack_ack` or `slack_ask`, whichever you reach
-first — so that it can sit in every project's `.mcp.json` without connecting in
+`slack_wait`, `slack_post`, `slack_ack`, `slack_ask` or `slack_history`,
+whichever you reach first — so that it can sit in every project's `.mcp.json`
+without connecting in
 sessions that never use it. `slack_status` itself never connects, which is what
 makes it useful when something is misconfigured. What matters at this point is
 that `config_error` is absent — if it is there, it names the variables that did
@@ -278,7 +279,8 @@ history does not return those, so the bridge separately looks for threads
 replied to since its cursor and reads them. It scans the newest 200 messages
 for such threads and reads at most 20 of them per reconnect, which is generous
 for a night's sleep and stops a long absence from turning into a crawl of the
-channel.
+channel. Past those limits replies are genuinely missed rather than deferred,
+and the server says so on stderr when it happens.
 
 **Tapping a `slack_ask` button does nothing.** Interactivity is off on the app.
 Turn it on under **Interactivity & Shortcuts** — it is a setting, not a scope,

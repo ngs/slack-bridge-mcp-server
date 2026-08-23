@@ -103,6 +103,29 @@ func indicatorPosts(api *fakeAPI) []postCall {
 	return found
 }
 
+// Close runs as the process is about to exit, and the chat.delete that clears
+// the indicator lives on a goroutine that exiting would kill. If Close did not
+// wait for it, the owner would be left with a "⏳ Working…" message that never
+// goes away.
+func TestCloseWaitsForTheIndicatorToClearTheChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// No polling: by the time Close returns, the deletion has already
+	// happened, which is the whole point of waiting for it.
+	if got := api.snapshotDeletes(); len(got) != 1 {
+		t.Errorf("deletes after Close() = %+v, want the indicator message already removed", got)
+	}
+}
+
 // The common case is a reply within seconds. Nothing should reach the channel
 // then, or the owner gets a "working…" note that is gone before it can be read.
 func TestNoIndicatorForRepliesFasterThanTheGracePeriod(t *testing.T) {

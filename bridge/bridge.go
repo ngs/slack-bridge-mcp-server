@@ -38,6 +38,12 @@ const (
 	maxThreadsPerCatchUp = 20
 )
 
+// shutdownIndicatorWait is how long Close waits for the indicator to delete
+// its message. It is the indicator's own delete timeout plus a margin, so the
+// wait ends because the delete finished or failed, not because the two clocks
+// disagreed.
+const shutdownIndicatorWait = indicatorDeleteTimeout + 2*time.Second
+
 // Bridge owns the Slack connection and the message cursor. All six MCP tools
 // go through it.
 type Bridge struct {
@@ -127,19 +133,37 @@ func (b *Bridge) Status() Status {
 	return status
 }
 
-// Close releases the lock and is safe to call on a bridge that never
-// connected.
+// Close retires the indicator and releases the lock. It is safe to call on a
+// bridge that never connected.
+//
+// Unlike the tool calls, which never wait on the indicator, this one does: it
+// runs as the process is about to exit, and the indicator's chat.delete lives
+// on a goroutine that exiting would kill. Waiting for it here is the
+// difference between the channel being left tidy and a "⏳ Working…" message
+// sitting there until someone notices. The wait is bounded, so a Slack that
+// never answers delays shutdown rather than preventing it.
 func (b *Bridge) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	b.connected = false
 	b.stopIndicatorLocked()
-	if b.lock == nil {
-		return nil
-	}
+	done := b.indicatorDone
 	lock := b.lock
 	b.lock = nil
+	b.mu.Unlock()
+
+	if done != nil {
+		timeout := time.NewTimer(shutdownIndicatorWait)
+		defer timeout.Stop()
+		select {
+		case <-done:
+		case <-timeout.C:
+			log.Printf("gave up waiting for the processing indicator to clear itself from the channel")
+		}
+	}
+
+	if lock == nil {
+		return nil
+	}
 	return lock.Release()
 }
 
@@ -420,12 +444,14 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 // Slack puts on every threaded parent: newer than the cursor means somebody
 // has spoken in there since the bridge last looked.
 //
-// Two caps keep the scan bounded, and both are real limits rather than
-// theoretical ones. Only the newest threadScanLimit surface messages are
-// examined, so a reply added to a thread that has since been pushed off that
-// window is lost — accepted, because the alternative is walking the channel's
-// whole history on every reconnect. And at most maxThreadsPerCatchUp threads
-// are read, which is logged when it bites.
+// Two caps keep the scan bounded, and both lose messages when they bite, which
+// is the trade accepted here rather than walking the channel's whole history
+// on every reconnect. Only the newest threadScanLimit surface messages are
+// examined, so a reply in a thread pushed off that window is never seen. And
+// at most maxThreadsPerCatchUp threads are read: the cursor advances past the
+// rest, so their replies are not recovered later either. Both are logged, and
+// the threads read are the ones nearest the top of the channel, which is where
+// a conversation the owner is actually having will be.
 func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
 	if after == "" {
 		// A first run seeds the cursor from the newest message instead of
@@ -442,29 +468,66 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 	var (
 		messages []Message
 		walked   int
+		skipped  int
 	)
 	for _, parent := range page.Messages {
 		if parent.TS == "" || parent.LatestReply == "" || !tsLess(after, parent.LatestReply) {
 			continue
 		}
 		if walked >= maxThreadsPerCatchUp {
-			log.Printf("catch-up stopped after %d threads; the rest will be recovered as they are replied to", maxThreadsPerCatchUp)
-			break
+			skipped++
+			continue
 		}
 		walked++
 
+		replies, err := readThread(ctx, api, channel, owner, parent.TS, after)
+		if err != nil {
+			if !errors.Is(err, ErrThreadUnreadable) {
+				// Slack said "not now" rather than "not there". Failing the
+				// whole catch-up is what keeps it retryable: the cursor stays
+				// where it is, and the next attempt asks for the same window
+				// again instead of stepping over replies it never read.
+				return nil, err
+			}
+			// A thread that no longer exists will not exist next time either,
+			// and failing forever on it would wedge every later message
+			// behind it.
+			log.Printf("skipping a thread that cannot be read: %s", logSafe(err.Error(), maxLoggedError))
+			continue
+		}
+		messages = append(messages, replies...)
+	}
+
+	if skipped > 0 {
+		// Said plainly, because it is a loss and not a deferral: the cursor is
+		// about to move past these replies, and nothing goes back for them.
+		log.Printf("catch-up read %d threads and skipped %d with newer replies; replies in the skipped threads will not be delivered",
+			walked, skipped)
+	}
+	return messages, nil
+}
+
+// readThread collects the owner's replies in one thread, newer than after,
+// following Slack's paging to the end of the window.
+//
+// Paging matters here: a thread the owner worked through while the bridge was
+// away can hold more replies than one page, and the caller is about to move
+// the cursor past all of them.
+func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) ([]Message, error) {
+	var (
+		messages []Message
+		cursor   string
+	)
+	for page := 0; page < maxHistoryPages; page++ {
 		replies, err := api.Replies(ctx, RepliesRequest{
 			Channel:  channel,
-			ThreadTS: parent.TS,
+			ThreadTS: threadTS,
 			Oldest:   after,
+			Cursor:   cursor,
 			Limit:    historyPageLimit,
 		})
 		if err != nil {
-			// One unreadable thread — a deleted parent, most often — must not
-			// wedge the relay: failing the whole catch-up would keep every
-			// later message waiting behind it, every time.
-			log.Printf("could not read a thread during catch-up: %s", logSafe(err.Error(), maxLoggedError))
-			continue
+			return nil, err
 		}
 
 		for _, c := range replies.Messages {
@@ -472,8 +535,12 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 				messages = append(messages, msg)
 			}
 		}
-	}
 
+		cursor = replies.NextCursor
+		if cursor == "" {
+			break
+		}
+	}
 	return messages, nil
 }
 
