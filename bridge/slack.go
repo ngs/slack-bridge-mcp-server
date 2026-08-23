@@ -94,7 +94,9 @@ type API interface {
 	BotUserID() string
 	// Post sends an agent-written message to a channel, optionally into a
 	// thread, and returns the timestamp of the posted message. The text is
-	// Markdown, and Slack renders it.
+	// Markdown, and Slack renders it — except when it is too long for that,
+	// where an implementation may fall back to sending it as the body, with
+	// only Slack's own mrkdwn applied.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)
 	// PostPlain sends a message as the body text alone, with no blocks, so a
 	// later text-only Update replaces all of what the channel shows. It

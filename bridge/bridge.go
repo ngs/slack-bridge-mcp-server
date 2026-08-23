@@ -818,7 +818,9 @@ type PostRequest struct {
 // Post sends a message to a channel, connecting first if needed.
 //
 // The text goes out as standard Markdown in a markdown block, which Slack
-// renders, so a reply is not delivered with its asterisks showing.
+// renders, so a reply is not delivered with its asterisks showing. Past what
+// a block holds it goes as the message body instead, where Slack applies its
+// own mrkdwn and nothing else — whole, but with its Markdown showing.
 func (b *Bridge) Post(ctx context.Context, req PostRequest) (string, error) {
 	if req.Text == "" {
 		return "", errors.New("text is required")

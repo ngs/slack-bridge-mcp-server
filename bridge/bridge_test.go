@@ -99,7 +99,13 @@ func (f *fakeAPI) JoinedChannels(_ context.Context, limit int) ([]string, error)
 	return append([]string(nil), joined...), nil
 }
 
-type postCall struct{ Channel, ThreadTS, Text string }
+type postCall struct {
+	Channel, ThreadTS, Text string
+	// Plain records that this went through PostPlain rather than Post, which
+	// is the difference between an indicator that can be updated and one
+	// frozen behind its own block.
+	Plain bool
+}
 type questionCall struct {
 	Channel  string
 	ThreadTS string
@@ -235,10 +241,15 @@ func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (strin
 	return f.postTS, nil
 }
 
-// PostPlain records the same way Post does: the indicator tests read these
-// back by their text, and which method carried them is not what they assert.
-func (f *fakeAPI) PostPlain(ctx context.Context, channel, threadTS, text string) (string, error) {
-	return f.Post(ctx, channel, threadTS, text)
+func (f *fakeAPI) PostPlain(_ context.Context, channel, threadTS, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.posts = append(f.posts, postCall{Channel: channel, ThreadTS: threadTS, Text: text, Plain: true})
+	if f.postErr != nil {
+		return "", f.postErr
+	}
+	return f.postTS, nil
 }
 
 func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {

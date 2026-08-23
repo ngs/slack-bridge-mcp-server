@@ -431,7 +431,8 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
 - **Attachments and files.** Text only. Messages whose body is empty because
   the content is a file are dropped rather than relayed as an empty string.
 - **Block Kit beyond what a reply needs.** Messages go out as a markdown block,
-  and `slack_ask` adds one actions block of buttons. No modals, no slash
-  commands, and no interactivity payloads beyond a button click.
+  and `slack_ask` adds one actions block of buttons; text too big for a block
+  falls back to the message body, where only Slack's mrkdwn applies. No modals,
+  no slash commands, and no interactivity payloads beyond a button click.
 - **Editing and deletion.** `message_changed` and `message_deleted` are ignored;
   an edited message is not re-delivered.
