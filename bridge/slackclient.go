@@ -95,7 +95,7 @@ func (w *webAPI) JoinedChannels(ctx context.Context, limit int) ([]string, error
 		Limit:           limit,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("users.conversations: %w", err)
+		return nil, apiError("users.conversations", err)
 	}
 
 	ids := make([]string, 0, len(channels))
@@ -114,7 +114,7 @@ func (w *webAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, 
 		Limit:     req.Limit,
 	})
 	if err != nil {
-		return HistoryPage{}, fmt.Errorf("conversations.history: %w", err)
+		return HistoryPage{}, apiError("conversations.history", err)
 	}
 
 	page := HistoryPage{
@@ -146,7 +146,7 @@ func (w *webAPI) Replies(ctx context.Context, req RepliesRequest) (HistoryPage, 
 		if errors.As(err, &slackErr) && permanentThreadErrors[slackErr.Err] {
 			return HistoryPage{}, fmt.Errorf("%w: %s", ErrThreadUnreadable, slackErr.Err)
 		}
-		return HistoryPage{}, fmt.Errorf("conversations.replies: %w", err)
+		return HistoryPage{}, apiError("conversations.replies", err)
 	}
 
 	page := HistoryPage{
@@ -289,6 +289,19 @@ func (w *webAPI) React(ctx context.Context, channel, ts, emoji string) error {
 		return ErrAlreadyReacted
 	}
 	return fmt.Errorf("reactions.add: %w", err)
+}
+
+// apiError names the method that failed and marks the one failure a caller may
+// want to answer with something other than an error: a scope the installation
+// does not have. Slack reports that as `missing_scope`, and it stays true until
+// somebody reinstalls the app, so the callers that can carry on without the
+// call recognise it and do.
+func apiError(method string, err error) error {
+	var slackErr slack.SlackErrorResponse
+	if errors.As(err, &slackErr) && slackErr.Err == "missing_scope" {
+		return fmt.Errorf("%s: %w", method, ErrMissingScope)
+	}
+	return fmt.Errorf("%s: %w", method, err)
 }
 
 // permanentThreadErrors are the conversations.replies failures that will still

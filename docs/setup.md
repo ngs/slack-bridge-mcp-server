@@ -82,10 +82,12 @@ gain them on its own. Two upgrades need one:
 - `users:read`, if you are coming from a version before `slack_history` existed
   — though that tool works without it too, showing raw user IDs instead of
   names, so the reinstall can wait until it suits you.
-- `channels:history`, `channels:read` and `groups:read`, if you are coming from
-  a version before conversations outside the home channel existed. Without them
-  the home channel works exactly as before and nothing else does, which is a
-  perfectly good place to stay until you want the rest.
+- `channels:read` and `groups:read`, plus `channels:history` and
+  `groups:history` for the public and private channels it should be reading, if
+  you are coming from a version before conversations outside the home channel
+  existed. Without them the home channel works exactly as before and nothing
+  else does, which is a perfectly good place to stay until you want the rest;
+  the server says once on stderr which scope it was refused.
 
 Event subscriptions and interactivity, by contrast, are settings rather than
 scopes: adding `app_mention` or turning interactivity on needs no reinstall.
@@ -307,6 +309,17 @@ and the server says so on stderr when it happens.
 **Tapping a `slack_ask` button does nothing.** Interactivity is off on the app.
 Turn it on under **Interactivity & Shortcuts** — it is a setting, not a scope,
 so nothing needs reinstalling — and ask again.
+
+**A mention in another channel is never picked up after a sleep, and stderr
+says a scope is missing.** The app predates conversations outside the home
+channel and has not been reinstalled since, so `users.conversations` — or
+reading a page of a channel that is not the home one — is refused. The bridge
+says so once and turns that catch-up off for the rest of the connection rather
+than failing the calls around it: the home channel, the live stream and every
+other tool go on working. Add `channels:read` and `groups:read` under **OAuth &
+Permissions** — plus `channels:history` and `groups:history` for the public and
+private channels it should be reading — then reinstall and restart the session:
+the next connection tries again.
 
 **`slack_history` shows user IDs instead of names.** The `users:read` scope is
 missing. Add it under **OAuth & Permissions** and reinstall the app — a scope,

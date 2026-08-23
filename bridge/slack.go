@@ -12,6 +12,13 @@ import (
 // refused this time is retried, so its replies are not stepped over.
 var ErrThreadUnreadable = errors.New("the thread cannot be read")
 
+// ErrMissingScope reports that Slack refused a call because the installed app
+// was never granted the scope it needs. It is distinguished from every other
+// failure because it is not a fault to retry: a scope appears when the app is
+// reinstalled and never before, so the feature that needs it steps aside for
+// the rest of the connection instead of failing the calls around it.
+var ErrMissingScope = errors.New("the Slack app is missing a scope")
+
 // HistoryPage is one page of conversations.history, newest message first, as
 // Slack returns it.
 type HistoryPage struct {

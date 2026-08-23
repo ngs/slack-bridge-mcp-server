@@ -164,14 +164,24 @@ func (b *Bridge) openThreads() map[threadKey]string {
 // conversations.replies — so the thread pass has to run after the scan, or a
 // conversation started while the laptop was asleep would arrive with its
 // opening line and nothing else until the next reconnect.
-func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string) ([]Message, error) {
+func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string, generation uint64) ([]Message, error) {
 	if api == nil {
+		return nil, nil
+	}
+	if b.conversationsAreDegraded(generation) {
+		// Already established that this installation cannot do it. Asking again
+		// on every catch-up would spend two API calls a tick to be told the same
+		// thing, and say so in the log each time.
 		return nil, nil
 	}
 
 	mentions, cursor, err := b.scanForMentions(ctx, api, owner)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, ErrMissingScope) {
+			return nil, err
+		}
+		b.degradeConversations(generation, err)
+		return nil, nil
 	}
 
 	// Opening the threads before the walk is what lets the walk find them, and
@@ -190,13 +200,59 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 
 	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, ErrMissingScope) {
+			return nil, err
+		}
+		// The mentions are already read and are handed over; only the walk
+		// through the threads is given up. Their cursors have not moved, so the
+		// replies are still there to be found once the app is reinstalled.
+		b.degradeConversations(generation, err)
+		replies = nil
 	}
 
 	if cursor != "" {
 		b.noteMentionCursor(cursor)
 	}
 	return mergeConversations(mentions, replies), nil
+}
+
+// conversationsAreDegraded reports whether the catch-up outside the home
+// channel has been given up on for this connection.
+func (b *Bridge) conversationsAreDegraded(generation uint64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Generations start at one, so a zero never matches a connection that has
+	// actually been refused.
+	return generation != 0 && b.degradedGeneration == generation
+}
+
+// degradeConversations turns off the catch-up outside the home channel for the
+// rest of the connection, and says once what the operator has to do about it.
+//
+// The alternative — failing the call — is what the bridge used to do, and it
+// took an app that had simply not been reinstalled since these scopes were
+// added and stopped it receiving anything at all, home channel included. A
+// feature nobody has granted permission for is not an error; it is a feature
+// that is off.
+//
+// The generation is the connection the refusal came from. A catch-up runs with
+// b.mu released, so a slow one can still be in flight when the connection is
+// replaced — and a refusal from the installation as it was must not switch off
+// the first scan of a connection whose scopes may well be there.
+func (b *Bridge) degradeConversations(generation uint64, err error) {
+	b.mu.Lock()
+	stale := generation != b.connGeneration
+	already := b.degradedGeneration == generation
+	if !stale {
+		b.degradedGeneration = generation
+	}
+	b.mu.Unlock()
+
+	if stale || already {
+		return
+	}
+	log.Printf("slack refused a call for want of a scope (%s); conversations outside the home channel are off until the app is reinstalled with channels:read and groups:read, plus channels:history and groups:history for the channels it should read. The home channel is unaffected.",
+		logSafe(err.Error(), maxLoggedError))
 }
 
 // catchUpThreadConversations reads every open thread from the point it was
