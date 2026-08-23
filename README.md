@@ -327,6 +327,16 @@ Keep replies short — I am reading them on a phone.
 Then message the channel from anywhere — or mention the app in any other
 channel it has been added to.
 
+### Example skill
+
+For a session you start this way often, the loop is better kept as a Claude
+Code skill than pasted in each time.
+[examples/attend/SKILL.md](examples/attend/SKILL.md) is a generic one: the same
+loop, plus when to reach for each of the other tools and how to treat what
+comes back. Copy it to `.claude/skills/attend/SKILL.md` in a project, or to
+`~/.claude/skills/attend/SKILL.md` for every project, and start the session
+with `/attend`.
+
 ## Manual smoke test
 
 With the binary built, this drives the MCP handshake by hand and should list
