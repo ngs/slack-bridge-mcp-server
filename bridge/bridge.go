@@ -29,6 +29,15 @@ const (
 	maxHistoryPages  = 5
 )
 
+// Bounds on the thread pass of catch-up. threadScanLimit is how far back the
+// bridge looks for threads that have been replied to; maxThreadsPerCatchUp is
+// how many of those it will actually read. Together they put a ceiling of
+// twenty-one API calls on recovering a night's worth of threaded conversation.
+const (
+	threadScanLimit      = 200
+	maxThreadsPerCatchUp = 20
+)
+
 // Bridge owns the Slack connection and the message cursor. All six MCP tools
 // go through it.
 type Bridge struct {
@@ -353,10 +362,14 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 	return ts, nil
 }
 
-// catchUp walks conversations.history forward from after, returning the owner
-// messages Slack has that the caller has not seen. conversations.history
-// returns every author in the channel, so the same owner filter the live
-// stream applies has to be applied here too.
+// catchUp returns the owner messages Slack has that the caller has not seen.
+// conversations.history returns every author in the channel, so the same owner
+// filter the live stream applies has to be applied here too.
+//
+// It takes two passes, because one is not enough: conversations.history only
+// ever returns channel-surface messages, so a reply the owner typed inside a
+// thread while the bridge was away is invisible to it. The second pass goes
+// and finds those.
 func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
 	if api == nil {
 		return nil, errors.New("the bridge is not connected to Slack")
@@ -389,8 +402,79 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 		}
 	}
 
+	replies, err := catchUpThreads(ctx, api, channel, owner, after)
+	if err != nil {
+		return nil, err
+	}
+
 	// History pages arrive newest-first; mergeMessages sorts and deduplicates.
-	return mergeMessages(after, messages), nil
+	return mergeMessages(after, messages, replies), nil
+}
+
+// catchUpThreads recovers thread replies newer than the cursor.
+//
+// A thread reply never appears in conversations.history, and its parent may be
+// far older than the cursor — an hour of conversation can hang off a message
+// from last week — so the window that finds the parents deliberately ignores
+// the cursor. What identifies a thread worth reading is latest_reply, which
+// Slack puts on every threaded parent: newer than the cursor means somebody
+// has spoken in there since the bridge last looked.
+//
+// Two caps keep the scan bounded, and both are real limits rather than
+// theoretical ones. Only the newest threadScanLimit surface messages are
+// examined, so a reply added to a thread that has since been pushed off that
+// window is lost — accepted, because the alternative is walking the channel's
+// whole history on every reconnect. And at most maxThreadsPerCatchUp threads
+// are read, which is logged when it bites.
+func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
+	if after == "" {
+		// A first run seeds the cursor from the newest message instead of
+		// replaying, and reading every thread in the channel would be exactly
+		// the replay that avoids.
+		return nil, nil
+	}
+
+	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		messages []Message
+		walked   int
+	)
+	for _, parent := range page.Messages {
+		if parent.TS == "" || parent.LatestReply == "" || !tsLess(after, parent.LatestReply) {
+			continue
+		}
+		if walked >= maxThreadsPerCatchUp {
+			log.Printf("catch-up stopped after %d threads; the rest will be recovered as they are replied to", maxThreadsPerCatchUp)
+			break
+		}
+		walked++
+
+		replies, err := api.Replies(ctx, RepliesRequest{
+			Channel:  channel,
+			ThreadTS: parent.TS,
+			Oldest:   after,
+			Limit:    historyPageLimit,
+		})
+		if err != nil {
+			// One unreadable thread — a deleted parent, most often — must not
+			// wedge the relay: failing the whole catch-up would keep every
+			// later message waiting behind it, every time.
+			log.Printf("could not read a thread during catch-up: %s", logSafe(err.Error(), maxLoggedError))
+			continue
+		}
+
+		for _, c := range replies.Messages {
+			if msg, ok := accept(c, channel, owner); ok {
+				messages = append(messages, msg)
+			}
+		}
+	}
+
+	return messages, nil
 }
 
 // ClampTimeout turns the tool's timeout_seconds argument into a duration,

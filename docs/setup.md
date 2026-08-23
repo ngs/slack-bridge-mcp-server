@@ -273,7 +273,12 @@ instructions.
 dies with the network, and on reconnect the bridge re-reads the window after
 its cursor from `conversations.history` and merges it with whatever the socket
 delivered, deduplicating by timestamp. The backlog arrives on the next
-`slack_wait` as a single array.
+`slack_wait` as a single array. Replies you typed inside a thread come back too:
+history does not return those, so the bridge separately looks for threads
+replied to since its cursor and reads them. It scans the newest 200 messages
+for such threads and reads at most 20 of them per reconnect, which is generous
+for a night's sleep and stops a long absence from turning into a crawl of the
+channel.
 
 **Tapping a `slack_ask` button does nothing.** Interactivity is off on the app.
 Turn it on under **Interactivity & Shortcuts** — it is a setting, not a scope,

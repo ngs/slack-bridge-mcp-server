@@ -101,7 +101,20 @@ func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, e
 	if f.repliesErr != nil {
 		return HistoryPage{}, f.repliesErr
 	}
-	return HistoryPage{Messages: append([]candidate(nil), f.replies...)}, nil
+
+	// Slack returns the parent plus the replies belonging to that thread,
+	// oldest first, honouring the same oldest bound as history.
+	matched := make([]candidate, 0, len(f.replies))
+	for _, c := range f.replies {
+		if req.ThreadTS != "" && c.ThreadTS != req.ThreadTS && c.TS != req.ThreadTS {
+			continue
+		}
+		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
+			continue
+		}
+		matched = append(matched, c)
+	}
+	return HistoryPage{Messages: matched}, nil
 }
 
 func (f *fakeAPI) UserName(_ context.Context, userID string) (string, error) {

@@ -132,15 +132,16 @@ func (w *webAPI) UserName(ctx context.Context, userID string) (string, error) {
 // echo it back on each message.
 func toCandidate(channel string, m slack.Message) candidate {
 	return candidate{
-		Channel:    channel,
-		User:       m.User,
-		BotID:      m.BotID,
-		SubType:    m.SubType,
-		Text:       m.Text,
-		TS:         m.Timestamp,
-		ThreadTS:   m.ThreadTimestamp,
-		Username:   m.Username,
-		ReplyCount: m.ReplyCount,
+		Channel:     channel,
+		User:        m.User,
+		BotID:       m.BotID,
+		SubType:     m.SubType,
+		Text:        m.Text,
+		TS:          m.Timestamp,
+		ThreadTS:    m.ThreadTimestamp,
+		Username:    m.Username,
+		ReplyCount:  m.ReplyCount,
+		LatestReply: m.LatestReply,
 	}
 }
 

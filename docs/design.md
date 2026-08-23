@@ -105,6 +105,42 @@ The first run against a channel is the one case where catch-up is skipped. With
 no cursor, the bridge records the newest existing message and starts from there,
 rather than replaying the channel's entire history into the model's context.
 
+#### Thread replies need a second pass
+
+`conversations.history` returns the channel surface and nothing else: a reply
+inside a thread is invisible to it. That was a real bug rather than a
+theoretical one — with a thread-first conversation habit, a reply typed while
+the laptop slept was never delivered at all, and `slack_wait` sat blocked until
+the owner said something new on the surface.
+
+So catch-up runs a second pass. It fetches one page of recent surface messages
+**without** the cursor bound, because a thread whose parent is a week old can
+still have a reply from five minutes ago, and looks at `latest_reply`, which
+Slack puts on every threaded parent. A parent whose newest reply is later than
+the cursor has been talked in since the bridge last looked, so the bridge reads
+that thread with `conversations.replies` from the cursor forward. Recovered
+replies go through the same owner filter and the same merge as everything else,
+keeping their `thread_ts` so the agent answers where the owner is talking.
+
+Two limits keep this from growing into a crawl of the channel:
+
+- Only the newest 200 surface messages are scanned for threads. A reply added
+  to a thread that has since been pushed past that window is not recovered —
+  accepted, because the alternative is walking the whole channel on every
+  reconnect.
+- At most 20 threads are read per catch-up, logged when it truncates. What is
+  missed arrives with the next reply in that thread.
+
+The pass is skipped entirely when there is no cursor, for the same reason the
+first run does not replay the channel. A thread that cannot be read — a deleted
+parent is the usual cause — is logged and skipped rather than failing catch-up,
+since one bad thread must never be able to wedge every later message behind it.
+
+One consequence is worth stating: the cursor can now land on a thread reply
+whose timestamp is newer than every surface message. That is correct. The
+cursor tracks what the agent has been handed, not where the channel surface has
+got to.
+
 ### 4. Never spawn AI from the bridge
 
 The bridge transports messages. It does not run `claude -p`, does not shell out,
