@@ -191,7 +191,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_progress",
 		Title:       "Say what you are working on",
-		Description: "Put a short status line beside the elapsed time on the processing indicator, for when you start something long such as waiting for CI. The server keeps it updated and clears it when the turn ends; if no indicator is running, this starts one.",
+		Description: "Put a short status line beside the elapsed time on the processing indicator, for when you start something long such as waiting for CI. The server keeps it updated and clears it when the turn ends; if no indicator is running, this starts one. An answer of ok false means the operator turned the indicator off, so the label had nowhere to go and nothing was posted; carry on with the work either way.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ProgressArgs) (*mcp.CallToolResult, bridge.ProgressResult, error) {
 		result, err := b.Progress(ctx, args.Text, args.ThreadTS)
