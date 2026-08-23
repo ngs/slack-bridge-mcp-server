@@ -178,8 +178,8 @@ via direnv or your shell profile.
 Restart the CLI and ask it to call `slack_status`. On a fresh session it
 answers `"connected": false`, and **that is the expected answer**: the server
 does not open a socket until the first tool call that actually needs Slack —
-`slack_wait`, `slack_post`, `slack_ack`, `slack_ask` or `slack_history`,
-whichever you reach first — so that it can sit in every project's `.mcp.json`
+`slack_wait`, `slack_post`, `slack_ack`, `slack_ask`, `slack_history` or
+`slack_progress`, whichever you reach first — so that it can sit in every project's `.mcp.json`
 without connecting in
 sessions that never use it. `slack_status` itself never connects, which is what
 makes it useful when something is misconfigured. What matters at this point is

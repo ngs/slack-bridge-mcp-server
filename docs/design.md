@@ -202,7 +202,29 @@ function, so a message cannot be relayed live but dropped on catch-up.
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
+| `slack_progress` | `text` (required), `thread_ts` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, and starts one when none is running. `ts` names the indicator's message once it has one. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
+
+### Why slack_progress is a label and not a message
+
+The obvious shape for "tell the owner what you are waiting on" is a second
+message the agent posts and later deletes. It is the wrong one. Two messages
+means two lifetimes to get right, and the failure mode is a stale "waiting for
+CI" left in the channel long after the agent moved on — precisely what the
+indicator's single-owner-goroutine design exists to prevent.
+
+So the label is state on the indicator, and the server keeps owning the
+display. The agent says the thing once; the message that already exists picks it
+up on its next render, carries it through every update, and takes it away when
+the turn ends. There is nothing for the agent to clean up, and no way for it to
+leave two progress messages behind.
+
+Cutting the grace period short falls out of the same reasoning. The grace period
+is a bet that the answer is seconds away and the channel is better off quiet;
+`slack_progress` is the agent saying that bet is lost. Waiting it out anyway
+would hold back the one message the owner is now waiting for. The predecessor
+handover is not skipped with it: that one is not a bet but an invariant, and
+"never two indicators at once" outranks being prompt.
 
 ### Why slack_history ignores the owner filter
 

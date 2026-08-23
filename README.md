@@ -119,8 +119,8 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 ```
 
 `slack_status` answers `"connected": false` until the first tool call that
-needs Slack — `slack_wait`, `slack_post`, `slack_ack`, `slack_ask` or
-`slack_history`, whichever comes first — which is the lazy connect working as
+needs Slack — `slack_wait`, `slack_post`, `slack_ack`, `slack_ask`,
+`slack_history` or `slack_progress`, whichever comes first — which is the lazy connect working as
 intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
@@ -132,6 +132,7 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
+| `slack_progress` | `text` (required), `thread_ts` (optional, only used if no indicator is running) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is empty while the indicator has yet to post, and `ok` is false when the indicator is turned off. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
@@ -221,6 +222,29 @@ The whole feature is best effort: if Slack refuses any of these calls, the
 failure is logged to stderr and the tools carry on unaffected. Set
 `SLACK_BRIDGE_INDICATOR=off` to turn it off.
 
+## Saying what you are waiting on
+
+A stopwatch says the agent is busy, not what with. When it starts something long
+— a CI run, a release pipeline, a build — one `slack_progress` call puts the
+answer next to the clock:
+
+> ⏳ Working… (4m 10s) — release chain: waiting for CI
+
+The agent says it once and the server does the rest: the label rides every
+update from then on and goes away with the indicator, so there is no second
+message to keep alive or clean up. Calling it again replaces the label, and the
+next turn starts with a bare stopwatch again.
+
+It also brings the indicator forward. The grace period exists because most
+answers arrive in seconds; an agent calling `slack_progress` has just said this
+one will not, so the message is posted straight away instead of waiting the
+grace period out. If no indicator is running at all — long work started after a
+`slack_wait` timed out, say — this starts one, in `thread_ts` if you pass it,
+and it retires on the next reply or wait like any other.
+
+With `SLACK_BRIDGE_INDICATOR=off` there is nowhere to put a label, so the call
+does nothing and answers `{"ok": false}`.
+
 ## Running a resident session
 
 Start a session and give it a loop like this:
@@ -237,7 +261,10 @@ do not stop:
    to say something an emoji says well — done, rejected, picked up by hand.
 4. If you need a decision from me before you can go on, call slack_ask with the
    question and the answers to choose from, and act on what I tap.
-5. Go back to step 1.
+5. If something is going to take a while — CI, a release, a long build — call
+   slack_progress once with what you are waiting on, so I can see it from the
+   channel.
+6. Go back to step 1.
 
 Keep replies short — I am reading them on a phone.
 ```
@@ -247,7 +274,7 @@ Then message the channel from anywhere.
 ## Manual smoke test
 
 With the binary built, this drives the MCP handshake by hand and should list
-the six tools. It needs no Slack credentials: listing the tools calls none of
+the seven tools. It needs no Slack credentials: listing the tools calls none of
 them, and it is the calls that connect.
 
 ```sh

@@ -66,6 +66,21 @@ type indicator struct {
 	// from being visible at once when the outgoing chat.delete is slow.
 	predecessor <-chan struct{}
 
+	// labelMu guards label and postedTS, both of which the goroutine writes or
+	// reads while a tool call may be touching them from outside.
+	labelMu sync.Mutex
+	// label is what slack_progress last said the agent is waiting on, shown
+	// next to the elapsed time. Empty until the agent says something.
+	label string
+	// postedTS is the message the indicator is updating, once it exists.
+	postedTS string
+
+	// nudge asks the goroutine to show what has just changed: it cuts the grace
+	// period short before the first post and forces an update in place after
+	// it. One slot is enough, because a second signal would only repeat what
+	// the first already said.
+	nudge chan struct{}
+
 	stopOnce sync.Once
 	stopped  chan struct{}
 	// done is closed once the goroutine has finished, deletion included.
@@ -82,6 +97,7 @@ func newIndicator(ctx context.Context, api API, channel, threadTS string, grace,
 		interval:    interval,
 		startedAt:   time.Now(),
 		predecessor: predecessor,
+		nudge:       make(chan struct{}, 1),
 		stopped:     make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -115,6 +131,9 @@ func (in *indicator) run() {
 		return
 	case <-in.ctx.Done():
 		return
+	case <-in.nudge:
+		// The agent has said this will take a while, so the silence the grace
+		// period is protecting has nothing left to protect.
 	case <-grace.C:
 	}
 
@@ -143,6 +162,7 @@ func (in *indicator) run() {
 		return
 	}
 	defer in.remove(ts)
+	in.notePosted(ts)
 
 	ticker := time.NewTicker(in.interval)
 	defer ticker.Stop()
@@ -153,14 +173,58 @@ func (in *indicator) run() {
 			return
 		case <-in.ctx.Done():
 			return
+		case <-in.nudge:
+			// A new label should not have to wait out the tick interval: the
+			// owner asked what is being waited on, and the answer is here now.
+			in.tick(ts)
 		case <-ticker.C:
-			if err := in.update(ts); err != nil {
-				// One failed tick is not worth tearing the indicator down;
-				// the next one may well land.
-				log.Printf("could not update the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
-			}
+			in.tick(ts)
 		}
 	}
+}
+
+// tick redraws the message, and treats a failure as nothing worse than a stale
+// line: one bad update is not worth tearing the indicator down, and the next
+// one may well land.
+func (in *indicator) tick(ts string) {
+	if err := in.update(ts); err != nil {
+		log.Printf("could not update the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
+	}
+}
+
+// setLabel attaches the status line the agent gave slack_progress, replacing
+// whatever was there before, and asks the goroutine to show it now — which
+// before the first post means posting now, grace period or not.
+func (in *indicator) setLabel(label string) {
+	in.labelMu.Lock()
+	in.label = label
+	in.labelMu.Unlock()
+
+	select {
+	case in.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// notePosted records the message the indicator lives in, so a tool call can
+// report it back without reaching into the goroutine.
+func (in *indicator) notePosted(ts string) {
+	in.labelMu.Lock()
+	defer in.labelMu.Unlock()
+	in.postedTS = ts
+}
+
+// messageTS is the indicator's message, or empty while it has yet to post one.
+func (in *indicator) messageTS() string {
+	in.labelMu.Lock()
+	defer in.labelMu.Unlock()
+	return in.postedTS
+}
+
+func (in *indicator) currentLabel() string {
+	in.labelMu.Lock()
+	defer in.labelMu.Unlock()
+	return in.label
 }
 
 // finish closes done, which is the promise that the channel is clear of this
@@ -221,7 +285,11 @@ func (in *indicator) remove(ts string) {
 }
 
 func (in *indicator) text() string {
-	return fmt.Sprintf("⏳ Working… (%s)", formatElapsed(time.Since(in.startedAt)))
+	elapsed := fmt.Sprintf("⏳ Working… (%s)", formatElapsed(time.Since(in.startedAt)))
+	if label := in.currentLabel(); label != "" {
+		return elapsed + " — " + label
+	}
+	return elapsed
 }
 
 // formatElapsed renders a duration the way a person reads a stopwatch: seconds
