@@ -142,6 +142,7 @@ function, so a message cannot be relayed live but dropped on catch-up.
 | `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text"}, …], "timed_out": false}`, oldest first. |
 | `slack_post` | `text` (required), `thread_ts` (optional) | `chat.postMessage` to the bound channel. Returns the posted `ts`. |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | `reactions.add` on that message. |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
 
 Out-of-range timeouts are clamped rather than rejected: a caller asking for an
@@ -172,7 +173,9 @@ is a member of.
 
 **The owner filter.** Even inside that channel, only one Slack user ID is
 relayed. Someone else invited to the channel can read the conversation but
-cannot drive the agent.
+cannot drive the agent — and that includes tapping a `slack_ask` button, which
+carries the clicker's user ID and is checked against the owner exactly as a
+message is.
 
 **Credentials stay in the environment.** Tokens are read from the process
 environment and never written to the state file or logged. The state file holds

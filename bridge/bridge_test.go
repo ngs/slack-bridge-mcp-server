@@ -22,13 +22,18 @@ type fakeAPI struct {
 
 	historyCalls []HistoryRequest
 	posts        []postCall
+	questions    []questionCall
 	reactions    []reactionCall
 	updates      []updateCall
+	resolutions  []updateCall
 	deletes      []deleteCall
 	postTS       string
+	questionTS   string
 	postErr      error
+	questionErr  error
 	reactErr     error
 	updateErr    error
+	resolveErr   error
 	deleteErr    error
 	// deleteGate, when set, holds Delete open until the test closes it, which
 	// is how a slow chat.delete is simulated.
@@ -36,6 +41,11 @@ type fakeAPI struct {
 }
 
 type postCall struct{ Channel, ThreadTS, Text string }
+type questionCall struct {
+	Channel  string
+	ThreadTS string
+	Question Question
+}
 type reactionCall struct{ Channel, TS, Emoji string }
 type updateCall struct{ Channel, TS, Text string }
 type deleteCall struct{ Channel, TS string }
@@ -77,6 +87,25 @@ func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (strin
 		return "", f.postErr
 	}
 	return f.postTS, nil
+}
+
+func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.questions = append(f.questions, questionCall{Channel: channel, ThreadTS: threadTS, Question: q})
+	if f.questionErr != nil {
+		return "", f.questionErr
+	}
+	return f.questionTS, nil
+}
+
+func (f *fakeAPI) ResolveQuestion(_ context.Context, channel, ts, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.resolutions = append(f.resolutions, updateCall{Channel: channel, TS: ts, Text: text})
+	return f.resolveErr
 }
 
 func (f *fakeAPI) React(_ context.Context, channel, ts, emoji string) error {

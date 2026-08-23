@@ -60,8 +60,8 @@ The short version, if you have done this kind of thing before:
 brew install ngs/tap/slack-bridge-mcp-server   # or: go install go.ngs.io/slack-bridge-mcp-server@latest
 ```
 
-Create a Slack app with Socket Mode on, an app-level token with
-`connections:write`, the bot scopes `chat:write`, `groups:history` and
+Create a Slack app with Socket Mode and interactivity on, an app-level token
+with `connections:write`, the bot scopes `chat:write`, `groups:history` and
 `reactions:write`, and the `message.groups` bot event. Install it, invite it to
 a private channel, and set the four variables below.
 
@@ -117,9 +117,9 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 ```
 
 `slack_status` answers `"connected": false` until the first tool call that
-needs Slack — `slack_wait`, `slack_post` or `slack_ack`, whichever comes first
-— which is the lazy connect working as intended rather than a problem.
-[docs/setup.md](docs/setup.md) covers the rest of the first run.
+needs Slack — `slack_wait`, `slack_post`, `slack_ack` or `slack_ask`, whichever
+comes first — which is the lazy connect working as intended rather than a
+problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
 
@@ -128,11 +128,35 @@ needs Slack — `slack_wait`, `slack_post` or `slack_ack`, whichever comes first
 | `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text"}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
 | `slack_post` | `text` (required), `thread_ts` (optional) | The posted `ts` |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
 `timed_out: true` result is not an error — just call it again.
+
+## Asking the owner a question
+
+`slack_ask` is the bridge's version of stopping to ask. The agent posts a
+question with one button per answer and blocks until you tap one:
+
+> Ship the fix now, or hold it until the release?
+>
+> `[ Ship now ]` `[ Hold ]` `[ Ask me later ]`
+
+Tapping rewrites the message with your choice and takes the buttons away, so a
+question is answered exactly once; a question nobody answers is marked expired
+when the timeout runs out and returns `timed_out: true`. Only the owner's clicks
+count, and only one question can be outstanding at a time — a second `slack_ask`
+while one is pending is refused rather than queued.
+
+The elapsed-time indicator below stops while the question is up, since the agent
+is not the one working, and starts again on your answer.
+
+The app needs **Interactivity** turned on for the clicks to arrive; the
+[manifest](docs/slack-app-manifest.yaml) sets it, and for an app installed
+before this existed it is one toggle and no reinstall. See
+[docs/setup.md](docs/setup.md#1-create-the-slack-app).
 
 ## Processing indicator
 
@@ -164,7 +188,9 @@ do not stop:
 3. For each message: if it will take a while, call slack_ack with its ts first.
    Do what it asks, then reply with slack_post. If the message arrived in a
    thread, pass its thread_ts so the reply lands in the same thread.
-4. Go back to step 1.
+4. If you need a decision from me before you can go on, call slack_ask with the
+   question and the answers to choose from, and act on what I tap.
+5. Go back to step 1.
 
 Keep replies short — I am reading them on a phone.
 ```
@@ -174,7 +200,7 @@ Then message the channel from anywhere.
 ## Manual smoke test
 
 With the binary built, this drives the MCP handshake by hand and should list
-the four tools. It needs no Slack credentials, since nothing connects until
+the five tools. It needs no Slack credentials, since nothing connects until
 `slack_wait` is called:
 
 ```sh

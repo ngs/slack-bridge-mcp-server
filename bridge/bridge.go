@@ -29,7 +29,7 @@ const (
 	maxHistoryPages  = 5
 )
 
-// Bridge owns the Slack connection and the message cursor. All four MCP tools
+// Bridge owns the Slack connection and the message cursor. All five MCP tools
 // go through it.
 type Bridge struct {
 	cfg       Config
@@ -60,6 +60,10 @@ type Bridge struct {
 	// stopped. It outlives the indicator itself because the next one has to
 	// wait for this one's chat.delete before posting its own message.
 	indicatorDone <-chan struct{}
+	// ask is the slack_ask question waiting for a click, if any. At most one
+	// is outstanding: a second question while one is pending is refused rather
+	// than queued, so a click is never ambiguous.
+	ask *pendingAsk
 }
 
 // New returns a Bridge that connects on first use. cfg may be incomplete; the
@@ -239,6 +243,10 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 }
 
 // absorb folds one stream event into the bridge's pending state.
+//
+// Both slack_wait and slack_ask pump the stream, so this is where an event is
+// routed to the one that wants it: messages queue up for the next slack_wait
+// whoever read them off the socket, and clicks go to the pending question.
 func (b *Bridge) absorb(evt StreamEvent) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -246,6 +254,8 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 	switch evt.Kind {
 	case StreamMessage:
 		b.pending = append(b.pending, evt.Message)
+	case StreamInteraction:
+		b.deliverInteraction(evt.Interaction)
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the
 		// authority, so go re-read the window after the cursor.

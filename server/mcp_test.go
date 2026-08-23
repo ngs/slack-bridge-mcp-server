@@ -49,9 +49,9 @@ func unconfiguredBridge(t *testing.T) *bridge.Bridge {
 	return b
 }
 
-// The four tool names are the server's contract with the resident session's
+// The five tool names are the server's contract with the resident session's
 // prompt loop; renaming one silently breaks every .mcp.json in the wild.
-func TestServerExposesTheFourBridgeTools(t *testing.T) {
+func TestServerExposesTheFiveBridgeTools(t *testing.T) {
 	session := connect(t, unconfiguredBridge(t))
 
 	result, err := session.ListTools(context.Background(), nil)
@@ -64,7 +64,7 @@ func TestServerExposesTheFourBridgeTools(t *testing.T) {
 		got[tool.Name] = tool
 	}
 
-	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_status"}
+	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_status"}
 	if len(got) != len(want) {
 		t.Errorf("ListTools() returned %d tools, want %d", len(got), len(want))
 	}

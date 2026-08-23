@@ -108,6 +108,51 @@ func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (stri
 	return ts, nil
 }
 
+func (w *webAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error) {
+	buttons := make([]slack.BlockElement, 0, len(q.Options))
+	for _, opt := range q.Options {
+		buttons = append(buttons, slack.NewButtonBlockElement(
+			opt.ActionID,
+			opt.Value,
+			// Button labels are plain_text; mrkdwn is not rendered there.
+			slack.NewTextBlockObject(slack.PlainTextType, opt.Label, false, false),
+		))
+	}
+
+	options := []slack.MsgOption{
+		// The text is the notification fallback, which is what the owner's
+		// phone shows on the lock screen; the section block is the message.
+		slack.MsgOptionText(q.Text, false),
+		slack.MsgOptionBlocks(
+			slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, q.Text, false, false), nil, nil),
+			slack.NewActionBlock(q.BlockID, buttons...),
+		),
+	}
+	if threadTS != "" {
+		options = append(options, slack.MsgOptionTS(threadTS))
+	}
+
+	_, ts, err := w.client.PostMessageContext(ctx, channel, options...)
+	if err != nil {
+		return "", fmt.Errorf("chat.postMessage: %w", err)
+	}
+	return ts, nil
+}
+
+// ResolveQuestion rewrites the question as plain text. The empty
+// MsgOptionBlocks is the part that matters: chat.update leaves the existing
+// blocks in place unless it is sent an explicit empty list, and blocks left
+// behind are buttons the owner can still click.
+func (w *webAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) error {
+	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts,
+		slack.MsgOptionText(text, false),
+		slack.MsgOptionBlocks(),
+	); err != nil {
+		return fmt.Errorf("chat.update: %w", err)
+	}
+	return nil
+}
+
 func (w *webAPI) Update(ctx context.Context, channel, ts, text string) error {
 	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts, slack.MsgOptionText(text, false)); err != nil {
 		return fmt.Errorf("chat.update: %w", err)
@@ -147,6 +192,8 @@ func (s *socketModeStream) Events() <-chan StreamEvent { return s.events }
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
 	defer close(s.events)
 
+	ack := func(req socketmode.Request) { _ = client.Ack(req) }
+
 	for {
 		s.flushDropped()
 
@@ -157,7 +204,7 @@ func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Clien
 			if !ok {
 				return
 			}
-			s.handle(client, evt)
+			s.handle(ack, evt)
 		}
 	}
 }
@@ -175,7 +222,12 @@ func (s *socketModeStream) flushDropped() {
 	}
 }
 
-func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Event) {
+// acker acknowledges one Socket Mode envelope. It is a function rather than
+// the client itself so the translation below can be tested without a
+// WebSocket, which is the whole of what handle needs the client for.
+type acker func(req socketmode.Request)
+
+func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 	switch evt.Type {
 	case socketmode.EventTypeConnected:
 		s.emit(StreamEvent{Kind: StreamConnected})
@@ -189,7 +241,7 @@ func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Even
 		// every events_api envelope, including those the owner filter
 		// discards, so unrelated channel traffic is not redelivered.
 		if evt.Request != nil {
-			_ = client.Ack(*evt.Request)
+			ack(*evt.Request)
 		}
 
 		inner, ok := api.InnerEvent.Data.(*slackevents.MessageEvent)
@@ -210,14 +262,52 @@ func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Even
 		}
 		s.emit(StreamEvent{Kind: StreamMessage, Message: msg})
 
+	case socketmode.EventTypeInteractive:
+		// Acknowledge first and unconditionally, exactly as for events_api:
+		// Slack redelivers anything it is not acknowledged for, and a click
+		// this bridge has no use for would otherwise come back repeatedly.
+		if evt.Request != nil {
+			ack(*evt.Request)
+		}
+
+		cb, ok := evt.Data.(slack.InteractionCallback)
+		if !ok || cb.Type != slack.InteractionTypeBlockActions {
+			return
+		}
+		if len(cb.ActionCallback.BlockActions) == 0 {
+			return
+		}
+		// A question has one button per option, so a click is one action.
+		action := cb.ActionCallback.BlockActions[0]
+
+		// Container carries the message the button lives on for block_actions;
+		// Message is populated too, but only the container is guaranteed.
+		channel := cb.Container.ChannelID
+		if channel == "" {
+			channel = cb.Channel.ID
+		}
+		messageTS := cb.Container.MessageTs
+		if messageTS == "" {
+			messageTS = cb.Message.Timestamp
+		}
+
+		s.emit(StreamEvent{Kind: StreamInteraction, Interaction: Interaction{
+			User:      cb.User.ID,
+			Channel:   channel,
+			MessageTS: messageTS,
+			BlockID:   action.BlockID,
+			ActionID:  action.ActionID,
+			Value:     action.Value,
+		}})
+
 	case socketmode.EventTypeInvalidAuth:
 		log.Printf("slack rejected the app-level token; check %s", EnvAppToken)
 
 	default:
-		// Slash commands, interactive payloads and the connection
-		// lifecycle chatter are not part of the bridge.
+		// Slash commands, view submissions and the connection lifecycle
+		// chatter are not part of the bridge.
 		if evt.Request != nil && evt.Type != socketmode.EventTypeHello {
-			_ = client.Ack(*evt.Request)
+			ack(*evt.Request)
 		}
 	}
 }

@@ -14,21 +14,22 @@ channel through this server.
 4. [Set the environment variables](#4-set-the-environment-variables)
 5. [Register it with Claude Code](#5-register-it-with-claude-code)
 6. [First run](#6-first-run)
-7. [Troubleshooting](#troubleshooting)
+7. [Asking you a question](#asking-you-a-question)
+8. [Troubleshooting](#troubleshooting)
 
 ## 1. Create the Slack app
 
 The app is yours alone: it exists to sit in one private channel and relay your
-own messages. It needs three bot scopes, one event subscription, and two
-tokens.
+own messages. It needs three bot scopes, one event subscription, two settings
+toggles, and two tokens.
 
 ### The quick way: from the manifest
 
 Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** →
 **From an app manifest**, pick your workspace, and paste
 [docs/slack-app-manifest.yaml](slack-app-manifest.yaml). That sets Socket Mode,
-the scopes and the event subscription in one step. Then continue at
-[Generate the two tokens](#generate-the-two-tokens).
+interactivity, the scopes and the event subscription in one step. Then continue
+at [Generate the two tokens](#generate-the-two-tokens).
 
 ### The manual way
 
@@ -51,6 +52,14 @@ the scopes and the event subscription in one step. Then continue at
 3. **Event Subscriptions** → turn it **on** and subscribe to the bot event
    `message.groups` (or `message.channels` for a public channel). This is the
    live half; history covers the rest.
+4. **Interactivity & Shortcuts** → turn it **on**. Leave the request URL empty:
+   with Socket Mode the button clicks come down the same WebSocket as the
+   messages, and Slack does not ask for a URL. This is what
+   [`slack_ask`](../README.md#asking-the-owner-a-question) needs; without it
+   Slack simply never delivers the clicks.
+
+Interactivity is a setting rather than a scope, so an app installed before this
+was added only needs the toggle flipped — no reinstall, no new token.
 
 ### Generate the two tokens
 
@@ -161,11 +170,12 @@ via direnv or your shell profile.
 Restart the CLI and ask it to call `slack_status`. On a fresh session it
 answers `"connected": false`, and **that is the expected answer**: the server
 does not open a socket until the first tool call that actually needs Slack —
-`slack_wait`, `slack_post` or `slack_ack`, whichever you reach first — so that
-it can sit in every project's `.mcp.json` without connecting in sessions that
-never use it. `slack_status` itself never connects, which is what makes it
-useful when something is misconfigured. What matters at this point is that `config_error` is absent — if
-it is there, it names the variables that did not arrive.
+`slack_wait`, `slack_post`, `slack_ack` or `slack_ask`, whichever you reach
+first — so that it can sit in every project's `.mcp.json` without connecting in
+sessions that never use it. `slack_status` itself never connects, which is what
+makes it useful when something is misconfigured. What matters at this point is
+that `config_error` is absent — if it is there, it names the variables that did
+not arrive.
 
 ## 6. First run
 
@@ -191,6 +201,22 @@ Three behaviours are worth knowing before you wonder about them:
   refuses to start instead. The operating system drops the lock when the
   process exits, including on a crash, so a stale lock file is never something
   you have to clean up.
+
+## Asking you a question
+
+`slack_ask` is the other direction: the agent posts a question with a button per
+answer and waits for you to tap one.
+
+```
+Ship the fix now, or hold it until the release?
+
+[ Ship now ]  [ Hold ]  [ Ask me later ]
+```
+
+The buttons disappear as soon as you tap one — the message is rewritten to show
+what you chose — and after the timeout, if you never do. The tool needs
+**Interactivity** enabled on the app (step 1); everything else it uses is
+already set up. One question can be outstanding at a time.
 
 ## Troubleshooting
 
@@ -222,6 +248,10 @@ dies with the network, and on reconnect the bridge re-reads the window after
 its cursor from `conversations.history` and merges it with whatever the socket
 delivered, deduplicating by timestamp. The backlog arrives on the next
 `slack_wait` as a single array.
+
+**Tapping a `slack_ask` button does nothing.** Interactivity is off on the app.
+Turn it on under **Interactivity & Shortcuts** — it is a setting, not a scope,
+so nothing needs reinstalling — and ask again.
 
 **Diagnostics.** Everything the server logs goes to stderr, prefixed
 `slack-bridge:`, because stdout carries the JSON-RPC stream and a stray byte

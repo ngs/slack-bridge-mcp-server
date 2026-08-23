@@ -1,8 +1,9 @@
 # Slack app manifest for slack-bridge-mcp-server.
 #
 # Create the app from this file at https://api.slack.com/apps → Create New App
-# → From an app manifest, and it arrives with Socket Mode on, the three bot
-# scopes the server actually calls, and the one message event it listens for.
+# → From an app manifest, and it arrives with Socket Mode on, interactivity
+# enabled, the three bot scopes the server actually calls, and the one message
+# event it listens for.
 # You still have to generate the app-level token and install the app; see
 # docs/setup.md.
 #
@@ -37,7 +38,10 @@ settings:
     bot_events:
       - message.groups
   interactivity:
-    is_enabled: false
+    # Required for slack_ask: without it Slack refuses to deliver the button
+    # clicks. Socket Mode apps need no request URL, since the clicks arrive
+    # over the same WebSocket as the messages.
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false
