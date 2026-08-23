@@ -83,6 +83,29 @@ func TestServerExposesTheSixBridgeTools(t *testing.T) {
 	}
 }
 
+// The read-only hint is something a client may act on without asking, so it
+// has to be true. slack_wait reacts to what it delivers and starts the
+// indicator; slack_history really does only read.
+func TestOnlyTheReadOnlyToolsSayTheyAre(t *testing.T) {
+	session := connect(t, unconfiguredBridge(t))
+
+	result, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+
+	readOnly := map[string]bool{"slack_history": true, "slack_status": true}
+	for _, tool := range result.Tools {
+		if tool.Annotations == nil {
+			t.Errorf("%s has no annotations", tool.Name)
+			continue
+		}
+		if got := tool.Annotations.ReadOnlyHint; got != readOnly[tool.Name] {
+			t.Errorf("%s ReadOnlyHint = %v, want %v", tool.Name, got, readOnly[tool.Name])
+		}
+	}
+}
+
 // slack_wait's timeout is the one argument a model is likely to guess at, so
 // the schema has to advertise it as optional with the documented range.
 func TestWaitToolAdvertisesAnOptionalTimeout(t *testing.T) {

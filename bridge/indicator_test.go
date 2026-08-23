@@ -184,6 +184,30 @@ func (b *Bridge) indicatorStartedAt() time.Time {
 	return b.indicator.startedAt
 }
 
+// A stop is a decision even when it finds nothing to stop. A slow failing
+// reply must not be able to overrule a later call that said "no indicator from
+// here" by putting its own back afterwards.
+func TestAStopInvalidatesAnInFlightRestore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to appear", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	// A reply retires the indicator and then takes its time with Slack.
+	retired := b.stopIndicator()
+	// Meanwhile another call decides there should be no indicator at all.
+	b.stopIndicator()
+	// The reply now fails and tries to put back what it retired.
+	b.restoreIndicator(ctx, retired)
+
+	time.Sleep(4 * testGrace)
+	if got := indicatorPosts(api); len(got) != 1 {
+		t.Errorf("indicator posts = %d, want the restore refused: something stopped the indicator after this one did", len(got))
+	}
+}
+
 // The common case is a reply within seconds. Nothing should reach the channel
 // then, or the owner gets a "working…" note that is gone before it can be read.
 func TestNoIndicatorForRepliesFasterThanTheGracePeriod(t *testing.T) {

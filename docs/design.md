@@ -102,8 +102,12 @@ reconnect, and again in the history page fetched for that same reconnect. The
 merge step deduplicates by timestamp, so how that race resolves does not matter.
 
 The first run against a channel is the one case where catch-up is skipped. With
-no cursor, the bridge records the newest existing message and starts from there,
-rather than replaying the channel's entire history into the model's context.
+no cursor, the bridge records where the conversation already is and starts from
+there, rather than replaying the channel's entire history into the model's
+context. "Where it already is" means the newest timestamp anywhere in the
+scanned window, replies included: the last thing anyone said is often a reply
+in an older thread, and a cursor set to the newest surface message would leave
+those replies looking new to the thread pass below.
 
 #### Thread replies need a second pass
 

@@ -198,6 +198,52 @@ func TestCatchUpOnlyReadsThreadsRepliedToSinceTheCursor(t *testing.T) {
 	}
 }
 
+// Seeding has to step past the threads too. The newest thing said in a channel
+// is often a reply in an older thread, and a cursor set to the newest surface
+// message would leave those replies looking new — handing the owner their own
+// history back as if they had just sent it.
+func TestFirstRunSeedsPastExistingThreadReplies(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	api := &fakeAPI{
+		history: []candidate{
+			// The newest surface message is older than the conversation
+			// happening in the thread above it.
+			threadedParent("100.000200", "an old thread", "100.000900", 12),
+			ownerMsg("100.000300", "the newest thing on the surface"),
+		},
+		replies: []candidate{reply("100.000900", "100.000200", "said long before the bridge existed")},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	defer func() { _ = b.Close() }()
+
+	// The first wait seeds and returns nothing.
+	if _, err := b.Wait(ctx, 20*testGrace); err != nil {
+		t.Fatalf("first Wait() error = %v", err)
+	}
+	if got := b.Status().LastTS; got != "100.000900" {
+		t.Errorf("seeded last_ts = %q, want 100.000900: the newest reply, not the newest surface message", got)
+	}
+
+	// Production queues a connected event on the way up, which sends the
+	// bridge round for another catch-up. Nothing existing may come back.
+	stream.events <- StreamEvent{Kind: StreamConnected}
+
+	result, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if !result.TimedOut || len(result.Messages) != 0 {
+		t.Errorf("Wait() = %+v, want nothing; every one of those messages predates the install", result)
+	}
+}
+
 // A fresh install joins the conversation. Reading every thread in the channel
 // would be the replay that seeding the cursor exists to avoid.
 func TestCatchUpReadsNoThreadsOnTheFirstEverRun(t *testing.T) {

@@ -99,8 +99,11 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_wait",
 		Title:       "Wait for a Slack message",
-		Description: "Block until the owner sends a message to the bridged Slack channel, or the timeout expires. Returns any messages missed while the session was down.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(true)},
+		Description: "Block until the owner sends a message to the bridged Slack channel, or the timeout expires. Returns any messages missed while the session was down. Marks what it delivers as received, and starts the progress indicator, so it is not a read-only call.",
+		// Not ReadOnlyHint: delivering messages reacts to them and starts the
+		// elapsed-time indicator, both of which write to the channel. A client
+		// may use that hint to decide what to allow without asking.
+		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args WaitArgs) (*mcp.CallToolResult, bridge.WaitResult, error) {
 		result, err := b.Wait(ctx, bridge.ClampTimeout(args.TimeoutSeconds))
 		if err != nil {

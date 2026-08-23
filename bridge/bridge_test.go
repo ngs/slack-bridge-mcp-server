@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -794,6 +795,11 @@ func TestClampTimeout(t *testing.T) {
 		{1500, MaxWaitTimeout},
 		{1501, MaxWaitTimeout},
 		{86400, MaxWaitTimeout},
+		// Seconds are compared before they are multiplied out: a number this
+		// large would wrap time.Duration round into a negative and clamp to
+		// the wrong end, or to nothing at all.
+		{1 << 62, MaxWaitTimeout},
+		{math.MaxInt, MaxWaitTimeout},
 	}
 
 	for _, tt := range tests {

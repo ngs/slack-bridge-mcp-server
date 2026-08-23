@@ -392,10 +392,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	return merged, nil
 }
 
-// seedCursor records the newest message in the channel without returning it,
-// establishing a starting point for a channel the bridge has never read.
+// seedCursor records where the conversation already is, without returning any
+// of it, establishing a starting point for a channel the bridge has never
+// read.
+//
+// The newest surface message is not enough on its own. A thread hanging off an
+// older message can hold the most recent thing anyone said, and the thread
+// pass of catch-up would then find those replies sitting past the cursor and
+// hand the owner's own history back to them as if it were new. So the seed is
+// the newest timestamp anywhere in the scanned window — surface messages and
+// their latest replies alike.
 func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (string, error) {
-	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: 1})
+	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
 		return "", err
 	}
@@ -403,7 +411,17 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 		return "", nil
 	}
 
-	ts := page.Messages[0].TS
+	var ts string
+	for _, m := range page.Messages {
+		for _, candidateTS := range []string{m.TS, m.LatestReply} {
+			if candidateTS != "" && (ts == "" || tsLess(ts, candidateTS)) {
+				ts = candidateTS
+			}
+		}
+	}
+	if ts == "" {
+		return "", nil
+	}
 	if b.store != nil && ts != "" {
 		if err := b.store.SetLastTS(channel, ts); err != nil {
 			log.Printf("could not persist the initial cursor: %v", err)
@@ -590,14 +608,18 @@ func ClampTimeout(seconds int) time.Duration {
 	if seconds <= 0 {
 		return DefaultWaitTimeout
 	}
-	d := time.Duration(seconds) * time.Second
-	if d < MinWaitTimeout {
+
+	// Compare while the value is still a count of seconds. Converting first
+	// multiplies by a billion, and a large enough number wraps time.Duration
+	// round into a negative — so an hour would clamp correctly while
+	// 1<<62 seconds would come out as the minimum, or as nothing at all.
+	if seconds <= int(MinWaitTimeout/time.Second) {
 		return MinWaitTimeout
 	}
-	if d > MaxWaitTimeout {
+	if seconds >= int(MaxWaitTimeout/time.Second) {
 		return MaxWaitTimeout
 	}
-	return d
+	return time.Duration(seconds) * time.Second
 }
 
 // Post sends a message to the bound channel, connecting first if needed.
@@ -750,6 +772,11 @@ func (b *Bridge) stopIndicator() retiredIndicator {
 // done channel is kept behind, so the next indicator knows what it is waiting
 // for.
 func (b *Bridge) stopIndicatorLocked() retiredIndicator {
+	// Every stop counts, including one that found nothing to stop. A call that
+	// says "no indicator from here" is a decision, and a slow failing reply
+	// must not be able to overrule it by putting its own back afterwards.
+	b.indicatorGeneration++
+
 	if b.indicator == nil {
 		return retiredIndicator{generation: b.indicatorGeneration}
 	}
@@ -757,7 +784,6 @@ func (b *Bridge) stopIndicatorLocked() retiredIndicator {
 	b.indicatorDone = b.indicator.done
 	startedAt := b.indicator.startedAt
 	b.indicator = nil
-	b.indicatorGeneration++
 	return retiredIndicator{wasRunning: true, startedAt: startedAt, generation: b.indicatorGeneration}
 }
 
