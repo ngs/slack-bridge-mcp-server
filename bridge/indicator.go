@@ -93,8 +93,10 @@ func (in *indicator) run() {
 	ts, err := in.api.Post(in.ctx, in.channel, "", in.text())
 	if err != nil {
 		// Without a message there is nothing to update or delete, so give up
-		// on this round rather than retrying into a rate limit.
-		log.Printf("could not post the processing indicator: %v", err)
+		// on this round rather than retrying into a rate limit. The error text
+		// comes back from Slack, so it goes through logSafe like any other
+		// value the bridge did not write itself.
+		log.Printf("could not post the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
 		return
 	}
 	defer in.remove(ts)
@@ -112,7 +114,7 @@ func (in *indicator) run() {
 			if err := in.api.Update(in.ctx, in.channel, ts, in.text()); err != nil {
 				// One failed tick is not worth tearing the indicator down;
 				// the next one may well land.
-				log.Printf("could not update the processing indicator: %v", err)
+				log.Printf("could not update the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
 			}
 		}
 	}
@@ -125,7 +127,7 @@ func (in *indicator) remove(ts string) {
 	defer cancel()
 
 	if err := in.api.Delete(ctx, in.channel, ts); err != nil {
-		log.Printf("could not delete the processing indicator: %v", err)
+		log.Printf("could not delete the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
 	}
 }
 

@@ -96,7 +96,10 @@ func durationSetting(name string, fallback, lowest, highest time.Duration) time.
 
 	seconds, err := strconv.Atoi(raw)
 	if err != nil || seconds <= 0 {
-		log.Printf("%s = %q is not a positive number of seconds; using %s", name, raw, fallback)
+		// The value is whatever was in the environment, so it is sanitized
+		// before it reaches a log line.
+		log.Printf("%s = %s is not a positive number of seconds; using %s",
+			name, logSafe(raw, maxLoggedValue), fallback)
 		return fallback
 	}
 
