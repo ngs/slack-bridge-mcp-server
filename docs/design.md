@@ -214,6 +214,19 @@ Being read-only is what keeps the two apart. The tool cannot move the cursor,
 consume a pending message, react, or touch the indicator, so no amount of
 reading changes what the relay will deliver next.
 
+### Clicks travel apart from messages
+
+A message that cannot be queued live is not lost: the overflow becomes a
+reconnect-shaped event and the bridge re-reads the window from
+`conversations.history`. That safety net does not exist for a `slack_ask`
+button click — no history call returns it — so a dropped click is an answer the
+owner gave that the agent never sees, and the question times out as if they had
+ignored it.
+
+Clicks therefore have a queue of their own, small and read by both the wait and
+the ask loops. A backlog of messages, which is the one situation where the
+event queue fills, cannot take the space a click needs.
+
 ### The receipt reaction
 
 When `slack_wait` hands messages over, the server reacts to each of them

@@ -107,24 +107,24 @@ const (
 	// Nothing is lost: the bridge treats it exactly like a reconnect and
 	// re-reads the window from history.
 	StreamDropped
-	// StreamInteraction carries a Block Kit button click. Unlike a message it
-	// is not filtered by author on the way in: who clicked is part of the
-	// payload, and the pending question is what decides whether that user's
-	// click counts.
-	StreamInteraction
 )
 
 // StreamEvent is one item from the live event stream.
 type StreamEvent struct {
-	Kind        StreamEventKind
-	Message     Message
-	Interaction Interaction
+	Kind    StreamEventKind
+	Message Message
 }
 
 // Interaction is one button click on a message the bridge posted. It is
 // already acknowledged to Slack by the time it reaches the bridge: an
 // unacknowledged envelope is redelivered, so the ack belongs next to the
 // socket rather than behind the bridge's own routing.
+//
+// Clicks travel on a channel of their own rather than alongside messages. A
+// message the bridge fails to queue is recovered from conversations.history; a
+// click is not in any history, so a dropped one is an answer the owner gave
+// and the agent will never see. Keeping the two apart means a flood of
+// messages cannot cost a question its answer.
 type Interaction struct {
 	// User is the Slack user ID of whoever clicked, which the bridge checks
 	// against the configured owner.
@@ -144,9 +144,12 @@ type Interaction struct {
 
 // Stream is the live half of the Slack connection.
 type Stream interface {
-	// Events delivers stream events until the stream's context is done, at
-	// which point the channel is closed.
+	// Events delivers messages and connection notices until the stream's
+	// context is done, at which point the channel is closed.
 	Events() <-chan StreamEvent
+	// Interactions delivers button clicks, on a separate channel because they
+	// cannot be recovered from history if they are dropped.
+	Interactions() <-chan Interaction
 }
 
 // Connector opens both halves of the Slack connection. Connect is called

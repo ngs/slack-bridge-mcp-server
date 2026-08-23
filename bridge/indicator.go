@@ -29,6 +29,13 @@ const (
 // cancelled, and the message would then be left behind in the channel forever.
 const indicatorDeleteTimeout = 5 * time.Second
 
+// indicatorRequestTimeout bounds each post and update the indicator makes.
+// Without it a Slack call that never answers would hold the goroutine open
+// forever, and with it the indicator's done channel — which is what the next
+// indicator waits on before posting, and what Close waits on before the
+// process exits. A hung request must cost this much and no more.
+const indicatorRequestTimeout = 10 * time.Second
+
 // indicator is the "⏳ Working… (1m 05s)" message the owner sees while the
 // agent is busy with what slack_wait handed it.
 //
@@ -118,7 +125,7 @@ func (in *indicator) run() {
 		}
 	}
 
-	ts, err := in.api.Post(in.ctx, in.channel, "", in.text())
+	ts, err := in.post()
 	if err != nil {
 		// Without a message there is nothing to update or delete, so give up
 		// on this round rather than retrying into a rate limit. The error text
@@ -139,13 +146,32 @@ func (in *indicator) run() {
 		case <-in.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := in.api.Update(in.ctx, in.channel, ts, in.text()); err != nil {
+			if err := in.update(ts); err != nil {
 				// One failed tick is not worth tearing the indicator down;
 				// the next one may well land.
 				log.Printf("could not update the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
 			}
 		}
 	}
+}
+
+// post publishes the indicator message.
+//
+// The request deliberately is not cancelled when the indicator is stopped: a
+// chat.postMessage abandoned in flight can still create the message, and the
+// ts needed to delete it would be lost with the response. Letting it finish
+// means the message is briefly visible after the agent has answered, and then
+// deleted — which is the smaller of the two prices.
+func (in *indicator) post() (string, error) {
+	ctx, cancel := context.WithTimeout(in.ctx, indicatorRequestTimeout)
+	defer cancel()
+	return in.api.Post(ctx, in.channel, "", in.text())
+}
+
+func (in *indicator) update(ts string) error {
+	ctx, cancel := context.WithTimeout(in.ctx, indicatorRequestTimeout)
+	defer cancel()
+	return in.api.Update(ctx, in.channel, ts, in.text())
 }
 
 // remove deletes the indicator message on a context of its own, so it still

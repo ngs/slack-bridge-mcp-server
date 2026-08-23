@@ -225,9 +225,10 @@ do not stop:
 
 1. Call slack_wait.
 2. If it returns timed_out, go back to step 1.
-3. For each message: if it will take a while, call slack_ack with its ts first.
-   Do what it asks, then reply with slack_post. If the message arrived in a
-   thread, pass its thread_ts so the reply lands in the same thread.
+3. For each message: do what it asks, then reply with slack_post. If the
+   message arrived in a thread, pass its thread_ts so the reply lands in the
+   same thread. Receipt is already marked for you, so reach for slack_ack only
+   to say something an emoji says well — done, rejected, picked up by hand.
 4. If you need a decision from me before you can go on, call slack_ask with the
    question and the answers to choose from, and act on what I tap.
 5. Go back to step 1.

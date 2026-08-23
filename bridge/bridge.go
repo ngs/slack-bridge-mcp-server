@@ -265,6 +265,12 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		case <-deadline.C:
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
 
+		case in := <-stream.Interactions():
+			// A click arriving while nobody is asking anything is answered by
+			// whoever is: routing it here keeps slack_wait from starving the
+			// click channel while it holds the connection.
+			b.routeInteraction(in)
+
 		case evt, ok := <-stream.Events():
 			if !ok {
 				b.mu.Lock()
@@ -281,9 +287,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 // absorb folds one stream event into the bridge's pending state.
 //
-// Both slack_wait and slack_ask pump the stream, so this is where an event is
-// routed to the one that wants it: messages queue up for the next slack_wait
-// whoever read them off the socket, and clicks go to the pending question.
+// Both slack_wait and slack_ask read the stream, so a message goes to the same
+// place whichever of them happened to pick it up: the queue the next
+// slack_wait drains.
 func (b *Bridge) absorb(evt StreamEvent) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -291,8 +297,6 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 	switch evt.Kind {
 	case StreamMessage:
 		b.pending = append(b.pending, evt.Message)
-	case StreamInteraction:
-		b.deliverInteraction(evt.Interaction)
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the
 		// authority, so go re-read the window after the cursor.
@@ -463,6 +467,12 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
 		return nil, err
+	}
+	if page.HasMore {
+		// The channel is busier than the scan window. Threads older than these
+		// messages were not even looked at, so a reply in one of them is
+		// missed without anything else noticing.
+		log.Printf("catch-up scanned the newest %d messages for threads; older threads were not examined", threadScanLimit)
 	}
 
 	var (

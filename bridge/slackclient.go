@@ -17,6 +17,12 @@ import (
 // and the bridge recovers the messages from conversations.history.
 const liveEventBuffer = 64
 
+// liveInteractionBuffer is the click queue. It is small because clicks are
+// rare — at most one question is outstanding at a time — and separate because
+// a click that does not fit is simply lost: unlike a message, there is no
+// history to recover it from.
+const liveInteractionBuffer = 16
+
 // SocketModeConnector is the production Connector: a Web API client for
 // history, posting and reactions, plus a Socket Mode WebSocket for live
 // events.
@@ -40,9 +46,10 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 
 	client := socketmode.New(api)
 	stream := &socketModeStream{
-		events:  make(chan StreamEvent, liveEventBuffer),
-		channel: cfg.Channel,
-		owner:   cfg.Owner,
+		events:       make(chan StreamEvent, liveEventBuffer),
+		interactions: make(chan Interaction, liveInteractionBuffer),
+		channel:      cfg.Channel,
+		owner:        cfg.Owner,
 	}
 
 	go stream.consume(ctx, client)
@@ -256,9 +263,10 @@ var permanentThreadErrors = map[string]bool{
 // socketModeStream translates socketmode events into StreamEvents, applying
 // the owner filter before anything is queued.
 type socketModeStream struct {
-	events  chan StreamEvent
-	channel string
-	owner   string
+	events       chan StreamEvent
+	interactions chan Interaction
+	channel      string
+	owner        string
 	// dropped is set when an event could not be queued. It is sticky rather
 	// than an event of its own because the queue being full is exactly when
 	// a StreamDropped event would not fit either; the flag is converted into
@@ -268,8 +276,11 @@ type socketModeStream struct {
 
 func (s *socketModeStream) Events() <-chan StreamEvent { return s.events }
 
+func (s *socketModeStream) Interactions() <-chan Interaction { return s.interactions }
+
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
 	defer close(s.events)
+	defer close(s.interactions)
 
 	ack := func(req socketmode.Request) { _ = client.Ack(req) }
 
@@ -370,14 +381,14 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 			messageTS = cb.Message.Timestamp
 		}
 
-		s.emit(StreamEvent{Kind: StreamInteraction, Interaction: Interaction{
+		s.emitInteraction(Interaction{
 			User:      cb.User.ID,
 			Channel:   channel,
 			MessageTS: messageTS,
 			BlockID:   action.BlockID,
 			ActionID:  action.ActionID,
 			Value:     action.Value,
-		}})
+		})
 
 	case socketmode.EventTypeInvalidAuth:
 		log.Printf("slack rejected the app-level token; check %s", EnvAppToken)
@@ -388,6 +399,17 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 		if evt.Request != nil && evt.Type != socketmode.EventTypeHello {
 			ack(*evt.Request)
 		}
+	}
+}
+
+// emitInteraction queues a click on its own channel. There is no fallback if
+// it does not fit: a click exists nowhere but this connection, so the loss is
+// logged plainly rather than dressed up as a catch-up.
+func (s *socketModeStream) emitInteraction(in Interaction) {
+	select {
+	case s.interactions <- in:
+	default:
+		log.Printf("dropped a button click because nothing was reading them; the question it answered will time out")
 	}
 }
 

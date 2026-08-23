@@ -4,9 +4,10 @@ import "testing"
 
 func newTestStream(size int) *socketModeStream {
 	return &socketModeStream{
-		events:  make(chan StreamEvent, size),
-		channel: testChannel,
-		owner:   testOwner,
+		events:       make(chan StreamEvent, size),
+		interactions: make(chan Interaction, size),
+		channel:      testChannel,
+		owner:        testOwner,
 	}
 }
 

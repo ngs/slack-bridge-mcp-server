@@ -151,6 +151,9 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, b.ctx.Err()
 
+		case in := <-stream.Interactions():
+			b.routeInteraction(in)
+
 		case evt, ok := <-stream.Events():
 			if !ok {
 				b.mu.Lock()
@@ -202,6 +205,14 @@ func (b *Bridge) resolve(api API, channel, ts, text string) {
 	if err := api.ResolveQuestion(ctx, channel, ts, text); err != nil {
 		log.Printf("could not retire the question in the channel: %s", logSafe(err.Error(), maxLoggedError))
 	}
+}
+
+// routeInteraction takes b.mu and hands the click on. It exists so the two
+// loops that read the stream do not have to know how a click is delivered.
+func (b *Bridge) routeInteraction(in Interaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deliverInteraction(in)
 }
 
 // deliverInteraction hands a button click to the pending question, if it is

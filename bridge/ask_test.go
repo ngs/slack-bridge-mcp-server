@@ -32,15 +32,15 @@ func askBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fakeStrea
 }
 
 // click is the interaction Slack sends when the owner taps the option at index.
-func click(user, messageTS string, index int) StreamEvent {
-	return StreamEvent{Kind: StreamInteraction, Interaction: Interaction{
+func click(user, messageTS string, index int) Interaction {
+	return Interaction{
 		User:      user,
 		Channel:   testChannel,
 		MessageTS: messageTS,
 		BlockID:   askBlockID,
 		ActionID:  askActionPrefix + string(rune('0'+index)),
 		Value:     string(rune('0' + index)),
-	}}
+	}
 }
 
 func (f *fakeAPI) snapshotQuestions() []questionCall {
@@ -65,7 +65,7 @@ func TestAskReturnsTheClickedOption(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		stream.events <- click(testOwner, askTS, 1)
+		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 
 	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No", "Later"}, MaxWaitTimeout, "")
@@ -114,8 +114,8 @@ func TestAskIgnoresClicksThatAreNotTheOwnerAnsweringThisQuestion(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		// Someone else in the channel, then a click on a different message —
 		// a question from an earlier session, say, whose buttons are stale.
-		stream.events <- click("U0INTRUDER", askTS, 0)
-		stream.events <- click(testOwner, "100.000111", 0)
+		stream.interactions <- click("U0INTRUDER", askTS, 0)
+		stream.interactions <- click(testOwner, "100.000111", 0)
 	}()
 
 	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, 120*time.Millisecond, "")
@@ -182,7 +182,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 		t.Error("second Ask() = nil error, want it refused while a question is pending")
 	}
 
-	stream.events <- click(testOwner, askTS, 0)
+	stream.interactions <- click(testOwner, askTS, 0)
 	if err := <-first; err != nil {
 		t.Fatalf("first Ask() error = %v", err)
 	}
@@ -190,7 +190,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 	// Once the first question is answered the slot is free again.
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		stream.events <- click(testOwner, askTS, 1)
+		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 	if _, err := b.Ask(ctx, "And now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err != nil {
 		t.Errorf("Ask() after the first was answered = %v, want it to succeed", err)
@@ -217,7 +217,7 @@ func TestAskStopsTheIndicatorAndRestartsItOnTheAnswer(t *testing.T) {
 
 	go func() {
 		time.Sleep(2 * testGrace)
-		stream.events <- click(testOwner, askTS, 0)
+		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
 	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err != nil {
@@ -260,7 +260,7 @@ func TestAskKeepsMessagesForTheNextWait(t *testing.T) {
 	go func() {
 		time.Sleep(10 * time.Millisecond)
 		stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000300", User: testOwner, Text: "one more thing"}}
-		stream.events <- click(testOwner, askTS, 0)
+		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
 	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err != nil {
@@ -394,6 +394,46 @@ func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 	}
 }
 
+// A click is in no history: if the queue it lands in is full, the owner's
+// answer is gone. A backlog of messages must therefore not be able to fill it.
+func TestAFullMessageQueueCannotSwallowAClick(t *testing.T) {
+	stream := newTestStream(2)
+	stream.emit(StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000100"}})
+	stream.emit(StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000200"}})
+	if !stream.dropped.Load() {
+		// Guard the premise: the message queue has to be full for this to
+		// mean anything.
+		stream.emit(StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000300"}})
+	}
+
+	callback := slack.InteractionCallback{
+		Type: slack.InteractionTypeBlockActions,
+		User: slack.User{ID: testOwner},
+	}
+	callback.Container.ChannelID = testChannel
+	callback.Container.MessageTs = askTS
+	callback.ActionCallback.BlockActions = []*slack.BlockAction{{
+		BlockID:  askBlockID,
+		ActionID: askActionPrefix + "0",
+		Value:    "0",
+	}}
+
+	stream.handle(func(socketmode.Request) {}, socketmode.Event{
+		Type:    socketmode.EventTypeInteractive,
+		Data:    callback,
+		Request: &socketmode.Request{},
+	})
+
+	select {
+	case got := <-stream.interactions:
+		if got.MessageTS != askTS {
+			t.Errorf("interaction = %+v, want the click on %s", got, askTS)
+		}
+	default:
+		t.Fatal("the click was dropped because the message queue was full; it cannot be recovered from history")
+	}
+}
+
 // pendingAskTS reports the ts of the question waiting for an answer, for tests
 // that need to know the question has actually been posted.
 func (b *Bridge) pendingAskTS() string {
@@ -443,10 +483,12 @@ func TestInteractiveEnvelopesAreAcknowledgedAndTranslated(t *testing.T) {
 		t.Errorf("acked %d interactive envelopes, want 2; Slack retries the rest", acked)
 	}
 
-	evt := <-stream.events
-	if evt.Kind != StreamInteraction {
-		t.Fatalf("event kind = %v, want StreamInteraction", evt.Kind)
+	// Clicks arrive on their own channel: a click cannot be recovered from
+	// history, so a queue full of messages must not be able to swallow one.
+	if len(stream.events) != 0 {
+		t.Errorf("the click was queued as a stream event; it belongs on the interaction channel")
 	}
+	got := <-stream.interactions
 	want := Interaction{
 		User:      "U0INTRUDER",
 		Channel:   testChannel,
@@ -455,10 +497,10 @@ func TestInteractiveEnvelopesAreAcknowledgedAndTranslated(t *testing.T) {
 		ActionID:  askActionPrefix + "1",
 		Value:     "1",
 	}
-	if evt.Interaction != want {
-		t.Errorf("interaction = %+v, want %+v; the owner check belongs to the bridge, not the socket", evt.Interaction, want)
+	if got != want {
+		t.Errorf("interaction = %+v, want %+v; the owner check belongs to the bridge, not the socket", got, want)
 	}
-	if len(stream.events) != 0 {
-		t.Errorf("the unusable payload was queued as %d event(s), want 0", len(stream.events))
+	if len(stream.interactions) != 0 {
+		t.Errorf("the unusable payload was queued as %d interaction(s), want 0", len(stream.interactions))
 	}
 }

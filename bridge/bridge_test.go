@@ -223,14 +223,20 @@ func (f *fakeAPI) calls() []HistoryRequest {
 
 // fakeStream is a hand-driven live event stream.
 type fakeStream struct {
-	events chan StreamEvent
+	events       chan StreamEvent
+	interactions chan Interaction
 }
 
 func newFakeStream() *fakeStream {
-	return &fakeStream{events: make(chan StreamEvent, 16)}
+	return &fakeStream{
+		events:       make(chan StreamEvent, 16),
+		interactions: make(chan Interaction, 16),
+	}
 }
 
 func (s *fakeStream) Events() <-chan StreamEvent { return s.events }
+
+func (s *fakeStream) Interactions() <-chan Interaction { return s.interactions }
 
 // fakeConnector hands out a fixed API and stream, and records how often it was
 // asked to connect.
