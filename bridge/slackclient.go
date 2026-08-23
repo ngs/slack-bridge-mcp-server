@@ -47,8 +47,11 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 	go stream.consume(ctx, client)
 	go func() {
 		// RunContext reconnects on its own; it only returns when ctx is
-		// cancelled or the connection fails unrecoverably.
-		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
+		// cancelled or the connection fails unrecoverably. It never returns a
+		// nil error, so only the "stopped without cancellation" case is worth
+		// reporting.
+		err := client.RunContext(ctx)
+		if ctx.Err() == nil {
 			log.Printf("socket mode client stopped: %v", err)
 		}
 	}()
