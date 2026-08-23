@@ -450,6 +450,46 @@ func TestAskTakesAQueuedClickOverTheDeadline(t *testing.T) {
 	}
 }
 
+// A ts identifies a message only inside its channel, and the buffer that holds
+// clicks during the posting window must not be fillable by traffic that could
+// never be this question's answer.
+func TestAskChecksWhoAndWhereBeforeBufferingAClick(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+
+	api.mu.Lock()
+	api.beforeQuestionReturns = func() {
+		// A click from elsewhere, one from someone else, and one on a
+		// different block — none of them can be the answer, and together they
+		// would fill the buffer if they were let in.
+		for range maxEarlyClicks {
+			elsewhere := click(testOwner, askTS, 0)
+			elsewhere.Channel = "C0OTHER"
+			b.routeInteraction(elsewhere)
+
+			stranger := click("U0INTRUDER", askTS, 0)
+			b.routeInteraction(stranger)
+
+			otherBlock := click(testOwner, askTS, 0)
+			otherBlock.BlockID = "some_other_block"
+			b.routeInteraction(otherBlock)
+		}
+		// And then the real one.
+		b.routeInteraction(click(testOwner, askTS, 1))
+	}
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the owner's own click honoured despite the noise", result)
+	}
+}
+
 // A dead socket cannot deliver a click, so the buttons must not outlive it.
 func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // historyBridge returns a bridge over a channel where several people, a bot
@@ -379,13 +380,13 @@ func TestHistoryFallsBackToUserIDsWhenNamesCannotBeResolved(t *testing.T) {
 		t.Errorf("user_name = %q with users.info failing, want the raw ID %q", got, testOwner)
 	}
 
-	// Two distinct users, and neither is asked about twice within the call:
-	// the lookup already failed, and it will fail the same way again.
+	// The scope is granted or it is not, so one refusal answers for the whole
+	// call rather than being rediscovered per author.
 	api.mu.Lock()
 	lookups := api.nameLookups
 	api.mu.Unlock()
-	if lookups != 2 {
-		t.Errorf("users.info called %d times for 2 distinct failing users, want 2", lookups)
+	if lookups > 2 {
+		t.Errorf("users.info called %d times after the first refusal, want the rest skipped", lookups)
 	}
 }
 
@@ -413,6 +414,52 @@ func TestHistoryResolvesEachNameOnlyOnce(t *testing.T) {
 	// Two distinct users across five messages and two calls.
 	if lookups != 2 {
 		t.Errorf("users.info called %d times, want 2 — one per distinct user, cached after that", lookups)
+	}
+}
+
+// A channel full of different people would otherwise mean a users.info round
+// trip per author, one after another, before the tool answers at all.
+func TestHistoryResolvesNamesInParallel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := historyBridge(ctx, t)
+
+	var (
+		history []candidate
+		names   = map[string]string{}
+	)
+	for i := range 16 {
+		id := "U0PERSON" + strconv.Itoa(i)
+		names[id] = "Person " + strconv.Itoa(i)
+		history = append(history, candidate{
+			Channel: testChannel,
+			User:    id,
+			Text:    "hello",
+			TS:      "100.000" + strconv.Itoa(300+i),
+		})
+	}
+
+	api.mu.Lock()
+	api.history = history
+	api.names = names
+	// Each lookup is slow enough that doing them one at a time would take
+	// sixteen times as long as doing them a few at a time.
+	api.nameDelay = 20 * time.Millisecond
+	api.mu.Unlock()
+
+	start := time.Now()
+	result, err := b.History(ctx, ReadRequest{})
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if len(result.Messages) != 16 || result.Messages[0].UserName != "Person 0" {
+		t.Fatalf("History() = %+v, want every author named", result.Messages)
+	}
+	if serial := 16 * 20 * time.Millisecond; elapsed >= serial {
+		t.Errorf("resolving 16 names took %v, which is no better than one at a time (%v)", elapsed, serial)
 	}
 }
 

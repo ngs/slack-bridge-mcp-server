@@ -319,6 +319,17 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 	if ask == nil {
 		return
 	}
+
+	// Everything that can be checked without the timestamp is checked first,
+	// so the buffer below only ever holds clicks that could plausibly be the
+	// answer. Otherwise unrelated traffic during the posting window could fill
+	// it and push the owner's real click out.
+	if in.User != b.cfg.Owner || in.BlockID != askBlockID ||
+		(in.Channel != "" && in.Channel != b.cfg.Channel) {
+		ask.warn(in)
+		return
+	}
+
 	if ask.ts == "" {
 		// The question is posted but its timestamp has not come back yet.
 		// Holding the click keeps it out of the bin until it can be checked
@@ -329,12 +340,11 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 		}
 		return
 	}
-	if in.User != b.cfg.Owner || in.MessageTS != ask.ts {
-		if !ask.warned {
-			ask.warned = true
-			log.Printf("ignoring a button click that is not the owner answering the pending question (user %s, message %s)",
-				logSafe(in.User, maxLoggedValue), logSafe(in.MessageTS, maxLoggedValue))
-		}
+
+	// A ts identifies a message only within its channel, and the question is
+	// the only message this call may be answered from.
+	if in.MessageTS != ask.ts {
+		ask.warn(in)
 		return
 	}
 
@@ -350,6 +360,18 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 		// Already answered. The second click is the owner tapping twice
 		// before Slack removed the buttons, and the first answer stands.
 	}
+}
+
+// warn reports a click that is not this question's answer, once per question:
+// a stale message with live buttons can be tapped repeatedly, and each tap is
+// otherwise a log line.
+func (a *pendingAsk) warn(in Interaction) {
+	if a.warned {
+		return
+	}
+	a.warned = true
+	log.Printf("ignoring a button click that is not the owner answering the pending question (user %s, channel %s, message %s)",
+		logSafe(in.User, maxLoggedValue), logSafe(in.Channel, maxLoggedValue), logSafe(in.MessageTS, maxLoggedValue))
 }
 
 // choiceIndex reads the option index back out of a click. The value is the

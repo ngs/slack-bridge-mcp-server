@@ -244,6 +244,50 @@ func TestFirstRunSeedsPastExistingThreadReplies(t *testing.T) {
 	}
 }
 
+// When the cap bites, it has to spend its budget on the threads the owner is
+// actually talking in — which is the ones replied to most recently, not the
+// ones whose parent happens to be newest.
+func TestCatchUpPrefersTheMostRecentlyRepliedThreads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var surface, replies []candidate
+	// Newest parent first, as history returns them, with the liveliest thread
+	// hanging off the oldest parent.
+	for i := range maxThreadsPerCatchUp {
+		parentTS := "100.000" + strconv.Itoa(900-i)
+		replyTS := "100.000" + strconv.Itoa(400+i)
+		surface = append(surface, threadedParent(parentTS, "quiet thread", replyTS, 1))
+		replies = append(replies, reply(replyTS, parentTS, "an old aside"))
+	}
+	surface = append(surface, threadedParent("100.000150", "the live one", "100.000999", 30))
+	replies = append(replies, reply("100.000999", "100.000150", "answered a minute ago"))
+
+	b, api, _ := threadBridge(ctx, t, surface, replies)
+
+	result, err := b.Wait(ctx, MaxWaitTimeout)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	var found bool
+	for _, m := range result.Messages {
+		if m.Text == "answered a minute ago" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the most recently replied thread was skipped for older ones; the cap must spend its budget by latest_reply")
+	}
+
+	api.mu.Lock()
+	walked := len(api.replyCalls)
+	api.mu.Unlock()
+	if walked != maxThreadsPerCatchUp {
+		t.Errorf("read %d threads, want the cap of %d", walked, maxThreadsPerCatchUp)
+	}
+}
+
 // A fresh install joins the conversation. Reading every thread in the channel
 // would be the replay that seeding the cursor exists to avoid.
 func TestCatchUpReadsNoThreadsOnTheFirstEverRun(t *testing.T) {

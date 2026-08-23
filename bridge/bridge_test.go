@@ -35,6 +35,9 @@ type fakeAPI struct {
 	names       map[string]string
 	nameErr     error
 	nameLookups int
+	// nameDelay makes each users.info call take time, so a test can tell
+	// parallel resolution from serial.
+	nameDelay   time.Duration
 	posts       []postCall
 	questions   []questionCall
 	reactions   []reactionCall
@@ -155,13 +158,17 @@ func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, e
 
 func (f *fakeAPI) UserName(_ context.Context, userID string) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.nameLookups++
-	if f.nameErr != nil {
-		return "", f.nameErr
+	delay, name, err := f.nameDelay, f.names[userID], f.nameErr
+	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
 	}
-	return f.names[userID], nil
+	if err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (string, error) {

@@ -24,6 +24,11 @@ const (
 // is ten thousand replies: past any real conversation, and still bounded.
 const maxThreadReadPages = 50
 
+// maxParallelNameLookups is how many users.info calls are in flight at once.
+// Enough that a channel full of different people resolves quickly, few enough
+// that reading history never looks like an attack on the rate limit.
+const maxParallelNameLookups = 8
+
 // ReadRequest is what slack_history asks for. Every field is optional.
 type ReadRequest struct {
 	// Limit caps how many messages come back, newest-end first if the window
@@ -167,13 +172,10 @@ func readThreadWindow(ctx context.Context, api API, channel string, req ReadRequ
 	return kept, hasMore || dropped, nil
 }
 
-// describe turns raw messages into the reported form, oldest first, resolving
-// each distinct author's name once.
+// describe turns raw messages into the reported form, oldest first, with each
+// distinct author's name looked up once.
 func (b *Bridge) describe(ctx context.Context, api API, messages []candidate) []HistoryMessage {
-	// A name Slack refuses this time is not worth asking about again within
-	// the same call; the shared cache keeps only the answers that worked, so a
-	// scope granted later still takes effect without a restart.
-	failed := make(map[string]bool)
+	names := b.resolveNames(ctx, api, messages)
 
 	out := make([]HistoryMessage, 0, len(messages))
 	for _, m := range messages {
@@ -183,7 +185,7 @@ func (b *Bridge) describe(ctx context.Context, api API, messages []candidate) []
 		out = append(out, HistoryMessage{
 			TS:         m.TS,
 			User:       m.User,
-			UserName:   b.authorName(ctx, api, m, failed),
+			UserName:   authorName(m, names),
 			Text:       m.Text,
 			ThreadTS:   m.ThreadTS,
 			Bot:        m.BotID != "" || m.SubType == "bot_message",
@@ -195,10 +197,11 @@ func (b *Bridge) describe(ctx context.Context, api API, messages []candidate) []
 	return out
 }
 
-// authorName works out what to call whoever wrote a message.
-func (b *Bridge) authorName(ctx context.Context, api API, m candidate, failed map[string]bool) string {
-	// A webhook post has no user to look up and carries the name it wants to
-	// be shown under, which is the only name there is.
+// authorName works out what to call whoever wrote a message, from names
+// already resolved.
+func authorName(m candidate, names map[string]string) string {
+	// A webhook or app post carries the name it wants to be shown under, which
+	// is the only name there is: there is no user to look up.
 	if m.Username != "" {
 		return m.Username
 	}
@@ -208,20 +211,77 @@ func (b *Bridge) authorName(ctx context.Context, api API, m candidate, failed ma
 		}
 		return "unknown"
 	}
-	if failed[m.User] {
-		return m.User
+	if name := names[m.User]; name != "" {
+		return name
+	}
+	// Unresolved, which is what the missing users:read scope looks like. The
+	// ID is still perfectly readable.
+	return m.User
+}
+
+// resolveNames looks up every distinct author in one batch.
+//
+// One at a time would mean a users.info round trip per author in reading
+// order — two hundred messages of a busy channel can be dozens of them — so
+// the lookups run together, a few at a time. The cap is there because a burst
+// of parallel calls is how a Slack app gets rate-limited.
+//
+// The first failure stops the rest. Failures here are effectively one failure:
+// the users:read scope is either granted or it is not, and asking fifty more
+// times to be told the same thing only slows the answer down and eats the rate
+// limit. Successes are cached on the bridge, so a scope granted later starts
+// working without a restart.
+func (b *Bridge) resolveNames(ctx context.Context, api API, messages []candidate) map[string]string {
+	pending := make([]string, 0, len(messages))
+	seen := make(map[string]bool, len(messages))
+	for _, m := range messages {
+		if m.Username != "" || m.User == "" || seen[m.User] {
+			continue
+		}
+		seen[m.User] = true
+		pending = append(pending, m.User)
+	}
+	if len(pending) == 0 {
+		return nil
 	}
 
-	name, err := b.names().lookup(ctx, api, m.User)
-	if err != nil {
-		// Most likely the users:read scope is missing, which is a setup
-		// choice rather than a fault: the IDs are still readable, so the tool
-		// keeps working with them.
-		failed[m.User] = true
-		log.Printf("could not resolve a display name, using the user ID: %s", logSafe(err.Error(), maxLoggedError))
-		return m.User
+	var (
+		mu      sync.Mutex
+		names   = make(map[string]string, len(pending))
+		failed  bool
+		wg      sync.WaitGroup
+		lookups = make(chan struct{}, maxParallelNameLookups)
+	)
+	for _, id := range pending {
+		mu.Lock()
+		stop := failed
+		mu.Unlock()
+		if stop {
+			break
+		}
+
+		wg.Add(1)
+		lookups <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-lookups }()
+
+			name, err := b.names().lookup(ctx, api, id)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if !failed {
+					failed = true
+					log.Printf("could not resolve display names, falling back to user IDs: %s", logSafe(err.Error(), maxLoggedError))
+				}
+				return
+			}
+			names[id] = name
+		}()
 	}
-	return name
+	wg.Wait()
+
+	return names
 }
 
 // names returns the bridge's display-name cache, creating it on first use.

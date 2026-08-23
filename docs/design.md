@@ -131,8 +131,10 @@ Two limits keep this from growing into a crawl of the channel:
 
 - Only the newest 200 surface messages are scanned for threads. A reply added
   to a thread that has since been pushed past that window is not recovered.
-- At most 20 threads are read per catch-up, newest-first, which is where a
-  conversation the owner is actually having will be.
+- At most 20 threads are read per catch-up, taken in order of when each was
+  last replied to. That ordering is the point: a week-old thread answered ten
+  minutes ago is the conversation the owner is having, and a thread started
+  this morning and quiet since is not.
 
 Both limits lose messages when they bite, and it is worth being exact about
 that rather than comfortable: the cursor advances to the newest message that

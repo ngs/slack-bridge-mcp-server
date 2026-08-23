@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -515,15 +516,27 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 		log.Printf("catch-up scanned the newest %d messages for threads; older threads were not examined", threadScanLimit)
 	}
 
+	// Sorted by when each thread was last spoken in, not by how recently its
+	// parent was posted, because that is what the cap has to choose between: a
+	// week-old thread the owner answered ten minutes ago matters more than a
+	// thread started this morning and quiet since.
+	eligible := make([]candidate, 0, len(page.Messages))
+	for _, parent := range page.Messages {
+		if parent.TS == "" || parent.LatestReply == "" || !tsLess(after, parent.LatestReply) {
+			continue
+		}
+		eligible = append(eligible, parent)
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		return tsLess(eligible[j].LatestReply, eligible[i].LatestReply)
+	})
+
 	var (
 		messages []Message
 		walked   int
 		skipped  int
 	)
-	for _, parent := range page.Messages {
-		if parent.TS == "" || parent.LatestReply == "" || !tsLess(after, parent.LatestReply) {
-			continue
-		}
+	for _, parent := range eligible {
 		if walked >= maxThreadsPerCatchUp {
 			skipped++
 			continue
