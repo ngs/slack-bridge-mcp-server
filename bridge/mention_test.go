@@ -390,7 +390,9 @@ func TestTheMentionSearchIsBounded(t *testing.T) {
 	}
 
 	history := map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}}
-	joined := make([]string, 0, maxScannedChannels+5)
+	// The home channel comes back in the list like any other, and is skipped:
+	// it has its own catch-up and must not cost the scan one of its slots.
+	joined := []string{testChannel}
 	for i := 0; i < maxScannedChannels+5; i++ {
 		id := "C0BUSY" + strconv.Itoa(i)
 		joined = append(joined, id)
@@ -415,8 +417,10 @@ func TestTheMentionSearchIsBounded(t *testing.T) {
 	if len(scanned) != maxScannedChannels {
 		t.Errorf("the search read %d channels, want it capped at %d", len(scanned), maxScannedChannels)
 	}
-	if got := api.joinedCalls; len(got) != 1 || got[0] != maxScannedChannels {
-		t.Errorf("users.conversations calls = %v, want one asking for %d channels", got, maxScannedChannels)
+	// One more than the cap is asked for, because the home channel is skipped
+	// and would otherwise cost one of the twenty.
+	if got := api.joinedCalls; len(got) != 1 || got[0] != maxScannedChannels+1 {
+		t.Errorf("users.conversations calls = %v, want one asking for %d channels", got, maxScannedChannels+1)
 	}
 }
 

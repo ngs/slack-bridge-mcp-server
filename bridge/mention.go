@@ -266,7 +266,10 @@ func (b *Bridge) scanForMentions(ctx context.Context, api API, owner string) ([]
 	home, cursor := b.cfg.Channel, b.mentionCursor
 	b.mu.Unlock()
 
-	channels, err := api.JoinedChannels(ctx, maxScannedChannels)
+	// One more than the cap, because the home channel is almost always in the
+	// list and is skipped below: asking for exactly the cap would quietly make
+	// it one channel smaller than it says it is.
+	channels, err := api.JoinedChannels(ctx, maxScannedChannels+1)
 	if err != nil {
 		return nil, "", err
 	}

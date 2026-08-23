@@ -86,7 +86,14 @@ func (f *fakeAPI) JoinedChannels(_ context.Context, limit int) ([]string, error)
 	if f.joinedErr != nil {
 		return nil, f.joinedErr
 	}
-	return append([]string(nil), f.joined...), nil
+
+	// Slack pages this, and the caller only ever reads the first page, so the
+	// limit is what decides how much of the workspace is visible at all.
+	joined := f.joined
+	if limit > 0 && len(joined) > limit {
+		joined = joined[:limit]
+	}
+	return append([]string(nil), joined...), nil
 }
 
 type postCall struct{ Channel, ThreadTS, Text string }
