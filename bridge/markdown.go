@@ -74,11 +74,17 @@ func rejectedForSize(err error, text string) bool {
 }
 
 // shortcodeAllowance is the room one expandable character is assumed to take
-// once Slack rewrites it as its :shortcode:. Slack accepts 1,000 emoji in a
-// markdown block and refuses 1,500, which puts the real figure near ten; eight
-// keeps the estimate on the cautious side of that without treating a message
-// as oversized on the strength of a couple of emoji.
-const shortcodeAllowance = 8
+// once Slack rewrites it as its :shortcode:. Shortcodes are not one width —
+// :tada: is seven characters and :slightly_smiling_face: is twenty-three — so
+// this is an upper bound rather than an average: guessing low would leave a
+// message that is nearly full and holds one emoji looking safe, and a post
+// rejected without a retry is a reply the owner never sees.
+//
+// Guessing high costs nothing that matters. The estimate only decides whether
+// an internal_error is worth retrying as plain text, and even at this width a
+// short message would need dozens of emoji before it counted as oversized —
+// far more than the one status marker that made the previous rule useless.
+const shortcodeAllowance = 32
 
 // mayExceedExpanded reports whether the text could pass the budget once Slack
 // rewrites what is inside it.

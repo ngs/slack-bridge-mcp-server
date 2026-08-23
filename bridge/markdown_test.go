@@ -283,6 +283,10 @@ func TestRejectedForSize(t *testing.T) {
 		// marker is not why a short message would be refused.
 		{"internal on a resolved question", slack.SlackErrorResponse{Err: "internal_error"}, "Deploy now?\n\n✅ `yes`", false},
 		{"internal on a wall of emoji", slack.SlackErrorResponse{Err: "internal_error"}, strings.Repeat("🎉", 1500), true},
+		// Nearly full with a single emoji: whether its shortcode tips the
+		// message over depends on which emoji it is, so this has to be
+		// retryable or a reply that Slack refused would simply be lost.
+		{"internal on a nearly full message with one emoji", slack.SlackErrorResponse{Err: "internal_error"}, strings.Repeat("a", maxMarkdownBlock-10) + "🙂", true},
 	}
 
 	for _, tc := range tests {
@@ -371,23 +375,44 @@ func TestPostQuestionFallsBackButKeepsTheButtons(t *testing.T) {
 	}
 }
 
-// The buttons have to go even when the block does not fit, or an answered
-// question stays answerable.
-func TestResolveQuestionRetiresTheButtonsEvenWhenTheBlockIsRefused(t *testing.T) {
+// A question that was living in a section block, because Slack would not
+// render it, has to retire the same way rather than dropping to bare text.
+func TestResolveQuestionFallsBackToASectionFirst(t *testing.T) {
 	f, api := newFakeSlack(t,
 		`{"ok":false,"error":"msg_too_long"}`,
 		`{"ok":true,"channel":"C1","ts":"100.000900"}`,
 	)
 
-	if err := api.ResolveQuestion(context.Background(), "C1", "100.000900", "**Deploy**? 🎉\n\n✅ yes"); err != nil {
+	if err := api.ResolveQuestion(context.Background(), "C1", "100.000900", "**Deploy**? 🎉\n\n✅ `yes`"); err != nil {
 		t.Fatalf("ResolveQuestion() error = %v", err)
 	}
 
 	if len(f.calls) != 2 {
-		t.Fatalf("made %d calls, want the block attempt and the retry", len(f.calls))
+		t.Fatalf("made %d calls, want the block attempt and the section retry", len(f.calls))
 	}
-	if len(f.calls[1].Blocks) != 0 {
-		t.Errorf("retry blocks = %v, want an empty list so the actions block is dropped", blockTypes(f.calls[1]))
+	if got := blockTypes(f.calls[1]); len(got) != 1 || got[0] != "section" {
+		t.Errorf("retry blocks = %v, want a section block, which still leaves no actions block", got)
+	}
+}
+
+// The buttons have to go even when nothing renders, or an answered question
+// stays answerable.
+func TestResolveQuestionRetiresTheButtonsEvenWhenNothingRenders(t *testing.T) {
+	f, api := newFakeSlack(t,
+		`{"ok":false,"error":"msg_too_long"}`,
+		`{"ok":false,"error":"msg_too_long"}`,
+		`{"ok":true,"channel":"C1","ts":"100.000900"}`,
+	)
+
+	if err := api.ResolveQuestion(context.Background(), "C1", "100.000900", "**Deploy**? 🎉\n\n✅ `yes`"); err != nil {
+		t.Fatalf("ResolveQuestion() error = %v", err)
+	}
+
+	if len(f.calls) != 3 {
+		t.Fatalf("made %d calls, want markdown, then section, then no blocks at all", len(f.calls))
+	}
+	if len(f.calls[2].Blocks) != 0 {
+		t.Errorf("last blocks = %v, want an empty list so the actions block is dropped", blockTypes(f.calls[2]))
 	}
 }
 
