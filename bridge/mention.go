@@ -241,16 +241,16 @@ func (b *Bridge) conversationsAreDegraded(generation uint64) bool {
 // the first scan of a connection whose scopes may well be there.
 func (b *Bridge) degradeConversations(generation uint64, err error) {
 	b.mu.Lock()
-	stale := generation != b.connGeneration
-	already := b.degradedGeneration == generation
-	if !stale {
-		b.degradedGeneration = generation
-	}
-	b.mu.Unlock()
+	defer b.mu.Unlock()
 
-	if stale || already {
+	if generation != b.connGeneration || b.degradedGeneration == generation {
 		return
 	}
+	b.degradedGeneration = generation
+
+	// Logged while the lock is still held, so the line cannot outlive the
+	// decision it reports: a connection replaced in the gap would leave this
+	// notice describing an installation that is no longer the one running.
 	log.Printf("slack refused a call for want of a scope (%s); conversations outside the home channel are off until the app is reinstalled with channels:read and groups:read, plus channels:history and groups:history for the channels it should read. The home channel is unaffected.",
 		logSafe(err.Error(), maxLoggedError))
 }
