@@ -451,3 +451,23 @@ func TestTheIndicatorPostsWithoutBlocks(t *testing.T) {
 		t.Error("the reply went through PostPlain, want the rendered path")
 	}
 }
+
+// The label is no longer rewritten on its way to the indicator. Nothing else
+// pins that: every other Progress test uses a label with no markup in it.
+func TestProgressLabelIsNotRewritten(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	const label = "# **release chain**: waiting for [CI](https://ci.example)"
+	if _, err := b.Progress(ctx, ProgressRequest{Text: label}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the label to reach the indicator", func() bool {
+		return strings.Contains(lastIndicatorUpdate(api), label)
+	})
+}

@@ -440,3 +440,25 @@ func TestAnsweredTextQuotesTheChosenLabel(t *testing.T) {
 		t.Errorf("answeredText() = %q, want %q", got, want)
 	}
 }
+
+// The tests above call webAPI directly, so nothing yet stops the bridge from
+// altering the text on its way there — which is exactly what it used to do,
+// and what the markdown block makes wrong.
+func TestBridgePostHandsTheMarkdownOverUntouched(t *testing.T) {
+	api := &fakeAPI{postTS: "100.000900"}
+	b := New(context.Background(), testConfig(t), &fakeConnector{api: api, stream: newFakeStream()})
+	defer func() { _ = b.Close() }()
+
+	text := "## Status\n\n**done** — see [the PR](https://example.com/pull/1)\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+	if _, err := b.Post(context.Background(), PostRequest{Text: text}); err != nil {
+		t.Fatalf("Post() error = %v", err)
+	}
+
+	posts := agentPosts(api)
+	if len(posts) != 1 {
+		t.Fatalf("agent posts = %d, want one", len(posts))
+	}
+	if posts[0].Text != text {
+		t.Errorf("the bridge changed the text on the way out:\n got %q\nwant %q", posts[0].Text, text)
+	}
+}
