@@ -154,10 +154,11 @@ Slack render it: `**bold**`, `# headings`, tables and fenced code all arrive
 rendered instead of showing their markup. The text is sent as the message's
 `text` as well, which is the fallback Slack puts in push notifications.
 
-A markdown block holds 12,000 characters per message. A longer post goes as
-plain text instead, whole and unrendered: splitting it across blocks would not
-help, since the budget is for the whole message rather than for each block. The
-`slack_progress` label stays plain text too — it shares one line with a
+A markdown block holds 12,000 characters per message. A longer post goes as the
+message body instead — whole, but with only Slack's own mrkdwn applied to it,
+so Markdown headings and tables show their markup. Splitting it across blocks
+would not help, since the budget is for the whole message rather than for each
+block. The `slack_progress` label goes the same way: it shares one line with a
 stopwatch, where there is nothing to render.
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool

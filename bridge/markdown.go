@@ -22,7 +22,8 @@ const maxMarkdownBlock = 12000
 // shows, so leaving it out would turn every push notification into an empty
 // one.
 //
-// Text too long for a markdown block goes as plain text instead. Splitting it
+// Text too long for a markdown block goes as the message body instead, where
+// only Slack's mrkdwn applies. Splitting it
 // across several blocks would not help, because the budget is for the whole
 // message rather than for each block, and splitting it across several messages
 // would change what a single slack_post means — one call, one ts, one thing to
@@ -37,9 +38,14 @@ func markdownBody(text string) []slack.MsgOption {
 	}
 }
 
-// plainBody sends the text as the message body itself, as the bridge did
-// before markdown blocks: no rendering, but a ceiling in the tens of thousands
-// of characters rather than 12,000.
+// plainBody sends the text as the message body itself, with no blocks, as the
+// bridge did before markdown blocks: Slack applies its own mrkdwn to it and
+// nothing else, so Markdown headings and tables show their markup — but the
+// ceiling is tens of thousands of characters rather than 12,000.
+//
+// mrkdwn is deliberately left on. It is what this path has always done, and
+// turning it off would newly break the `*bold*` an owner reading these
+// messages already sees rendered.
 func plainBody(text string) []slack.MsgOption {
 	return []slack.MsgOption{slack.MsgOptionText(text, false)}
 }
@@ -52,11 +58,10 @@ func fitsMarkdownBlock(text string) bool {
 // big, which is the one failure a plain-text retry can fix.
 //
 // msg_too_long says so outright. internal_error is Slack's generic failure and
-// is only read as a size rejection when the text holds something Slack expands
-// — that is the case where a payload inside the character budget is refused
-// with nothing more specific to go on. Reading every internal_error that way
-// would mean retrying a transient failure whose first request Slack may have
-// accepted, and posting the reply twice.
+// is only read that way when the text is big enough that expansion could
+// plausibly have pushed it over — otherwise a transient failure whose request
+// Slack had already accepted would be retried, posting a reply twice or
+// undoing an update that had landed.
 func rejectedForSize(err error, text string) bool {
 	if err == nil {
 		return false
@@ -65,39 +70,62 @@ func rejectedForSize(err error, text string) bool {
 	if strings.Contains(msg, "msg_too_long") {
 		return true
 	}
-	return strings.Contains(msg, "internal_error") && expandsInSlack(text)
+	return strings.Contains(msg, "internal_error") && mayExceedExpanded(text)
 }
 
-// expandsInSlack reports whether the text holds characters Slack rewrites on
-// the way in, an emoji becoming its :shortcode:. That expansion is measured
-// against the budget, which is how 1,000 emoji fit a markdown block and 1,500
-// do not, well short of 12,000 characters.
-func expandsInSlack(text string) bool {
-	for _, r := range text {
-		if unicode.Is(unicode.So, r) {
-			return true
-		}
-	}
-	return false
-}
+// shortcodeAllowance is the room one expandable character is assumed to take
+// once Slack rewrites it as its :shortcode:. Slack accepts 1,000 emoji in a
+// markdown block and refuses 1,500, which puts the real figure near ten; eight
+// keeps the estimate on the cautious side of that without treating a message
+// as oversized on the strength of a couple of emoji.
+const shortcodeAllowance = 8
 
-// escapeMarkdown neutralises the inline Markdown in a string that was never
-// meant to be Markdown, so it reads as the characters it actually contains.
+// mayExceedExpanded reports whether the text could pass the budget once Slack
+// rewrites what is inside it.
 //
-// It exists for text that was shown somewhere Markdown is not rendered and is
-// later quoted somewhere it is — an answer's button label, which is plain_text
-// on the button, appearing in the resolved question. Only the characters that
-// start inline formatting are escaped: the ones that matter solely at the
-// start of a line cannot fire mid-sentence, and escaping them would leave
-// backslashes on show for nothing.
-func escapeMarkdown(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		if strings.ContainsRune(`\*_`+"`"+`~[]`, r) {
-			b.WriteByte('\\')
+// Counting the expandable characters, rather than merely noticing one, is what
+// keeps this honest for short text: every resolved question carries a ✅ or a
+// ⌛, and a status marker is not why a hundred-character message would be
+// refused.
+func mayExceedExpanded(text string) bool {
+	runes, expandable := 0, 0
+	for _, r := range text {
+		runes++
+		if unicode.Is(unicode.So, r) {
+			expandable++
 		}
-		b.WriteRune(r)
 	}
-	return b.String()
+	return runes+expandable*shortcodeAllowance > maxMarkdownBlock
+}
+
+// literal renders a string so a markdown block shows the characters it
+// actually contains.
+//
+// A code span rather than an escape set, because the string this exists for —
+// the label of the button the owner clicked — was shown as plain_text, where
+// nothing at all is markup. Escaping would mean naming every construct that
+// could fire: emphasis, autolinks, entities, emoji shortcodes. A code span
+// suspends all of them at once.
+//
+// The fence is one backtick longer than the longest run inside, which is how
+// Markdown lets a code span contain backticks of its own.
+func literal(s string) string {
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			longest = max(longest, run)
+			continue
+		}
+		run = 0
+	}
+
+	fence := strings.Repeat("`", longest+1)
+	// A space keeps a leading or trailing backtick in the content from
+	// touching the fence, where it would be read as part of it. Markdown
+	// strips one space from each end of a padded span.
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") {
+		return fence + " " + s + " " + fence
+	}
+	return fence + s + fence
 }

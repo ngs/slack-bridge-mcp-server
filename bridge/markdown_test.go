@@ -273,12 +273,16 @@ func TestRejectedForSize(t *testing.T) {
 		{"too long", slack.SlackErrorResponse{Err: "msg_too_long"}, "hello", true},
 		{"wrapped", fmt.Errorf("chat.postMessage: %w", slack.SlackErrorResponse{Err: "msg_too_long"}), "hello", true},
 		{"unrelated", slack.SlackErrorResponse{Err: "channel_not_found"}, "hello", false},
-		// internal_error is Slack's generic failure. Reading it as a size
-		// rejection is only justified when the text holds something Slack
-		// expands; otherwise a retry could post a reply Slack already accepted.
-		{"internal on expandable text", slack.SlackErrorResponse{Err: "internal_error"}, "done 🎉", true},
+		// internal_error is Slack's generic failure, so it only counts as a
+		// size rejection where expansion could plausibly have caused it.
+		// Otherwise a retry could repeat a post Slack already accepted.
 		{"internal on plain text", slack.SlackErrorResponse{Err: "internal_error"}, "done", false},
 		{"internal on cjk text", slack.SlackErrorResponse{Err: "internal_error"}, "完了しました", false},
+		{"internal on a couple of emoji", slack.SlackErrorResponse{Err: "internal_error"}, "done 🎉", false},
+		// Every resolved question carries one of these markers, and a status
+		// marker is not why a short message would be refused.
+		{"internal on a resolved question", slack.SlackErrorResponse{Err: "internal_error"}, "Deploy now?\n\n✅ `yes`", false},
+		{"internal on a wall of emoji", slack.SlackErrorResponse{Err: "internal_error"}, strings.Repeat("🎉", 1500), true},
 	}
 
 	for _, tc := range tests {
@@ -290,29 +294,31 @@ func TestRejectedForSize(t *testing.T) {
 	}
 }
 
-func TestEscapeMarkdown(t *testing.T) {
+func TestLiteral(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
 		want string
 	}{
-		{"plain", "yes", "yes"},
-		{"bold", "**yes**", `\*\*yes\*\*`},
-		{"underscores", "run__it", `run\_\_it`},
-		{"link", "[docs](https://example.com)", `\[docs\](https://example.com)`},
-		{"code span", "`go test`", "\\`go test\\`"},
-		{"strikethrough", "~~no~~", `\~\~no\~\~`},
-		{"backslash", `a\b`, `a\\b`},
-		// Nothing that only matters at the start of a line: the label is
-		// quoted mid-sentence, where these cannot fire.
-		{"dash and hash left alone", "- no # 1", "- no # 1"},
-		{"cjk untouched", "はい", "はい"},
+		{"plain", "yes", "`yes`"},
+		{"bold", "**yes**", "`**yes**`"},
+		{"underscores", "run__it", "`run__it`"},
+		{"link", "[docs](https://example.com)", "`[docs](https://example.com)`"},
+		{"autolink", "<https://example.com>", "`<https://example.com>`"},
+		{"entity", "a & b", "`a & b`"},
+		{"emoji shortcode", ":shipit:", "`:shipit:`"},
+		{"cjk", "はい", "`はい`"},
+		// A label with backticks needs a longer fence, and one at either end
+		// needs padding so it does not merge into it.
+		{"contains a backtick", "go `test`", "`` go `test` ``"},
+		{"starts with a backtick", "`x", "`` `x ``"},
+		{"double run inside", "a ``b`` c", "```a ``b`` c```"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := escapeMarkdown(tc.in); got != tc.want {
-				t.Errorf("escapeMarkdown(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := literal(tc.in); got != tc.want {
+				t.Errorf("literal(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -427,9 +433,9 @@ func TestBuildQuestionTruncatesAtTheCap(t *testing.T) {
 
 // The answer is quoted back into a markdown block, but the owner chose it on a
 // plain_text button.
-func TestAnsweredTextEscapesTheChosenLabel(t *testing.T) {
+func TestAnsweredTextQuotesTheChosenLabel(t *testing.T) {
 	got := answeredText("Deploy **now**?", "**yes**")
-	want := "Deploy **now**?\n\n✅ " + `\*\*yes\*\*`
+	want := "Deploy **now**?\n\n✅ `**yes**`"
 	if got != want {
 		t.Errorf("answeredText() = %q, want %q", got, want)
 	}

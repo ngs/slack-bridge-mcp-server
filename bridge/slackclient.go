@@ -285,9 +285,10 @@ func questionBody(q Question, buttons []slack.BlockElement, markdown bool) []sla
 // way the live one was.
 //
 // If Slack will not take the block, the buttons still have to go, so the
-// retry sends an explicit empty list: the question reads as plain text, which
-// is worse than rendered and far better than an answered question the owner
-// can answer again.
+// retry sends an explicit empty list: the question falls back to the body
+// text, where Slack's mrkdwn applies but its Markdown does not. Less well
+// rendered, and far better than an answered question the owner can answer
+// again.
 func (w *webAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) error {
 	err := w.updateBlocks(ctx, channel, ts, text, slack.NewMarkdownBlock("", text))
 	if err != nil && rejectedForSize(err, text) {

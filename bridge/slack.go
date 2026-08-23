@@ -96,11 +96,12 @@ type API interface {
 	// thread, and returns the timestamp of the posted message. The text is
 	// Markdown, and Slack renders it.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)
-	// PostPlain sends a message that is not Markdown and must not be rendered
-	// as any. It exists for the bridge's own furniture — the processing
-	// indicator — which is a fixed line the server rewrites in place, and
-	// which a block would freeze: an update that sends only text leaves the
-	// blocks of the original post standing.
+	// PostPlain sends a message as the body text alone, with no blocks, so a
+	// later text-only Update replaces all of what the channel shows. It
+	// exists for the bridge's own furniture — the processing indicator — which
+	// a block would freeze in place, since an update carrying no blocks leaves
+	// the ones already on the message standing. Slack's own mrkdwn still
+	// applies to the text; what it does not get is Markdown.
 	PostPlain(ctx context.Context, channel, threadTS, text string) (string, error)
 	// PostQuestion sends a question with clickable answers and returns the
 	// timestamp of the posted message.
@@ -109,9 +110,10 @@ type API interface {
 	React(ctx context.Context, channel, ts, emoji string) error
 	// Update rewrites the text of a message the bridge posted.
 	Update(ctx context.Context, channel, ts, text string) error
-	// ResolveQuestion rewrites a question to plain text and removes its
-	// buttons, which is how an answered or expired question stops being
-	// clickable.
+	// ResolveQuestion rewrites an answered or expired question and removes
+	// its buttons, which is how it stops being clickable. The text is
+	// Markdown, rendered as the live question was; an implementation that
+	// cannot render it must still drop the buttons.
 	ResolveQuestion(ctx context.Context, channel, ts, text string) error
 	// Delete removes a message the bridge posted.
 	Delete(ctx context.Context, channel, ts string) error

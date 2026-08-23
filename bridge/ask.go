@@ -470,12 +470,12 @@ func buildQuestion(question string, options []string) (Question, []string, error
 
 // answeredText is the question with the chosen answer under it.
 //
-// The label is escaped because it was chosen on a button, where plain_text
-// showed it exactly as the caller wrote it; the resolved question is Markdown,
-// where an option like **yes** would arrive in bold and stop matching what the
-// owner clicked.
+// The label is quoted literally because it was chosen on a button, where
+// plain_text showed it exactly as the caller wrote it. The resolved question
+// is Markdown, where an option like **yes** would arrive in bold, <https://x>
+// as a link and :shipit: as a picture — none of them what the owner clicked.
 func answeredText(question, label string) string {
-	return fmt.Sprintf("%s\n\n✅ %s", question, escapeMarkdown(label))
+	return fmt.Sprintf("%s\n\n✅ %s", question, literal(label))
 }
 
 // truncate shortens a string to limit characters, spending the last one on an
