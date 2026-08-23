@@ -56,6 +56,10 @@ type Bridge struct {
 	// indicator is the live "⏳ Working…" message, if one is running. At most
 	// one exists at a time; see indicator.go.
 	indicator *indicator
+	// indicatorDone belongs to the most recent indicator, running or already
+	// stopped. It outlives the indicator itself because the next one has to
+	// wait for this one's chat.delete before posting its own message.
+	indicatorDone <-chan struct{}
 }
 
 // New returns a Bridge that connects on first use. cfg may be incomplete; the
@@ -434,6 +438,12 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 // replacing any indicator still running so two of them can never coexist in the
 // channel.
 //
+// The replacement is handed its predecessor's done channel and waits for it
+// before posting anything, which is what makes "never two at once" hold even
+// when the outgoing chat.delete is slower than the grace period. That wait
+// happens on the new indicator's own goroutine, so this call still returns
+// immediately.
+//
 // The indicator is given the bridge's own context rather than the tool call's:
 // the call that starts it returns immediately, and a per-call context would be
 // cancelled before the first tick.
@@ -447,7 +457,8 @@ func (b *Bridge) startIndicator() {
 	}
 
 	grace, interval := b.cfg.indicatorTimings()
-	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval)
+	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval, b.indicatorDone)
+	b.indicatorDone = b.indicator.done
 	b.indicator.start()
 }
 
@@ -459,12 +470,15 @@ func (b *Bridge) stopIndicator() {
 	b.stopIndicatorLocked()
 }
 
-// stopIndicatorLocked is stopIndicator for callers that already hold b.mu.
+// stopIndicatorLocked is stopIndicator for callers that already hold b.mu. The
+// done channel is kept behind, so the next indicator knows what it is waiting
+// for.
 func (b *Bridge) stopIndicatorLocked() {
 	if b.indicator == nil {
 		return
 	}
 	b.indicator.stop()
+	b.indicatorDone = b.indicator.done
 	b.indicator = nil
 }
 

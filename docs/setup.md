@@ -160,9 +160,11 @@ via direnv or your shell profile.
 
 Restart the CLI and ask it to call `slack_status`. On a fresh session it
 answers `"connected": false`, and **that is the expected answer**: the server
-does not open a socket until the first `slack_wait` or `slack_post`, so that it
-can sit in every project's `.mcp.json` without connecting in sessions that
-never use it. What matters at this point is that `config_error` is absent — if
+does not open a socket until the first tool call that actually needs Slack —
+`slack_wait`, `slack_post` or `slack_ack`, whichever you reach first — so that
+it can sit in every project's `.mcp.json` without connecting in sessions that
+never use it. `slack_status` itself never connects, which is what makes it
+useful when something is misconfigured. What matters at this point is that `config_error` is absent — if
 it is there, it names the variables that did not arrive.
 
 ## 6. First run

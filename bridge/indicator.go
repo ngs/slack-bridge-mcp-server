@@ -47,19 +47,28 @@ type indicator struct {
 	// time the owner cares about — not when the first message was posted.
 	startedAt time.Time
 
+	// predecessor is the done channel of the indicator this one replaces, if
+	// any. Waiting for it before posting is what keeps two indicator messages
+	// from being visible at once when the outgoing chat.delete is slow.
+	predecessor <-chan struct{}
+
 	stopOnce sync.Once
 	stopped  chan struct{}
+	// done is closed once the goroutine has finished, deletion included.
+	done chan struct{}
 }
 
-func newIndicator(ctx context.Context, api API, channel string, grace, interval time.Duration) *indicator {
+func newIndicator(ctx context.Context, api API, channel string, grace, interval time.Duration, predecessor <-chan struct{}) *indicator {
 	return &indicator{
-		api:       api,
-		channel:   channel,
-		ctx:       ctx,
-		grace:     grace,
-		interval:  interval,
-		startedAt: time.Now(),
-		stopped:   make(chan struct{}),
+		api:         api,
+		channel:     channel,
+		ctx:         ctx,
+		grace:       grace,
+		interval:    interval,
+		startedAt:   time.Now(),
+		predecessor: predecessor,
+		stopped:     make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -77,6 +86,10 @@ func (in *indicator) stop() {
 }
 
 func (in *indicator) run() {
+	// Closed last, after any deletion below, so that whoever replaces this
+	// indicator can tell when the channel is clear again.
+	defer close(in.done)
+
 	grace := time.NewTimer(in.grace)
 	defer grace.Stop()
 
@@ -88,6 +101,21 @@ func (in *indicator) run() {
 	case <-in.ctx.Done():
 		return
 	case <-grace.C:
+	}
+
+	// The indicator this one replaces may still be deleting its message —
+	// chat.delete is allowed several seconds, which can outlast a short grace
+	// period. Posting before it finishes would put two indicators in the
+	// channel, so wait it out here, on this goroutine, rather than making the
+	// tool call that started us pay for it.
+	if in.predecessor != nil {
+		select {
+		case <-in.predecessor:
+		case <-in.stopped:
+			return
+		case <-in.ctx.Done():
+			return
+		}
 	}
 
 	ts, err := in.api.Post(in.ctx, in.channel, "", in.text())

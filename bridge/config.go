@@ -103,14 +103,18 @@ func durationSetting(name string, fallback, lowest, highest time.Duration) time.
 		return fallback
 	}
 
-	d := time.Duration(seconds) * time.Second
-	if d < lowest {
+	// Clamp while the value is still a count of seconds. Converting first
+	// multiplies by a billion, and a large enough number overflows
+	// time.Duration into a negative value, which would then clamp to the
+	// minimum — the opposite of what someone asking for a very long interval
+	// meant.
+	if seconds <= int(lowest/time.Second) {
 		return lowest
 	}
-	if d > highest {
+	if seconds >= int(highest/time.Second) {
 		return highest
 	}
-	return d
+	return time.Duration(seconds) * time.Second
 }
 
 // indicatorTimings resolves the durations actually used, so a Config built in

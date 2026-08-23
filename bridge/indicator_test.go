@@ -3,7 +3,9 @@ package bridge
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -51,7 +53,7 @@ func eventually(t *testing.T, what string, cond func() bool) {
 
 // indicatorBridge returns a bridge whose next Wait hands over one message, with
 // the indicator wound down to test speed.
-func indicatorBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI) {
+func indicatorBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fakeStream) {
 	t.Helper()
 
 	cfg := testConfig(t)
@@ -69,9 +71,10 @@ func indicatorBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI) {
 		postTS: "100.000900",
 	}
 
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
 	t.Cleanup(func() { _ = b.Close() })
-	return b, api
+	return b, api, stream
 }
 
 // waitForMessages performs the Wait that hands messages to the agent, which is
@@ -106,7 +109,7 @@ func TestNoIndicatorForRepliesFasterThanTheGracePeriod(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	waitForMessages(ctx, t, b)
 
 	if _, err := b.Post(ctx, "here you go", ""); err != nil {
@@ -134,7 +137,7 @@ func TestIndicatorPostsTicksAndIsDeletedOnReply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	waitForMessages(ctx, t, b)
 
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
@@ -182,7 +185,7 @@ func TestNextWaitRemovesTheIndicator(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	waitForMessages(ctx, t, b)
 
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
@@ -194,13 +197,55 @@ func TestNextWaitRemovesTheIndicator(t *testing.T) {
 	eventually(t, "the indicator to be deleted", func() bool { return len(api.snapshotDeletes()) == 1 })
 }
 
+// Two turns in a row, with the first indicator's chat.delete still in flight
+// when the second turn starts. The replacement has to hold its post until the
+// old message is actually gone, or the owner briefly sees two of them — and
+// chat.delete is allowed longer than the shortest grace period, so this is not
+// a theoretical window.
+func TestReplacementWaitsForTheOutgoingIndicatorToBeDeleted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := indicatorBridge(ctx, t)
+
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	defer release()
+
+	api.mu.Lock()
+	api.deleteGate = gate
+	api.mu.Unlock()
+
+	waitForMessages(ctx, t, b)
+	eventually(t, "the first indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	// A second turn begins before the first indicator has finished cleaning up.
+	stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000300", User: testOwner, Text: "and another thing"}}
+	waitForMessages(ctx, t, b)
+
+	eventually(t, "the outgoing indicator to start deleting", func() bool { return len(api.snapshotDeletes()) == 1 })
+
+	// The replacement's grace period has expired several times over by now;
+	// only the pending deletion should be holding it back.
+	time.Sleep(6 * testGrace)
+	if got := indicatorPosts(api); len(got) != 1 {
+		t.Fatalf("indicator posts = %d while the previous message was still being deleted, want 1", len(got))
+	}
+
+	release()
+	eventually(t, "the replacement to post once the channel is clear", func() bool {
+		return len(indicatorPosts(api)) == 2
+	})
+}
+
 // slack_ack means "seen, still working", which is precisely when the owner
 // wants the clock to keep running.
 func TestReactDoesNotStopTheIndicator(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	waitForMessages(ctx, t, b)
 
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
@@ -220,7 +265,7 @@ func TestIndicatorCanBeTurnedOff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	b.cfg.IndicatorDisabled = true
 
 	waitForMessages(ctx, t, b)
@@ -237,7 +282,7 @@ func TestIndicatorFailuresDoNotReachTheTools(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	api.mu.Lock()
 	api.updateErr = errors.New("slack said no")
 	api.deleteErr = errors.New("slack said no again")
@@ -260,7 +305,7 @@ func TestIndicatorGivesUpWhenItCannotPost(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, api := indicatorBridge(ctx, t)
+	b, api, _ := indicatorBridge(ctx, t)
 	api.mu.Lock()
 	api.postErr = errors.New("slack is down")
 	api.mu.Unlock()
@@ -341,6 +386,24 @@ func TestIndicatorSettingsFromTheEnvironment(t *testing.T) {
 		grace, interval = LoadConfig().indicatorTimings()
 		if grace != DefaultIndicatorGrace || interval != DefaultIndicatorInterval {
 			t.Errorf("timings = %v/%v, want the defaults for unusable values", grace, interval)
+		}
+	})
+
+	// A second count large enough to overflow time.Duration once multiplied by
+	// a billion must still land on the maximum, not wrap into a negative
+	// duration and come back as the minimum.
+	t.Run("absurdly large values do not wrap", func(t *testing.T) {
+		if strconv.IntSize < 64 {
+			t.Skip("int is too narrow here for the value to parse at all")
+		}
+
+		huge := strconv.Itoa(1 << 62)
+		t.Setenv(EnvIndicatorGrace, huge)
+		t.Setenv(EnvIndicatorInterval, huge)
+
+		grace, interval := LoadConfig().indicatorTimings()
+		if grace != MaxIndicatorGrace || interval != MaxIndicatorInterval {
+			t.Errorf("timings = %v/%v, want them clamped to %v/%v", grace, interval, MaxIndicatorGrace, MaxIndicatorInterval)
 		}
 	})
 }

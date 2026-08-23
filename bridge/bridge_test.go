@@ -30,6 +30,9 @@ type fakeAPI struct {
 	reactErr     error
 	updateErr    error
 	deleteErr    error
+	// deleteGate, when set, holds Delete open until the test closes it, which
+	// is how a slow chat.delete is simulated.
+	deleteGate chan struct{}
 }
 
 type postCall struct{ Channel, ThreadTS, Text string }
@@ -92,12 +95,18 @@ func (f *fakeAPI) Update(_ context.Context, channel, ts, text string) error {
 	return f.updateErr
 }
 
+// Delete records the call before waiting on deleteGate, so a test can hold a
+// deletion open and still see that it started.
 func (f *fakeAPI) Delete(_ context.Context, channel, ts string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.deletes = append(f.deletes, deleteCall{Channel: channel, TS: ts})
-	return f.deleteErr
+	gate, err := f.deleteGate, f.deleteErr
+	f.mu.Unlock()
+
+	if gate != nil {
+		<-gate
+	}
+	return err
 }
 
 func (f *fakeAPI) calls() []HistoryRequest {

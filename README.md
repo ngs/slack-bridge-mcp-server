@@ -41,8 +41,8 @@ backlog.
 
 The bridge is a child process of the CLI with the same lifetime as the session.
 No daemon, no HTTP listener, no launchd job. It does not connect to Slack until
-the first `slack_wait`, so it can sit in every project's `.mcp.json` without
-opening a socket in sessions that never use it.
+the first tool call that needs Slack, so it can sit in every project's
+`.mcp.json` without opening a socket in sessions that never use it.
 
 The full rationale is in [docs/design.md](docs/design.md).
 
@@ -116,9 +116,10 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 }
 ```
 
-`slack_status` answers `"connected": false` until the first `slack_wait` or
-`slack_post`, which is the lazy connect working as intended rather than a
-problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
+`slack_status` answers `"connected": false` until the first tool call that
+needs Slack — `slack_wait`, `slack_post` or `slack_ack`, whichever comes first
+— which is the lazy connect working as intended rather than a problem.
+[docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
 
