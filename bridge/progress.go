@@ -101,10 +101,13 @@ func (b *Bridge) Progress(_ context.Context, text, threadTS string) (ProgressRes
 // text.
 //
 // The label is dropped into a message the server owns, next to the elapsed
-// time, so it has to stay on that line: newlines and control characters become
-// spaces, runs of whitespace collapse, and a label longer than the cap is cut
-// with an ellipsis. A model that returns a paragraph, or a stack trace, then
-// costs the owner one line rather than a wall of text.
+// time, so it has to stay on that line and read as what it claims to be. Every
+// rune that is whitespace or not printable becomes a separator — newlines and
+// control characters, but zero-width and bidi marks too, which do not take up a
+// line but can hide or reorder what is on it. Runs of them collapse to one
+// space, and a label longer than the cap is cut with an ellipsis, so a model
+// that answers with a paragraph or pastes a stack trace costs the owner one
+// line rather than a wall of text.
 func sanitizeProgressLabel(s string) string {
 	var b strings.Builder
 	space := false

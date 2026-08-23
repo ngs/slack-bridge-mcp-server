@@ -340,6 +340,7 @@ func TestSanitizeProgressLabel(t *testing.T) {
 		{"runs of whitespace collapse", "waiting\t\t for   CI", "waiting for CI"},
 		{"surrounding whitespace goes", "  waiting for CI \n", "waiting for CI"},
 		{"control characters go", "waiting\x00for\x07CI", "waiting for CI"},
+		{"zero-width and bidi marks go too", "waiting\u200bfor\u202eCI", "waiting for CI"},
 		{"whitespace only comes back empty", " \n\t ", ""},
 		{"multibyte text survives", "リリース待ち", "リリース待ち"},
 	}
