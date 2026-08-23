@@ -45,8 +45,15 @@ const indicatorRequestTimeout = 10 * time.Second
 // non-blocking channel close, so a reply is never held up by the indicator's
 // own bookkeeping.
 type indicator struct {
-	api      API
-	channel  string
+	api     API
+	channel string
+	// threadTS is the thread the turn is happening in, empty when the owner
+	// spoke on the channel surface. The indicator belongs wherever the
+	// conversation is: a "⏳ Working…" posted to the channel while the owner is
+	// talking inside a thread is both noise out there and silence in here.
+	// Only the post needs it — chat.update and chat.delete address the message
+	// by its own ts, which identifies it whichever surface it sits on.
+	threadTS string
 	ctx      context.Context
 	grace    time.Duration
 	interval time.Duration
@@ -65,10 +72,11 @@ type indicator struct {
 	done chan struct{}
 }
 
-func newIndicator(ctx context.Context, api API, channel string, grace, interval time.Duration, predecessor <-chan struct{}) *indicator {
+func newIndicator(ctx context.Context, api API, channel, threadTS string, grace, interval time.Duration, predecessor <-chan struct{}) *indicator {
 	return &indicator{
 		api:         api,
 		channel:     channel,
+		threadTS:    threadTS,
 		ctx:         ctx,
 		grace:       grace,
 		interval:    interval,
@@ -190,7 +198,7 @@ func (in *indicator) finish() {
 func (in *indicator) post() (string, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(in.ctx), indicatorRequestTimeout)
 	defer cancel()
-	return in.api.Post(ctx, in.channel, "", in.text())
+	return in.api.Post(ctx, in.channel, in.threadTS, in.text())
 }
 
 // update is cancellable, unlike post: there is nothing to orphan, since the

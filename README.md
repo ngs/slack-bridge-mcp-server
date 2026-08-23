@@ -211,6 +211,12 @@ goes back to `slack_wait`. Neither the automatic receipt nor an explicit
 `slack_ack` disturbs it — "seen, still working" is exactly when the elapsed time
 is worth showing.
 
+It appears wherever the conversation is. A message sent inside a thread gets its
+indicator in that thread; one sent on the channel surface gets it out there. A
+`slack_ask` asked in a thread starts the next one in the same thread, and when a
+batch of messages arrives at once the newest decides, since that is where the
+owner spoke last.
+
 The whole feature is best effort: if Slack refuses any of these calls, the
 failure is logged to stderr and the tools carry on unaffected. Set
 `SLACK_BRIDGE_INDICATOR=off` to turn it off.

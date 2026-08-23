@@ -56,6 +56,18 @@ func eventually(t *testing.T, what string, cond func() bool) {
 func indicatorBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fakeStream) {
 	t.Helper()
 
+	return indicatorBridgeWith(ctx, t, []candidate{
+		ownerMsg("100.000100", "already answered"),
+		ownerMsg("100.000200", "please look into this"),
+	})
+}
+
+// indicatorBridgeWith is indicatorBridge over a chosen channel history, so a
+// test can decide whether the message the agent is handed sits on the channel
+// surface or inside a thread.
+func indicatorBridgeWith(ctx context.Context, t *testing.T, history []candidate) (*Bridge, *fakeAPI, *fakeStream) {
+	t.Helper()
+
 	cfg := testConfig(t)
 	cfg.IndicatorGrace = testGrace
 	cfg.IndicatorInterval = testInterval
@@ -63,13 +75,7 @@ func indicatorBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fak
 		t.Fatalf("seeding the cursor: %v", err)
 	}
 
-	api := &fakeAPI{
-		history: []candidate{
-			ownerMsg("100.000100", "already answered"),
-			ownerMsg("100.000200", "please look into this"),
-		},
-		postTS: "100.000900",
-	}
+	api := &fakeAPI{history: history, postTS: "100.000900"}
 
 	stream := newFakeStream()
 	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
@@ -281,6 +287,91 @@ func TestIndicatorPostsTicksAndIsDeletedOnReply(t *testing.T) {
 	// Only ever one indicator message, however long the turn ran.
 	if got := indicatorPosts(api); len(got) != 1 {
 		t.Errorf("indicator posted %d times, want exactly 1", len(got))
+	}
+}
+
+// threadedBridge hands the agent one message sent inside a thread, which is
+// where a conversation with the owner usually lives: they reply under the
+// message they are talking about rather than starting a new one.
+func threadedBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fakeStream) {
+	t.Helper()
+
+	b, api, stream := indicatorBridgeWith(ctx, t, []candidate{ownerMsg("100.000100", "already answered")})
+	stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.000300", ThreadTS: "100.000200", User: testOwner, Text: "and what about this one",
+	}}
+	return b, api, stream
+}
+
+// The indicator has to appear where the owner is looking. A turn that started
+// with a message inside a thread is answered in that thread, so a "⏳ Working…"
+// on the channel surface is noise in one place and silence in the other.
+func TestIndicatorPostsIntoTheThreadTheTurnBelongsTo(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := threadedBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+	if got := indicatorPosts(api)[0]; got.ThreadTS != "100.000200" {
+		t.Errorf("indicator posted as %+v, want it in thread 100.000200 with the conversation", got)
+	}
+}
+
+// A batch can span more than one thread — a reconnect delivers everything
+// missed at once. The owner is waiting where they spoke last, so the newest
+// message decides, and a surface message keeps the indicator on the surface.
+func TestIndicatorFollowsTheNewestMessageInTheBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A catch-up after a reconnect: a reply the owner left in a thread, and a
+	// later one out on the channel surface, both arriving in one batch.
+	b, api, _ := indicatorBridgeWith(ctx, t, []candidate{
+		ownerMsg("100.000100", "already answered"),
+		{Channel: testChannel, User: "U0COLLEAGUE", Text: "a thread to reply in", TS: "100.000200", LatestReply: "100.000300"},
+		ownerMsg("100.000400", "then out here instead"),
+	})
+	api.replies = []candidate{
+		{Channel: testChannel, User: testOwner, Text: "asked in a thread", TS: "100.000300", ThreadTS: "100.000200"},
+	}
+
+	result, err := b.Wait(ctx, MaxWaitTimeout)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if len(result.Messages) != 2 {
+		t.Fatalf("Wait() returned %v, want the thread reply and the surface message in one batch", texts(result.Messages))
+	}
+
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+	if got := indicatorPosts(api)[0]; got.ThreadTS != "" {
+		t.Errorf("indicator posted as %+v, want it on the channel surface where the newest message was", got)
+	}
+}
+
+// A restore is the same turn resuming, so it goes back to the thread it was in
+// — the failed reply changed nothing about where the owner is waiting.
+func TestARestoredIndicatorGoesBackToItsThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := threadedBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to appear", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	api.mu.Lock()
+	api.postErr = errors.New("channel_not_found")
+	api.mu.Unlock()
+
+	if _, err := b.Post(ctx, "here you go", "100.000200"); err == nil {
+		t.Fatal("Post() = nil error, want the failure surfaced")
+	}
+
+	eventually(t, "the indicator to come back", func() bool { return len(indicatorPosts(api)) == 2 })
+	if got := indicatorPosts(api)[1]; got.ThreadTS != "100.000200" {
+		t.Errorf("restored indicator posted as %+v, want it back in thread 100.000200", got)
 	}
 }
 
