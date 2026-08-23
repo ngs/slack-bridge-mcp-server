@@ -134,11 +134,11 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel", "files"?}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `{"ts", "channel"}` — where the message landed |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
-| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts`, `channel` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
+| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts`, `channel` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?, "files"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
 | `slack_progress` | `text` (required), `thread_ts` and `channel` (optional — where the status belongs; they start the indicator, or move a running one) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the label had nowhere to go: the indicator is turned off, or the turn ended before it could be applied. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
@@ -214,6 +214,53 @@ indicator — calling it changes nothing except what the model knows.
 Names come from `users.info`, which needs the `users:read` scope. Without it
 the tool still works and shows raw user IDs, so an app installed before this
 existed keeps working until it suits you to reinstall it with the scope.
+
+## Attachments
+
+Send a screenshot and it reaches the session like anything else you say. The
+message arrives with a `files` array beside its text, and a caption is optional:
+an upload with nothing typed alongside it is delivered on the strength of the
+file alone.
+
+```json
+{
+  "ts": "1787504922.733289",
+  "channel": "C0BRIDGE",
+  "thread_ts": "1787504116.958859",
+  "text": "why is this red?",
+  "files": [
+    {
+      "name": "image.png",
+      "mimetype": "image/png",
+      "size": 88731,
+      "url_private": "https://files.slack.com/files-pri/T0TEAM-F0FILEID/image.png",
+      "permalink": "https://example.slack.com/files/U0OWNER/F0FILEID/image.png"
+    }
+  ]
+}
+```
+
+The bridge transports metadata, not bytes: it does not download anything, and
+nothing is written to disk. `url_private` is where the file actually is, and it
+is not a public link — fetching it takes the bot token in an `Authorization`
+header and the `files:read` scope:
+
+```sh
+curl -H "Authorization: Bearer $SLACK_BOT_TOKEN" -o image.png \
+  "https://files.slack.com/files-pri/T0TEAM-F0FILEID/image.png"
+```
+
+`files:read` is optional, and only the download needs it. Slack returns the file
+metadata on the message whether or not the app has the scope, so delivery, the
+names, the sizes and the links all work without it; what changes is that the
+`curl` above answers with a Slack login page instead of the file. Add the scope
+under **OAuth & Permissions** and reinstall the app if you want the session to
+be able to open what you send it. `permalink` opens the file in Slack and needs
+no token at all, which makes it the thing to quote back at you.
+
+`slack_history` reports the same `files` on any message that has them, so an
+attachment somebody else posted is visible when you ask the agent to read the
+channel.
 
 ## Receipt and progress
 
@@ -402,6 +449,10 @@ Slack account, which is exactly as strong as that account and the phone it is
 signed in on. Treat access to the channel as equivalent to terminal access on
 the machine running the session, and set that session's tool permissions
 accordingly.
+
+Attachments are relayed as metadata and nothing more. The bridge never fetches
+a file, so a link that arrives is a link the session decided to follow, with
+the same care any other external content deserves.
 
 Tokens are read from the environment and are never logged or written to the
 state file.

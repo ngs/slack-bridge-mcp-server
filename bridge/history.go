@@ -63,6 +63,9 @@ type HistoryMessage struct {
 	// ReplyCount is set on messages that have a thread hanging off them, so
 	// the caller knows there is more to read behind this one.
 	ReplyCount int `json:"reply_count,omitempty"`
+	// Files describes what was attached to the message, in the same shape a
+	// relayed message reports it, and is absent when nothing was.
+	Files []File `json:"files,omitempty"`
 }
 
 // HistoryResult is what slack_history returns.
@@ -193,6 +196,7 @@ func (b *Bridge) describe(ctx context.Context, api API, messages []candidate) []
 			ThreadTS:   m.ThreadTS,
 			Bot:        m.BotID != "" || m.SubType == "bot_message",
 			ReplyCount: m.ReplyCount,
+			Files:      m.Files,
 		})
 	}
 

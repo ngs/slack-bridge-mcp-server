@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -200,7 +201,30 @@ func toCandidate(channel string, m slack.Message) candidate {
 		Username:    username,
 		ReplyCount:  m.ReplyCount,
 		LatestReply: m.LatestReply,
+		Files:       toFiles(m.Files),
 	}
+}
+
+// toFiles narrows Slack's file objects to the handful of fields the bridge
+// reports. Slack sends these on any message with an attachment whether or not
+// the app has files:read: the scope governs fetching the bytes behind
+// URLPrivate, not learning that a file is there.
+func toFiles(files []slack.File) []File {
+	if len(files) == 0 {
+		return nil
+	}
+
+	out := make([]File, 0, len(files))
+	for _, f := range files {
+		out = append(out, File{
+			Name:       f.Name,
+			Mimetype:   f.Mimetype,
+			Size:       f.Size,
+			URLPrivate: f.URLPrivate,
+			Permalink:  f.Permalink,
+		})
+	}
+	return out
 }
 
 func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (string, error) {
@@ -396,6 +420,11 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 		if !ok {
 			return
 		}
+		// The typed message event has no files field at all, so an upload
+		// would otherwise arrive as a caption with nothing attached to it.
+		if len(c.Files) == 0 && evt.Request != nil {
+			c.Files = filesFromEnvelope(evt.Request.Payload)
+		}
 		// An empty channel accepts any: the bridge sorts out which conversation
 		// this belongs to, and whether it belongs to one at all.
 		msg, ok := accept(c, "", s.owner)
@@ -485,10 +514,39 @@ func toEventCandidate(data any) (candidate, bool) {
 			Text:     evt.Text,
 			TS:       evt.TimeStamp,
 			ThreadTS: evt.ThreadTimeStamp,
+			Files:    toFiles(evt.Files),
 		}, true
 	default:
 		return candidate{}, false
 	}
+}
+
+// filesFromEnvelope recovers a message's attachments from the raw Socket Mode
+// envelope.
+//
+// It exists because slackevents.MessageEvent does not model the files array —
+// app_mention does, but the message event a plain upload arrives as does not —
+// so the typed event is the one place the bridge cannot see an attachment. The
+// envelope carries the event JSON verbatim, files included, which is where the
+// history path reads them from as well.
+//
+// Anything that is not a message envelope simply has no files to find: the
+// payload of another envelope type may not even be an object, so a decode
+// failure is an answer rather than an error.
+func filesFromEnvelope(payload json.RawMessage) []File {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	var envelope struct {
+		Event struct {
+			Files []slack.File `json:"files"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return nil
+	}
+	return toFiles(envelope.Event.Files)
 }
 
 // emitInteraction queues a click on its own channel. There is no fallback if
