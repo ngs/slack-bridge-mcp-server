@@ -128,7 +128,11 @@ jobs:
 
   publish-binaries:
     name: Publish Binaries
-    needs: build-binaries
+    # release (GoReleaser) must run first: both this job and GoReleaser touch
+    # the GitHub release for the tag, and two concurrent creators race into a
+    # 422 tag_name already_exists conflict. Waiting on release makes this job
+    # attach the raw binaries to the release GoReleaser created.
+    needs: [build-binaries, release]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
