@@ -92,9 +92,16 @@ type API interface {
 	// the connection was opened. A mention is that ID appearing in the text, so
 	// the bridge cannot recognise one without it.
 	BotUserID() string
-	// Post sends a message to a channel, optionally into a thread, and
-	// returns the timestamp of the posted message.
+	// Post sends an agent-written message to a channel, optionally into a
+	// thread, and returns the timestamp of the posted message. The text is
+	// Markdown, and Slack renders it.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)
+	// PostPlain sends a message that is not Markdown and must not be rendered
+	// as any. It exists for the bridge's own furniture — the processing
+	// indicator — which is a fixed line the server rewrites in place, and
+	// which a block would freeze: an update that sends only text leaves the
+	// blocks of the original post standing.
+	PostPlain(ctx context.Context, channel, threadTS, text string) (string, error)
 	// PostQuestion sends a question with clickable answers and returns the
 	// timestamp of the posted message.
 	PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error)

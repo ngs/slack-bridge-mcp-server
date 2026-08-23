@@ -176,7 +176,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	for {
 		select {
 		case choice := <-ask.answered:
-			b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
+			b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 			// The answer is new work handed to the agent, exactly like the
 			// messages slack_wait returns, so the clock starts again here —
 			// and in the thread the question was asked in, which is where the
@@ -188,7 +188,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask, stream); ok {
-				b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
+				b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 				b.startIndicator(channel, threadTS)
 				return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
 			}
@@ -466,6 +466,16 @@ func buildQuestion(question string, options []string) (Question, []string, error
 		labels = append(labels, label)
 	}
 	return q, labels, nil
+}
+
+// answeredText is the question with the chosen answer under it.
+//
+// The label is escaped because it was chosen on a button, where plain_text
+// showed it exactly as the caller wrote it; the resolved question is Markdown,
+// where an option like **yes** would arrive in bold and stop matching what the
+// owner clicked.
+func answeredText(question, label string) string {
+	return fmt.Sprintf("%s\n\n✅ %s", question, escapeMarkdown(label))
 }
 
 // truncate shortens a string to limit characters, spending the last one on an

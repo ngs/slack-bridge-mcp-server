@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
@@ -47,17 +48,56 @@ func fitsMarkdownBlock(text string) bool {
 	return utf8.RuneCountInString(text) <= maxMarkdownBlock
 }
 
-// rejectedForSize reports whether Slack turned a payload away for being too
-// big. It answers to both of the errors an oversized markdown block draws:
-// msg_too_long when the count alone settles it, and internal_error when the
-// text only exceeds the budget once Slack expands what is inside it.
+// rejectedForSize reports whether Slack turned this payload away for being too
+// big, which is the one failure a plain-text retry can fix.
 //
-// Retrying an internal_error is safe here because it is only ever asked about
-// a rejected markdown post, and a rejected post is one that did not happen.
-func rejectedForSize(err error) bool {
+// msg_too_long says so outright. internal_error is Slack's generic failure and
+// is only read as a size rejection when the text holds something Slack expands
+// — that is the case where a payload inside the character budget is refused
+// with nothing more specific to go on. Reading every internal_error that way
+// would mean retrying a transient failure whose first request Slack may have
+// accepted, and posting the reply twice.
+func rejectedForSize(err error, text string) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "msg_too_long") || strings.Contains(msg, "internal_error")
+	if strings.Contains(msg, "msg_too_long") {
+		return true
+	}
+	return strings.Contains(msg, "internal_error") && expandsInSlack(text)
+}
+
+// expandsInSlack reports whether the text holds characters Slack rewrites on
+// the way in, an emoji becoming its :shortcode:. That expansion is measured
+// against the budget, which is how 1,000 emoji fit a markdown block and 1,500
+// do not, well short of 12,000 characters.
+func expandsInSlack(text string) bool {
+	for _, r := range text {
+		if unicode.Is(unicode.So, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// escapeMarkdown neutralises the inline Markdown in a string that was never
+// meant to be Markdown, so it reads as the characters it actually contains.
+//
+// It exists for text that was shown somewhere Markdown is not rendered and is
+// later quoted somewhere it is — an answer's button label, which is plain_text
+// on the button, appearing in the resolved question. Only the characters that
+// start inline formatting are escaped: the ones that matter solely at the
+// start of a line cannot fire mid-sentence, and escaping them would leave
+// backslashes on show for nothing.
+func escapeMarkdown(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if strings.ContainsRune(`\*_`+"`"+`~[]`, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

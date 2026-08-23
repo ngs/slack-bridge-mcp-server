@@ -235,6 +235,12 @@ func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (strin
 	return f.postTS, nil
 }
 
+// PostPlain records the same way Post does: the indicator tests read these
+// back by their text, and which method carried them is not what they assert.
+func (f *fakeAPI) PostPlain(ctx context.Context, channel, threadTS, text string) (string, error) {
+	return f.Post(ctx, channel, threadTS, text)
+}
+
 func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
 	f.mu.Lock()
 	f.questions = append(f.questions, questionCall{Channel: channel, ThreadTS: threadTS, Question: q})

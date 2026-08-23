@@ -291,7 +291,7 @@ func (in *indicator) finish() {
 func (in *indicator) post() (string, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(in.ctx), indicatorRequestTimeout)
 	defer cancel()
-	return in.api.Post(ctx, in.channel, in.threadTS, in.text())
+	return in.api.PostPlain(ctx, in.channel, in.threadTS, in.text())
 }
 
 // update is cancellable, unlike post: there is nothing to orphan, since the

@@ -266,20 +266,171 @@ func TestRejectedForSize(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
+		text string
 		want bool
 	}{
-		{"nil", nil, false},
-		{"too long", slack.SlackErrorResponse{Err: "msg_too_long"}, true},
-		{"internal", slack.SlackErrorResponse{Err: "internal_error"}, true},
-		{"wrapped", fmt.Errorf("chat.postMessage: %w", slack.SlackErrorResponse{Err: "msg_too_long"}), true},
-		{"unrelated", slack.SlackErrorResponse{Err: "channel_not_found"}, false},
+		{"nil", nil, "hello", false},
+		{"too long", slack.SlackErrorResponse{Err: "msg_too_long"}, "hello", true},
+		{"wrapped", fmt.Errorf("chat.postMessage: %w", slack.SlackErrorResponse{Err: "msg_too_long"}), "hello", true},
+		{"unrelated", slack.SlackErrorResponse{Err: "channel_not_found"}, "hello", false},
+		// internal_error is Slack's generic failure. Reading it as a size
+		// rejection is only justified when the text holds something Slack
+		// expands; otherwise a retry could post a reply Slack already accepted.
+		{"internal on expandable text", slack.SlackErrorResponse{Err: "internal_error"}, "done 🎉", true},
+		{"internal on plain text", slack.SlackErrorResponse{Err: "internal_error"}, "done", false},
+		{"internal on cjk text", slack.SlackErrorResponse{Err: "internal_error"}, "完了しました", false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rejectedForSize(tc.err); got != tc.want {
-				t.Errorf("rejectedForSize(%v) = %v, want %v", tc.err, got, tc.want)
+			if got := rejectedForSize(tc.err, tc.text); got != tc.want {
+				t.Errorf("rejectedForSize(%v, %q) = %v, want %v", tc.err, tc.text, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestEscapeMarkdown(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "yes", "yes"},
+		{"bold", "**yes**", `\*\*yes\*\*`},
+		{"underscores", "run__it", `run\_\_it`},
+		{"link", "[docs](https://example.com)", `\[docs\](https://example.com)`},
+		{"code span", "`go test`", "\\`go test\\`"},
+		{"strikethrough", "~~no~~", `\~\~no\~\~`},
+		{"backslash", `a\b`, `a\\b`},
+		// Nothing that only matters at the start of a line: the label is
+		// quoted mid-sentence, where these cannot fire.
+		{"dash and hash left alone", "- no # 1", "- no # 1"},
+		{"cjk untouched", "はい", "はい"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := escapeMarkdown(tc.in); got != tc.want {
+				t.Errorf("escapeMarkdown(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The indicator is furniture the server rewrites in place, and chat.update
+// sends only text: blocks on the original post would freeze the stopwatch at
+// whatever it said when it was created.
+func TestPostPlainSendsNoBlocks(t *testing.T) {
+	f, api := newFakeSlack(t)
+
+	if _, err := api.PostPlain(context.Background(), "C1", "", "⏳ Working… (10s)"); err != nil {
+		t.Fatalf("PostPlain() error = %v", err)
+	}
+
+	call := f.last()
+	if len(call.Blocks) != 0 {
+		t.Errorf("blocks = %v, want none so a text-only update replaces what is shown", blockTypes(call))
+	}
+	if call.Text != "⏳ Working… (10s)" {
+		t.Errorf("text = %q, want the indicator line", call.Text)
+	}
+}
+
+// Losing the question altogether would leave slack_ask with nothing to return,
+// so a size rejection keeps the buttons and gives up only the block.
+func TestPostQuestionFallsBackButKeepsTheButtons(t *testing.T) {
+	f, api := newFakeSlack(t,
+		`{"ok":false,"error":"msg_too_long"}`,
+		`{"ok":true,"channel":"C1","ts":"100.000900"}`,
+	)
+
+	q := Question{
+		BlockID: askBlockID,
+		Text:    "**Deploy** now? 🎉",
+		Options: []QuestionOption{
+			{ActionID: askActionPrefix + "0", Value: "0", Label: "yes"},
+			{ActionID: askActionPrefix + "1", Value: "1", Label: "no"},
+		},
+	}
+	if _, err := api.PostQuestion(context.Background(), "C1", "", q); err != nil {
+		t.Fatalf("PostQuestion() error = %v, want the fallback to have carried it", err)
+	}
+
+	if len(f.calls) != 2 {
+		t.Fatalf("made %d calls, want the block attempt and the fallback", len(f.calls))
+	}
+	if got := blockTypes(f.calls[1]); len(got) != 2 || got[0] != "section" || got[1] != "actions" {
+		t.Errorf("fallback blocks = %v, want a section question with the buttons still under it", got)
+	}
+}
+
+// The buttons have to go even when the block does not fit, or an answered
+// question stays answerable.
+func TestResolveQuestionRetiresTheButtonsEvenWhenTheBlockIsRefused(t *testing.T) {
+	f, api := newFakeSlack(t,
+		`{"ok":false,"error":"msg_too_long"}`,
+		`{"ok":true,"channel":"C1","ts":"100.000900"}`,
+	)
+
+	if err := api.ResolveQuestion(context.Background(), "C1", "100.000900", "**Deploy**? 🎉\n\n✅ yes"); err != nil {
+		t.Fatalf("ResolveQuestion() error = %v", err)
+	}
+
+	if len(f.calls) != 2 {
+		t.Fatalf("made %d calls, want the block attempt and the retry", len(f.calls))
+	}
+	if len(f.calls[1].Blocks) != 0 {
+		t.Errorf("retry blocks = %v, want an empty list so the actions block is dropped", blockTypes(f.calls[1]))
+	}
+}
+
+// buildQuestion must hand the caller's Markdown through untouched: the block
+// tests above call PostQuestion directly and would not notice it being altered
+// on the way in.
+func TestBuildQuestionKeepsTheMarkdown(t *testing.T) {
+	text := "## Deploy\n\n**now**? See [the plan](https://example.com)."
+	q, labels, err := buildQuestion(text, []string{"**yes**", "no"})
+	if err != nil {
+		t.Fatalf("buildQuestion() error = %v", err)
+	}
+	if q.Text != text {
+		t.Errorf("question text = %q, want the Markdown unchanged", q.Text)
+	}
+	// Labels ride on buttons, which render plain text.
+	if labels[0] != "**yes**" {
+		t.Errorf("option label = %q, want it left alone", labels[0])
+	}
+}
+
+func TestBuildQuestionTruncatesAtTheCap(t *testing.T) {
+	atCap := strings.Repeat("あ", maxQuestionText)
+	q, _, err := buildQuestion(atCap, []string{"yes", "no"})
+	if err != nil {
+		t.Fatalf("buildQuestion() error = %v", err)
+	}
+	if q.Text != atCap {
+		t.Error("a question exactly at the cap was altered")
+	}
+
+	q, _, err = buildQuestion(atCap+"あ", []string{"yes", "no"})
+	if err != nil {
+		t.Fatalf("buildQuestion() error = %v", err)
+	}
+	if got := len([]rune(q.Text)); got != maxQuestionText {
+		t.Errorf("question ran to %d characters, want it cut to %d", got, maxQuestionText)
+	}
+	if !strings.HasSuffix(q.Text, "…") {
+		t.Error("a cut question does not say it was cut")
+	}
+}
+
+// The answer is quoted back into a markdown block, but the owner chose it on a
+// plain_text button.
+func TestAnsweredTextEscapesTheChosenLabel(t *testing.T) {
+	got := answeredText("Deploy **now**?", "**yes**")
+	want := "Deploy **now**?\n\n✅ " + `\*\*yes\*\*`
+	if got != want {
+		t.Errorf("answeredText() = %q, want %q", got, want)
 	}
 }

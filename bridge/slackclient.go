@@ -205,7 +205,7 @@ func toCandidate(channel string, m slack.Message) candidate {
 
 func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (string, error) {
 	ts, err := w.postBody(ctx, channel, threadTS, markdownBody(text))
-	if err != nil && fitsMarkdownBlock(text) && rejectedForSize(err) {
+	if err != nil && fitsMarkdownBlock(text) && rejectedForSize(err, text) {
 		// Slack measures the block's budget after expanding what it finds
 		// inside — an emoji becomes its :shortcode: — so a message can be
 		// within the character count and still be turned away. Sending it as
@@ -215,6 +215,12 @@ func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (stri
 		return w.postBody(ctx, channel, threadTS, plainBody(text))
 	}
 	return ts, err
+}
+
+// PostPlain sends the text as the message body, with no blocks, so a later
+// text-only chat.update fully replaces what the channel shows.
+func (w *webAPI) PostPlain(ctx context.Context, channel, threadTS, text string) (string, error) {
+	return w.postBody(ctx, channel, threadTS, plainBody(text))
 }
 
 func (w *webAPI) postBody(ctx context.Context, channel, threadTS string, body []slack.MsgOption) (string, error) {
@@ -235,32 +241,38 @@ func (w *webAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Q
 		buttons = append(buttons, slack.NewButtonBlockElement(
 			opt.ActionID,
 			opt.Value,
-			// Button labels are plain_text; mrkdwn is not rendered there.
+			// Button labels are plain_text; Markdown is not rendered there.
 			slack.NewTextBlockObject(slack.PlainTextType, opt.Label, false, false),
 		))
 	}
 
-	// A question is capped at maxQuestionText, well inside the markdown
-	// block's budget, so it never needs the plain-text fallback a free-form
-	// post does.
-	options := []slack.MsgOption{
+	ts, err := w.postBody(ctx, channel, threadTS, questionBody(q, buttons, true))
+	if err != nil && rejectedForSize(err, q.Text) {
+		// A question is capped at maxQuestionText, so this is not about the
+		// character count: it is a question Slack grew past the budget when it
+		// expanded what was inside. The section block renders less of the
+		// Markdown, and what matters is that the question and its buttons
+		// reach the owner at all — without them slack_ask has nothing to
+		// return but an error.
+		return w.postBody(ctx, channel, threadTS, questionBody(q, buttons, false))
+	}
+	return ts, err
+}
+
+// questionBody lays out a question: the text, then the buttons. The text is a
+// markdown block when Slack will take one, and a section block when it will
+// not.
+func questionBody(q Question, buttons []slack.BlockElement, markdown bool) []slack.MsgOption {
+	var question slack.Block = slack.NewMarkdownBlock("", q.Text)
+	if !markdown {
+		question = slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, q.Text, false, false), nil, nil)
+	}
+	return []slack.MsgOption{
 		// The text is the notification fallback, which is what the owner's
 		// phone shows on the lock screen; the blocks are the message.
 		slack.MsgOptionText(q.Text, false),
-		slack.MsgOptionBlocks(
-			slack.NewMarkdownBlock("", q.Text),
-			slack.NewActionBlock(q.BlockID, buttons...),
-		),
+		slack.MsgOptionBlocks(question, slack.NewActionBlock(q.BlockID, buttons...)),
 	}
-	if threadTS != "" {
-		options = append(options, slack.MsgOptionTS(threadTS))
-	}
-
-	_, ts, err := w.client.PostMessageContext(ctx, channel, options...)
-	if err != nil {
-		return "", fmt.Errorf("chat.postMessage: %w", err)
-	}
-	return ts, nil
 }
 
 // ResolveQuestion rewrites the question as a message with no buttons left in
@@ -271,10 +283,23 @@ func (w *webAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Q
 // behind are buttons the owner can still click. Sending the markdown block on
 // its own both retires the buttons and keeps the retired question rendered the
 // way the live one was.
+//
+// If Slack will not take the block, the buttons still have to go, so the
+// retry sends an explicit empty list: the question reads as plain text, which
+// is worse than rendered and far better than an answered question the owner
+// can answer again.
 func (w *webAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) error {
+	err := w.updateBlocks(ctx, channel, ts, text, slack.NewMarkdownBlock("", text))
+	if err != nil && rejectedForSize(err, text) {
+		return w.updateBlocks(ctx, channel, ts, text)
+	}
+	return err
+}
+
+func (w *webAPI) updateBlocks(ctx context.Context, channel, ts, text string, blocks ...slack.Block) error {
 	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts,
 		slack.MsgOptionText(text, false),
-		slack.MsgOptionBlocks(slack.NewMarkdownBlock("", text)),
+		slack.MsgOptionBlocks(blocks...),
 	); err != nil {
 		return fmt.Errorf("chat.update: %w", err)
 	}
