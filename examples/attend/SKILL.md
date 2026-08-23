@@ -60,6 +60,20 @@ waiting on. The channel already shows an elapsed-time indicator; this puts the
 reason next to it, so the owner can see the difference between slow work and a
 stuck session. Call it again only when the answer changes.
 
+## Delegating
+
+Anything that will run longer than a couple of minutes belongs to a subagent,
+not to this session: while you are working, you are not waiting, and the owner
+is talking to a session that does not answer.
+
+Tell the delegate up front to report at every milestone — a review round, CI
+passing or failing, a pull request opened, a blocker — and relay each report
+into the Slack thread as it arrives. The owner wants to follow the work while
+it happens, not read a summary of it once it is over.
+
+When the session itself has to do the long thing, call `slack_progress` once
+before you start, so the channel can see what it is waiting on.
+
 ## Decisions
 
 When you need the owner to choose before you can go on, call `slack_ask` with
