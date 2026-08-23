@@ -82,10 +82,12 @@ gain them on its own. Two upgrades need one:
 - `users:read`, if you are coming from a version before `slack_history` existed
   — though that tool works without it too, showing raw user IDs instead of
   names, so the reinstall can wait until it suits you.
-- `channels:history`, `channels:read` and `groups:read`, if you are coming from
-  a version before conversations outside the home channel existed. Without them
-  the home channel works exactly as before and nothing else does, which is a
-  perfectly good place to stay until you want the rest.
+- `channels:read` and `groups:read`, plus `channels:history` and
+  `groups:history` for the public and private channels it should be reading, if
+  you are coming from a version before conversations outside the home channel
+  existed. Without them the home channel works exactly as before and nothing
+  else does, which is a perfectly good place to stay until you want the rest;
+  the server says once on stderr which scope it was refused.
 
 Event subscriptions and interactivity, by contrast, are settings rather than
 scopes: adding `app_mention` or turning interactivity on needs no reinstall.

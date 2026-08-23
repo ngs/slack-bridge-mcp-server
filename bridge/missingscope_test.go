@@ -249,6 +249,52 @@ func TestAStaleRefusalDoesNotDegradeTheNextConnection(t *testing.T) {
 	}
 }
 
+// replacingAPI stands in for a connection being replaced underneath a catch-up
+// that is already running: the replacement is installed while the old API is
+// still answering.
+type replacingAPI struct {
+	*fakeAPI
+	b    *Bridge
+	once bool
+}
+
+func (r *replacingAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, error) {
+	if !r.once {
+		r.once = true
+		r.b.mu.Lock()
+		r.b.connGeneration++
+		r.b.mu.Unlock()
+	}
+	return r.fakeAPI.History(ctx, req)
+}
+
+// Catching up is what a new connection does first, and a drain belonging to the
+// connection it replaced must not report that work as done on its behalf — the
+// replacement's own scan is the one that finds what a reinstall made readable.
+func TestAStaleDrainDoesNotClearTheNewConnectionsCatchUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := mentionBridge(ctx, t)
+	waitFor(ctx, t, b)
+
+	b.mu.Lock()
+	b.api = &replacingAPI{fakeAPI: api, b: b}
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	if _, err := b.drainCatchUp(ctx); err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+
+	b.mu.Lock()
+	pending := b.needCatchUp
+	b.mu.Unlock()
+	if !pending {
+		t.Error("a drain from the previous connection marked the replacement as caught up; its first scan would be skipped")
+	}
+}
+
 // The client is what decides a failure is a missing scope, and it has to tell
 // that one apart from the failures worth retrying.
 func TestMissingScopeIsRecognisedOnTheWire(t *testing.T) {

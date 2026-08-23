@@ -464,7 +464,12 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if needCatchUp {
+	// A drain that started on a connection since replaced does not get to say
+	// the replacement has caught up: what it read came from the installation as
+	// it was, and the new connection has its own catch-up to run — the one that
+	// finds what a reinstall has just made readable. The messages it did read
+	// are still handed over; only the flag is left alone.
+	if needCatchUp && generation == b.connGeneration {
 		b.needCatchUp = false
 		if b.lastTS == "" {
 			b.lastTS = lastTS
