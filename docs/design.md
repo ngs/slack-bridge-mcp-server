@@ -181,11 +181,17 @@ holds in every channel the app is in. Everything else is dropped:
 - **Bot messages**, identified by a non-empty `bot_id`. This is what stops the
   bridge from feeding the agent's own `slack_post` output back to it as new
   input, which would otherwise loop.
-- **Subtypes** other than none and `thread_broadcast`. `message_changed`,
-  `message_deleted`, `channel_join`, `file_share` and the rest are either not
-  new text or not the owner speaking. A plain message and a plain thread reply
-  both carry no subtype at all, so both pass.
-- **Empty bodies**, which have nothing to transport.
+- **Subtypes** other than none, `thread_broadcast` and `file_share`.
+  `message_changed`, `message_deleted`, `channel_join` and the rest are either
+  not new text or not the owner speaking. A plain message and a plain thread
+  reply both carry no subtype at all, so both pass; `file_share` is the owner
+  attaching something, which is them speaking too. The two sources disagree
+  about that last one — the live message event carries the subtype, while the
+  same message read back from `conversations.history` carries none and only the
+  `files` array — so both shapes are accepted, or an upload would be relayed by
+  one path and dropped by the other.
+- **Empty bodies with no files**, which have nothing to transport. An upload
+  sent without a caption is relayed on the strength of its attachment.
 
 Thread replies are relayed and carry their `thread_ts`, so the agent can reply
 into the same thread, and every message carries its `channel` for the same
@@ -266,7 +272,7 @@ dropped.
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts`, `channel` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
-| `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, and starts one when none is running. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
+| `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, starts one when none is running, and moves a running one when the call names a different conversation. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
 
 ### Why slack_progress is a label and not a message
@@ -289,6 +295,28 @@ is a bet that the answer is seconds away and the channel is better off quiet;
 would hold back the one message the owner is now waiting for. The predecessor
 handover is not skipped with it: that one is not a bet but an invariant, and
 "never two indicators at once" outranks being prompt.
+
+Moving the indicator leans on the same invariant. The indicator starts where the
+owner last spoke, which is only a guess at what the agent went on to work on,
+and with two conversations in flight the guess puts the status line under the
+wrong one. A `slack_progress` call naming a conversation is better information
+than that guess, so it is acted on: since a Slack message cannot change channel
+or thread, the move is a retirement and a fresh start, going through the same
+predecessor handover a new turn does — the old message, if there is one yet, is
+deleted, and the new indicator waits for that before posting. Moved inside the
+grace period, which is where most moves happen, nothing has been posted and
+nothing is deleted: the retired indicator simply never speaks. The clock is carried across, because the
+elapsed time measures the work the owner is waiting on and not the message
+showing it. What the call does not name it does not change: a thread with no
+channel moves within the current channel rather than defaulting to the home one,
+which is the one place in the API where an omitted `channel` does not mean
+"home" — an indicator has a channel already, and this argument says whether to
+change it. The symmetric case does not hold, though, and is the exception to
+the rule: a thread cannot be carried into a different channel, because a
+`thread_ts` identifies a message only within its own channel. Taking it along
+would at best have Slack refuse the post and at worst attach the indicator to
+whatever message over there shares the timestamp, so a move across channels
+that names no thread goes to the new channel's surface.
 
 ### Why slack_history ignores the owner filter
 
@@ -428,8 +456,12 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
   the model a transcript.)
 - **Direct messages.** Channels only, which keeps the app out of the scopes and
   events that reach a DM.
-- **Attachments and files.** Text only. Messages whose body is empty because
-  the content is a file are dropped rather than relayed as an empty string.
+- **Fetching attachments.** A message carries its files as metadata — name,
+  type, size, `url_private`, `permalink` — and the bridge downloads none of
+  them. Whether an attachment is worth opening is a judgement about the
+  conversation, which belongs to the agent and not to the transport; nothing is
+  written to disk, and the `files:read` scope stays optional for anyone who
+  never wants the bytes.
 - **Block Kit beyond what a reply needs.** Messages go out as a markdown block,
   and `slack_ask` adds one actions block of buttons. A reply too big for a
   block falls back to the message body, where only Slack's mrkdwn applies; a

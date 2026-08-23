@@ -214,28 +214,10 @@ func TestProgressStartsAnIndicatorWhenNoneIsRunning(t *testing.T) {
 	})
 }
 
-// An indicator already has a surface, and it is the one the owner is watching.
-// A thread_ts passed alongside it is stale information from a call that could
-// not know an indicator was running.
-func TestProgressDoesNotMoveARunningIndicator(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	b, api, _ := indicatorBridge(ctx, t)
-	waitForMessages(ctx, t, b)
-	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
-
-	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: "100.000200"}); err != nil {
-		t.Fatalf("Progress() error = %v", err)
-	}
-
-	eventually(t, "the label to reach the channel", func() bool {
-		return strings.Contains(lastIndicatorUpdate(api), progressLabel)
-	})
-	if got := indicatorPosts(api); len(got) != 1 {
-		t.Errorf("indicator posts = %+v, want the running one left where it was", got)
-	}
-}
+// A thread_ts alongside a running indicator used to be treated as stale
+// information and ignored, which is what put a status line under the wrong
+// conversation. It now names where the status belongs; the tests for that, and
+// for the calls that still move nothing, are at the end of this file.
 
 // The status line answers "what is happening now", so the newest answer is the
 // only one worth showing.
@@ -417,6 +399,297 @@ func TestProgressLabelIsTruncated(t *testing.T) {
 	huge := strings.Repeat("stack frame ", 100_000)
 	if n := utf8.RuneCountInString(sanitizeProgressLabel(huge)); n != maxProgressLabel {
 		t.Errorf("a %d-rune label came back as %d runes, want %d", utf8.RuneCountInString(huge), n, maxProgressLabel)
+	}
+}
+
+// indicatorLocation reports where the running indicator is posting, so a test
+// can see a move that has yet to reach Slack.
+func indicatorLocation(b *Bridge) (channel, threadTS string, running bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.indicator == nil {
+		return "", "", false
+	}
+	return b.indicator.channel, b.indicator.threadTS, true
+}
+
+// indicatorStartedAt is the clock the elapsed counter runs off.
+func indicatorStartedAt(t *testing.T, b *Bridge) time.Time {
+	t.Helper()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.indicator == nil {
+		t.Fatal("no indicator is running")
+	}
+	return b.indicator.startedAt
+}
+
+// The bug this fixes: the indicator starts wherever the owner last spoke, and
+// with two topics interleaved that is not where the work is. A label naming
+// the conversation it belongs to has to take the indicator with it.
+func TestProgressMovesTheIndicatorToTheConversationItNames(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to post where the owner last spoke", func() bool {
+		return len(indicatorPosts(api)) == 1
+	})
+	if got := indicatorPosts(api)[0]; got.ThreadTS != "" {
+		t.Fatalf("the first indicator went to %+v, want the channel surface", got)
+	}
+
+	// The agent is actually working on the other topic, which lives in a
+	// thread.
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, Channel: testChannel, ThreadTS: "100.000700"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to reappear in the thread it was moved to", func() bool {
+		return len(indicatorPosts(api)) == 2
+	})
+	moved := indicatorPosts(api)[1]
+	if moved.ThreadTS != "100.000700" || moved.Channel != testChannel {
+		t.Errorf("moved indicator posted as %+v, want it in thread 100.000700 of %s", moved, testChannel)
+	}
+	if !strings.Contains(moved.Text, progressLabel) {
+		t.Errorf("moved indicator text = %q, want it to carry the label", moved.Text)
+	}
+
+	// The message left behind has to go, or the move is just a second
+	// indicator.
+	eventually(t, "the indicator left behind to be deleted", func() bool {
+		return len(api.snapshotDeletes()) == 1
+	})
+	// Compared against the two messages the fake actually handed out, so this
+	// fails if the move deletes the message it has just posted rather than the
+	// one it is replacing.
+	posts := indicatorPosts(api)
+	if posts[0].TS == posts[1].TS {
+		t.Fatalf("both indicator messages have ts %q, so the check below cannot tell them apart", posts[0].TS)
+	}
+	if got := api.snapshotDeletes()[0].TS; got != posts[0].TS {
+		t.Errorf("deleted ts = %q, want %q — the indicator that was standing in the wrong conversation, not the new one at %q",
+			got, posts[0].TS, posts[1].TS)
+	}
+}
+
+// A move before the first post is the common one: the grace period is ten
+// seconds and the agent works out what it is doing well inside that. Nothing
+// has been posted, so nothing may be deleted, and only one message may ever
+// appear.
+func TestProgressMovesAnIndicatorThatHasNotPostedYet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	// Long enough that the only thing that can bring a post forward is the
+	// label this test sets.
+	b.cfg.IndicatorGrace = 60 * time.Second
+
+	waitForMessages(ctx, t, b)
+	if got := indicatorPosts(api); len(got) != 0 {
+		t.Fatalf("indicator posts = %+v inside the grace period, want none", got)
+	}
+
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: "100.000700"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to post in the thread it was moved to", func() bool {
+		return len(indicatorPosts(api)) == 1
+	})
+	if got := indicatorPosts(api)[0]; got.ThreadTS != "100.000700" {
+		t.Errorf("indicator posted as %+v, want it in the thread the label named", got)
+	}
+
+	// Give the abandoned indicator every chance to post or delete something.
+	time.Sleep(10 * testGrace)
+	if got := indicatorPosts(api); len(got) != 1 {
+		t.Errorf("indicator posts = %+v, want exactly one: the one that never posted has nothing to show", got)
+	}
+	if got := api.snapshotDeletes(); len(got) != 0 {
+		t.Errorf("deletes = %+v, want none: there was no message to delete", got)
+	}
+}
+
+// The counter measures how long the owner has been waiting, not how long this
+// message has been on screen. Moving the status must not tell them the work
+// just started.
+func TestMovingTheIndicatorKeepsTheElapsedTime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the first indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	// A turn that has been going for a while, set up the way a restored
+	// indicator is: the clock is fixed before the goroutine starts.
+	started := time.Now().Add(-5 * time.Minute)
+	b.startIndicatorAt(started, testChannel, "")
+	eventually(t, "the long-running indicator to post", func() bool { return len(indicatorPosts(api)) == 2 })
+
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: "100.000700"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the moved indicator to post", func() bool { return len(indicatorPosts(api)) == 3 })
+	moved := indicatorPosts(api)[2]
+	if !strings.Contains(moved.Text, "5m") {
+		t.Errorf("moved indicator text = %q, want the elapsed time carried over rather than restarted", moved.Text)
+	}
+	if got := indicatorStartedAt(t, b); !got.Equal(started) {
+		t.Errorf("moved indicator startedAt = %v, want the original %v", got, started)
+	}
+}
+
+// Every call that does not name a conversation has to behave exactly as it did
+// before any of this existed: label the indicator where it is, in place.
+func TestProgressWithoutATargetLeavesTheIndicatorWhereItIs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridgeWith(ctx, t, []candidate{
+		ownerMsg("100.000100", "already answered"),
+		{Channel: testChannel, User: testOwner, Text: "asked in a thread", TS: "100.000200", ThreadTS: "100.000150"},
+	})
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	result, err := b.Progress(ctx, ProgressRequest{Text: progressLabel})
+	if err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+	if result.TS != "100.000900" {
+		t.Errorf("Progress() ts = %q, want the indicator that was already running", result.TS)
+	}
+
+	eventually(t, "the label to reach the message in place", func() bool {
+		return strings.Contains(lastIndicatorUpdate(api), progressLabel)
+	})
+
+	_, thread, running := indicatorLocation(b)
+	if !running || thread != "100.000150" {
+		t.Errorf("indicator thread = %q (running %v), want it left in the thread the owner spoke in", thread, running)
+	}
+	if got := api.snapshotDeletes(); len(got) != 0 {
+		t.Errorf("deletes = %+v, want none: a label with no target moves nothing", got)
+	}
+	if got := indicatorPosts(api); len(got) != 1 {
+		t.Errorf("indicator posts = %+v, want the one message, updated in place", got)
+	}
+}
+
+// Naming the conversation the indicator is already in is not a move, and must
+// not cost the owner a message that disappears and comes back.
+func TestProgressNamingTheCurrentConversationDoesNotMoveAnything(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	result, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, Channel: testChannel})
+	if err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+	if result.TS != "100.000900" {
+		t.Errorf("Progress() ts = %q, want the running indicator's own message", result.TS)
+	}
+
+	time.Sleep(10 * testGrace)
+	if got := indicatorPosts(api); len(got) != 1 {
+		t.Errorf("indicator posts = %+v, want the original left alone", got)
+	}
+	if got := api.snapshotDeletes(); len(got) != 0 {
+		t.Errorf("deletes = %+v, want none", got)
+	}
+}
+
+// A thread named without a channel moves within the conversation the indicator
+// is already in. The alternative — reading the missing channel as the home
+// channel, the way every other tool does — would drag the status out of the
+// channel the agent is working in on a call that never mentioned it.
+func TestProgressMovesWithinTheCurrentChannelWhenOnlyAThreadIsNamed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	// The turn is happening somewhere that is not the home channel.
+	b.startIndicatorAt(time.Now(), "C0ELSEWHERE", "100.000500")
+	eventually(t, "the indicator to post in the other channel", func() bool { return len(indicatorPosts(api)) == 2 })
+
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: "100.000700"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to move to the other thread", func() bool { return len(indicatorPosts(api)) == 3 })
+	moved := indicatorPosts(api)[2]
+	if moved.Channel != "C0ELSEWHERE" || moved.ThreadTS != "100.000700" {
+		t.Errorf("moved indicator posted as %+v, want thread 100.000700 of C0ELSEWHERE", moved)
+	}
+}
+
+// A thread_ts identifies a message only within its own channel. Carrying the
+// current one into a different channel would at best have Slack refuse the
+// post, and at worst hang the indicator off whatever message over there shares
+// the timestamp — so a move across channels that names no thread lands on the
+// new channel's surface.
+func TestMovingToAnotherChannelLeavesTheOldThreadBehind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	// The turn is happening inside a thread of the home channel.
+	b.startIndicatorAt(time.Now(), testChannel, "100.000200")
+	eventually(t, "the indicator to post in the thread", func() bool { return len(indicatorPosts(api)) == 2 })
+
+	// The work has moved to a different channel, and the call says so without
+	// naming a thread over there.
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, Channel: "C0ELSEWHERE"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to move to the other channel", func() bool { return len(indicatorPosts(api)) == 3 })
+	moved := indicatorPosts(api)[2]
+	if moved.Channel != "C0ELSEWHERE" {
+		t.Errorf("moved indicator posted in %q, want C0ELSEWHERE", moved.Channel)
+	}
+	if moved.ThreadTS != "" {
+		t.Errorf("moved indicator posted into thread %q, want the channel surface: that thread belongs to %s", moved.ThreadTS, testChannel)
+	}
+}
+
+// Naming both means both are honoured, thread included, which is the ordinary
+// way an agent says where the work it is doing lives.
+func TestMovingToAThreadInAnotherChannelKeepsThatThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, Channel: "C0ELSEWHERE", ThreadTS: "100.000700"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to move", func() bool { return len(indicatorPosts(api)) == 2 })
+	moved := indicatorPosts(api)[1]
+	if moved.Channel != "C0ELSEWHERE" || moved.ThreadTS != "100.000700" {
+		t.Errorf("moved indicator posted as %+v, want thread 100.000700 of C0ELSEWHERE", moved)
 	}
 }
 
