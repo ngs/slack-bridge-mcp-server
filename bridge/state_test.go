@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -108,13 +109,16 @@ func TestStoreWritesTheDocumentedShape(t *testing.T) {
 	}
 
 	// The file holds nothing secret, but it records who the owner talks to,
-	// so it should not be world-readable.
-	info, err := os.Stat(store.Path())
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		t.Errorf("state file mode = %v, want no group or other access", perm)
+	// so it should not be world-readable. Windows has no Unix permission bits
+	// (Go reports 0666 regardless), so the check only means something on Unix.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(store.Path())
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("state file mode = %v, want no group or other access", perm)
+		}
 	}
 }
 

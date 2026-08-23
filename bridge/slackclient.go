@@ -47,8 +47,11 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 	go stream.consume(ctx, client)
 	go func() {
 		// RunContext reconnects on its own; it only returns when ctx is
-		// cancelled or the connection fails unrecoverably.
-		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
+		// cancelled or the connection fails unrecoverably. It never returns a
+		// nil error, so only the "stopped without cancellation" case is worth
+		// reporting.
+		err := client.RunContext(ctx)
+		if ctx.Err() == nil {
 			log.Printf("socket mode client stopped: %v", err)
 		}
 	}()
@@ -172,7 +175,7 @@ func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Even
 		// every events_api envelope, including those the owner filter
 		// discards, so unrelated channel traffic is not redelivered.
 		if evt.Request != nil {
-			client.Ack(*evt.Request)
+			_ = client.Ack(*evt.Request)
 		}
 
 		inner, ok := api.InnerEvent.Data.(*slackevents.MessageEvent)
@@ -200,7 +203,7 @@ func (s *socketModeStream) handle(client *socketmode.Client, evt socketmode.Even
 		// Slash commands, interactive payloads and the connection
 		// lifecycle chatter are not part of the bridge.
 		if evt.Request != nil && evt.Type != socketmode.EventTypeHello {
-			client.Ack(*evt.Request)
+			_ = client.Ack(*evt.Request)
 		}
 	}
 }

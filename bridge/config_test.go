@@ -118,7 +118,10 @@ func TestResolveStateDir(t *testing.T) {
 	// their dotfiles the same way on macOS and Linux.
 	t.Run("defaults to ~/.config/slack-bridge", func(t *testing.T) {
 		t.Setenv("XDG_CONFIG_HOME", "")
+		// os.UserHomeDir reads HOME on Unix and USERPROFILE on Windows; set
+		// both so the test controls the home directory on every platform.
 		t.Setenv("HOME", "/home/tester")
+		t.Setenv("USERPROFILE", "/home/tester")
 
 		got, err := Config{}.ResolveStateDir()
 		if err != nil {

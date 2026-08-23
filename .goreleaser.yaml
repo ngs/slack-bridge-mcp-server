@@ -95,7 +95,7 @@ brews:
     commit_author:
       name: goreleaserbot
       email: bot@goreleaser.com
-    folder: Formula
+    directory: Formula
     test: |
       system "#{bin}/slack-bridge-mcp-server", "--version"
     install: |

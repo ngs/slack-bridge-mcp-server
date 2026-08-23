@@ -79,10 +79,9 @@ jobs:
         cache: true
 
     - name: golangci-lint
-      uses: golangci/golangci-lint-action@v3
+      uses: golangci/golangci-lint-action@v8
       with:
         version: latest
-        args: --timeout=5m
 
   security:
     name: Security Scan

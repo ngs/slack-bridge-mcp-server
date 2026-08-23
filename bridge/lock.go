@@ -38,7 +38,7 @@ func AcquireLock(dir string) (*Lock, error) {
 	}
 
 	if err := lockFile(file); err != nil {
-		file.Close()
+		_ = file.Close()
 		if errors.Is(err, ErrAlreadyLocked) {
 			return nil, err
 		}

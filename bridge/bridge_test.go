@@ -160,7 +160,7 @@ func TestFirstEverWaitSeedsTheCursorInsteadOfReplaying(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, testConfig(t), connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	result, err := b.Wait(ctx, 20*time.Millisecond)
 	if err != nil {
@@ -197,7 +197,7 @@ func TestFirstWaitReturnsTheBacklogMissedWhileDown(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	result, err := b.Wait(ctx, MaxWaitTimeout)
 	if err != nil {
@@ -245,7 +245,7 @@ func TestWaitReturnsLiveMessages(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -285,7 +285,7 @@ func TestReconnectMergesHistoryWithLiveWithoutDuplicates(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	// The socket delivers the newest message and then reports the reconnect,
 	// so both the live copy and the history copy of 100.000300 are in play.
@@ -322,7 +322,7 @@ func TestDroppedLiveEventTriggersCatchUp(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	// Drain the initial catch-up so the dropped event is the only trigger left.
 	if _, err := b.Wait(ctx, MaxWaitTimeout); err != nil {
@@ -355,7 +355,7 @@ func TestWaitTimesOutWithAnEmptyArray(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	result, err := b.Wait(ctx, 20*time.Millisecond)
 	if err != nil {
@@ -384,7 +384,7 @@ func TestConnectIsLazyAndHappensOnce(t *testing.T) {
 	defer cancel()
 
 	b := New(ctx, cfg, connector)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	if got := connector.connectCount(); got != 0 {
 		t.Fatalf("connector called %d times before any tool call, want 0", got)
@@ -411,7 +411,7 @@ func TestToolsReportMissingConfigurationByName(t *testing.T) {
 	ctx := context.Background()
 	cfg := Config{BotToken: "xoxb-test", StateDir: t.TempDir()}
 	b := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	_, waitErr := b.Wait(ctx, MinWaitTimeout)
 	_, postErr := b.Post(ctx, "hello", "")
@@ -451,7 +451,7 @@ func TestPostAndReact(t *testing.T) {
 
 	api := &fakeAPI{postTS: "100.000900"}
 	b := New(context.Background(), cfg, &fakeConnector{api: api, stream: newFakeStream()})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	ts, err := b.Post(context.Background(), "hello from the agent", "100.000100")
 	if err != nil {
@@ -494,7 +494,7 @@ func TestCatchUpFailureDoesNotAdvanceTheCursor(t *testing.T) {
 		historyErr: errors.New("slack is down"),
 	}
 	b := New(context.Background(), cfg, &fakeConnector{api: api, stream: newFakeStream()})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	if _, err := b.Wait(context.Background(), MinWaitTimeout); err == nil {
 		t.Fatal("Wait() = nil error, want the history failure surfaced")
@@ -524,7 +524,7 @@ func TestCatchUpAsksSlackForEverythingAfterTheCursor(t *testing.T) {
 
 	api := &fakeAPI{history: []candidate{ownerMsg("100.000200", "unread")}}
 	b := New(context.Background(), cfg, &fakeConnector{api: api, stream: newFakeStream()})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	if _, err := b.Wait(context.Background(), MinWaitTimeout); err != nil {
 		t.Fatalf("Wait() error = %v", err)
@@ -547,7 +547,7 @@ func TestWaitFailsWhenTheStreamClosesForGood(t *testing.T) {
 
 	stream := newFakeStream()
 	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	close(stream.events)
 
@@ -569,13 +569,13 @@ func TestWaitRefusesASecondConcurrentBridge(t *testing.T) {
 	defer cancel()
 
 	first := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
-	defer first.Close()
+	defer func() { _ = first.Close() }()
 	if _, err := first.Wait(ctx, 10*time.Millisecond); err != nil {
 		t.Fatalf("first Wait() error = %v", err)
 	}
 
 	second := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
-	defer second.Close()
+	defer func() { _ = second.Close() }()
 
 	_, err := second.Wait(ctx, 10*time.Millisecond)
 	if !errors.Is(err, ErrAlreadyLocked) {
@@ -628,7 +628,7 @@ func TestWaitHonoursContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	go func() {
 		time.Sleep(20 * time.Millisecond)

@@ -28,14 +28,14 @@ func connect(t *testing.T, b *bridge.Bridge) *mcp.ClientSession {
 	if err != nil {
 		t.Fatalf("connecting the server: %v", err)
 	}
-	t.Cleanup(func() { serverSession.Close() })
+	t.Cleanup(func() { _ = serverSession.Close() })
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.0"}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)
 	if err != nil {
 		t.Fatalf("connecting the client: %v", err)
 	}
-	t.Cleanup(func() { session.Close() })
+	t.Cleanup(func() { _ = session.Close() })
 
 	return session
 }
@@ -45,7 +45,7 @@ func connect(t *testing.T, b *bridge.Bridge) *mcp.ClientSession {
 func unconfiguredBridge(t *testing.T) *bridge.Bridge {
 	t.Helper()
 	b := bridge.New(context.Background(), bridge.Config{StateDir: t.TempDir()}, nil)
-	t.Cleanup(func() { b.Close() })
+	t.Cleanup(func() { _ = b.Close() })
 	return b
 }
 
