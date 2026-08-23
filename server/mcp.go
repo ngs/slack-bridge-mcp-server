@@ -91,8 +91,8 @@ type HistoryArgs struct {
 // ProgressArgs is the argument set for slack_progress.
 type ProgressArgs struct {
 	Text     string `json:"text" jsonschema:"a short line saying what you are working on or waiting for, e.g. 'release chain: waiting for CI'"`
-	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"where to start the indicator if none is running; ignored when one already is"`
-	Channel  string `json:"channel,omitempty" jsonschema:"the channel to start the indicator in if none is running; ignored when one already is, and defaults to the home channel"`
+	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"the thread this status belongs to; starts the indicator there, or moves a running one that is somewhere else, keeping the elapsed time. Leave it out to label the indicator where it already is"`
+	Channel  string `json:"channel,omitempty" jsonschema:"the channel this status belongs to; starts the indicator there, or moves a running one that is somewhere else. Defaults to the home channel when nothing is running, and to the indicator's current channel when one is"`
 }
 
 // StatusArgs is empty: slack_status takes no arguments.
@@ -217,7 +217,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_progress",
 		Title:       "Say what you are working on",
-		Description: "Put a short status line beside the elapsed time on the processing indicator, for when you start something long such as waiting for CI. The server keeps it updated and clears it when the turn ends; if no indicator is running, this starts one. An answer of ok false means the operator turned the indicator off, so the label had nowhere to go and nothing was posted; carry on with the work either way.",
+		Description: "Put a short status line beside the elapsed time on the processing indicator, for when you start something long such as waiting for CI. The server keeps it updated and clears it when the turn ends; if no indicator is running, this starts one. Pass the channel and thread_ts of the conversation the work is for when it is not the one you were last spoken to in — the indicator moves there, keeping its elapsed time — and leave them out to label it where it is. An answer of ok false means the operator turned the indicator off, so the label had nowhere to go and nothing was posted; carry on with the work either way.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ProgressArgs) (*mcp.CallToolResult, bridge.ProgressResult, error) {
 		result, err := b.Progress(ctx, bridge.ProgressRequest{Text: args.Text, ThreadTS: args.ThreadTS, Channel: args.Channel})
