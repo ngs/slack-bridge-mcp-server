@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync/atomic"
@@ -168,10 +169,19 @@ func (w *webAPI) Delete(ctx context.Context, channel, ts string) error {
 }
 
 func (w *webAPI) React(ctx context.Context, channel, ts, emoji string) error {
-	if err := w.client.AddReactionContext(ctx, emoji, slack.NewRefToMessage(channel, ts)); err != nil {
-		return fmt.Errorf("reactions.add: %w", err)
+	err := w.client.AddReactionContext(ctx, emoji, slack.NewRefToMessage(channel, ts))
+	if err == nil {
+		return nil
 	}
-	return nil
+
+	// The emoji already being on the message is the outcome the caller wanted,
+	// and it is routine: the automatic receipt reaction and an explicit
+	// slack_ack can easily pick the same emoji for the same message.
+	var slackErr slack.SlackErrorResponse
+	if errors.As(err, &slackErr) && slackErr.Err == "already_reacted" {
+		return ErrAlreadyReacted
+	}
+	return fmt.Errorf("reactions.add: %w", err)
 }
 
 // socketModeStream translates socketmode events into StreamEvents, applying

@@ -21,7 +21,15 @@ const (
 	EnvIndicator         = "SLACK_BRIDGE_INDICATOR"
 	EnvIndicatorGrace    = "SLACK_BRIDGE_INDICATOR_GRACE"
 	EnvIndicatorInterval = "SLACK_BRIDGE_INDICATOR_INTERVAL"
+
+	EnvAutoAck      = "SLACK_BRIDGE_AUTO_ACK"
+	EnvAutoAckEmoji = "SLACK_BRIDGE_AUTO_ACK_EMOJI"
 )
+
+// DefaultAutoAckEmoji is the receipt reaction. Eyes reads as "I have seen
+// this and I am looking at it", which is exactly what the server can honestly
+// claim on the agent's behalf the moment a message is handed over.
+const DefaultAutoAckEmoji = "eyes"
 
 // Config is the resolved environment configuration.
 type Config struct {
@@ -50,6 +58,14 @@ type Config struct {
 	// IndicatorInterval is the gap between chat.update ticks. Zero means
 	// DefaultIndicatorInterval.
 	IndicatorInterval time.Duration
+
+	// AutoAckDisabled turns off the receipt reaction the server adds to every
+	// message slack_wait hands over. Negative for the same reason as
+	// IndicatorDisabled: the zero Config matches the documented default.
+	AutoAckDisabled bool
+	// AutoAckEmoji is the receipt reaction's emoji name, without colons. Empty
+	// means DefaultAutoAckEmoji.
+	AutoAckEmoji string
 }
 
 // LoadConfig reads the configuration from the process environment. It never
@@ -64,19 +80,29 @@ func LoadConfig() Config {
 		Owner:    strings.TrimSpace(os.Getenv(EnvOwner)),
 		StateDir: strings.TrimSpace(os.Getenv("SLACK_BRIDGE_STATE_DIR")),
 
-		IndicatorDisabled: indicatorDisabled(os.Getenv(EnvIndicator)),
+		IndicatorDisabled: switchedOff(os.Getenv(EnvIndicator)),
 		IndicatorGrace: durationSetting(
 			EnvIndicatorGrace, DefaultIndicatorGrace, MinIndicatorGrace, MaxIndicatorGrace),
 		IndicatorInterval: durationSetting(
 			EnvIndicatorInterval, DefaultIndicatorInterval, MinIndicatorInterval, MaxIndicatorInterval),
+
+		AutoAckDisabled: switchedOff(os.Getenv(EnvAutoAck)),
+		AutoAckEmoji:    emojiName(os.Getenv(EnvAutoAckEmoji)),
 	}
 }
 
-// indicatorDisabled reads the on/off switch. Only the documented "off" and the
-// obvious synonyms turn the indicator off; anything else, including a typo,
-// leaves the default in place, because silently losing a feature is worse than
+// emojiName normalises an emoji setting to the bare name Slack's API wants.
+// People write the reaction the way they type it in Slack, colons and all, and
+// reactions.add rejects that form.
+func emojiName(value string) string {
+	return strings.Trim(strings.TrimSpace(value), ":")
+}
+
+// switchedOff reads an on/off switch. Only the documented "off" and the
+// obvious synonyms turn a feature off; anything else, including a typo, leaves
+// the default in place, because silently losing a feature is worse than
 // ignoring a value nobody meant.
-func indicatorDisabled(value string) bool {
+func switchedOff(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "off", "false", "0", "no":
 		return true
@@ -129,6 +155,16 @@ func (c Config) indicatorTimings() (grace, interval time.Duration) {
 		interval = DefaultIndicatorInterval
 	}
 	return grace, interval
+}
+
+// autoAckEmoji resolves the reaction actually used, so a Config built in code
+// rather than from the environment still gets the documented default instead
+// of an empty emoji name reactions.add would refuse.
+func (c Config) autoAckEmoji() string {
+	if c.AutoAckEmoji == "" {
+		return DefaultAutoAckEmoji
+	}
+	return c.AutoAckEmoji
 }
 
 // MissingVars lists the required environment variables that are unset or

@@ -218,6 +218,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// From here the agent is working on these messages, which is the
 			// span the owner sees counted in the channel.
 			b.startIndicator()
+			b.autoAck(msgs)
 			return WaitResult{Messages: msgs}, nil
 		}
 
@@ -441,7 +442,13 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 	if err != nil {
 		return err
 	}
-	return api.React(ctx, channel, ts, emoji)
+	// The automatic receipt reaction may well have got there first with the
+	// same emoji. The message is marked either way, which is all slack_ack
+	// promises, so that is a success rather than something to report.
+	if err := api.React(ctx, channel, ts, emoji); err != nil && !errors.Is(err, ErrAlreadyReacted) {
+		return err
+	}
+	return nil
 }
 
 // startIndicator begins counting for the messages just handed to the agent,

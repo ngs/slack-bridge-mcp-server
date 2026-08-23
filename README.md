@@ -76,6 +76,8 @@ All configuration is environment variables:
 | `SLACK_BRIDGE_CHANNEL` | yes | Channel ID to bridge, `C…` |
 | `SLACK_BRIDGE_OWNER` | yes | Your Slack user ID, `U…`. Only this user's messages are relayed. |
 | `SLACK_BRIDGE_STATE_DIR` | no | Override the state directory |
+| `SLACK_BRIDGE_AUTO_ACK` | no | `off` disables the automatic receipt reaction. Enabled by default. |
+| `SLACK_BRIDGE_AUTO_ACK_EMOJI` | no | Emoji for the receipt reaction, without colons. Default `eyes`. |
 | `SLACK_BRIDGE_INDICATOR` | no | `off` disables the processing indicator. Enabled by default. |
 | `SLACK_BRIDGE_INDICATOR_GRACE` | no | Seconds before the indicator appears. Default 10, clamped to 3–120. |
 | `SLACK_BRIDGE_INDICATOR_INTERVAL` | no | Seconds between indicator updates. Default 10, clamped to 5–60. |
@@ -127,13 +129,32 @@ problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 |---|---|---|
 | `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text"}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
 | `slack_post` | `text` (required), `thread_ts` (optional) | The posted `ts` |
-| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation |
+| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
 `timed_out: true` result is not an error — just call it again.
+
+## Receipt and progress
+
+Two signals, and they mean different things:
+
+> **👀** — received: the message reached the session
+>
+> **⏳ Working… (1m 29s)** — still busy with it
+
+The 👀 goes on every message the moment `slack_wait` hands it over, added by the
+server itself rather than by the model, so the owner sees delivery at second
+zero instead of whenever the model gets around to it. It is best effort and
+happens off to the side: if Slack refuses the reaction, the message is still
+delivered and the failure only reaches stderr.
+
+`SLACK_BRIDGE_AUTO_ACK=off` turns it off, and `SLACK_BRIDGE_AUTO_ACK_EMOJI`
+picks a different emoji (bare name, no colons). `slack_ack` stays for the
+deliberate signals — done, rejected, picked up by hand — with whatever emoji
+the moment calls for.
 
 ## Asking the owner a question
 
@@ -168,8 +189,9 @@ posted on how long the answer is taking:
 It is posted only if the agent is still busy after the grace period, so a quick
 reply leaves no trace. From then on the same message is updated in place every
 interval, and it is deleted as soon as the agent replies with `slack_post` or
-goes back to `slack_wait`. An ack (`slack_ack`) leaves it running — "seen, still
-working" is exactly when the elapsed time is worth showing.
+goes back to `slack_wait`. Neither the automatic receipt nor an explicit
+`slack_ack` disturbs it — "seen, still working" is exactly when the elapsed time
+is worth showing.
 
 The whole feature is best effort: if Slack refuses any of these calls, the
 failure is logged to stderr and the tools carry on unaffected. Set

@@ -45,7 +45,7 @@ at [Generate the two tokens](#generate-the-two-tokens).
    |---|---|
    | `chat:write` | `chat.postMessage` for replies, plus `chat.update` and `chat.delete` for the [processing indicator](../README.md#processing-indicator) |
    | `groups:history` | `conversations.history`, which is how the bridge catches up on everything sent while your machine was asleep. Use `channels:history` instead if your bridge channel is public |
-   | `reactions:write` | `reactions.add`, which is all `slack_ack` does |
+   | `reactions:write` | `reactions.add`, for the automatic 👀 receipt and for `slack_ack` |
 
    Nothing else is called. There is no user token, and the server never reads a
    channel it is not bound to.
@@ -123,6 +123,8 @@ slack-bridge-mcp-server --version
 | `SLACK_BRIDGE_CHANNEL` | yes | the `C…` channel ID |
 | `SLACK_BRIDGE_OWNER` | yes | your `U…` user ID |
 | `SLACK_BRIDGE_STATE_DIR` | no | overrides where the cursor and lock live |
+| `SLACK_BRIDGE_AUTO_ACK` | no | `off` disables the automatic 👀 receipt reaction |
+| `SLACK_BRIDGE_AUTO_ACK_EMOJI` | no | emoji for the receipt reaction, without colons; default `eyes` |
 | `SLACK_BRIDGE_INDICATOR` | no | `off` disables the processing indicator |
 | `SLACK_BRIDGE_INDICATOR_GRACE` | no | seconds before it appears; default 10, clamped to 3–120 |
 | `SLACK_BRIDGE_INDICATOR_INTERVAL` | no | seconds between updates; default 10, clamped to 5–60 |
@@ -184,8 +186,12 @@ Slack. It should come back to the agent within a second or two. From then on,
 run the loop in
 [Running a resident session](../README.md#running-a-resident-session).
 
-Three behaviours are worth knowing before you wonder about them:
+Four behaviours are worth knowing before you wonder about them:
 
+- **Your message gets a 👀 straight away.** The server adds it as soon as the
+  message reaches the session, before the model has read a word of it, so the
+  reaction means "delivered" and the ⏳ that may follow means "still working".
+  See [Receipt and progress](../README.md#receipt-and-progress).
 - **Your old messages are not replayed.** The very first `slack_wait` against a
   channel records the newest existing message as the starting point and returns
   nothing. A fresh install joins the conversation rather than dumping the

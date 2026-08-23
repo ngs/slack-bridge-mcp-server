@@ -28,7 +28,9 @@ const instructions = `Bridges this session to a private Slack channel so the own
 
 Call slack_wait to block until the owner sends a message; it returns immediately with
 anything that arrived while you were busy or the session was down. Reply with slack_post.
-Use slack_ack to acknowledge a message you have started working on but cannot answer yet.
+Every message slack_wait returns is marked as received in Slack automatically, so you do
+not need slack_ack for that; use it only for a deliberate signal beyond receipt, such as
+marking a request done or rejected with a specific emoji.
 Use slack_ask to ask the owner a multiple-choice question and block for the answer, the way
 you would ask in the terminal when you need a decision before you can go on.
 When slack_wait returns timed_out, simply call it again to keep the conversation open.`
@@ -114,7 +116,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_ack",
 		Title:       "Acknowledge a Slack message",
-		Description: "Add an emoji reaction to a message, to show the owner it has been seen without posting a reply.",
+		Description: "Add an emoji reaction to a message. Receipt is already marked automatically for everything slack_wait returns, so use this for a deliberate signal beyond that, with the emoji you mean.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args AckArgs) (*mcp.CallToolResult, AckResult, error) {
 		emoji := args.Emoji

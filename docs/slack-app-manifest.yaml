@@ -31,7 +31,8 @@ oauth_config:
       - chat:write
       # conversations.history, used for catch-up after sleep or a restart.
       - groups:history
-      # reactions.add, which is what slack_ack does.
+      # reactions.add: the automatic receipt reaction on every delivered
+      # message, and whatever slack_ack asks for on top of it.
       - reactions:write
 settings:
   event_subscriptions:
