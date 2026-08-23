@@ -54,13 +54,14 @@ type RepliesRequest struct {
 	Limit    int
 }
 
-// Question is the message slack_ask posts: one line of mrkdwn and one button
+// Question is the message slack_ask posts: one line of Markdown and one button
 // per option. It is a plain description of the Block Kit payload so the bridge
 // never has to name a slack-go type; slackclient.go turns it into blocks.
 type Question struct {
 	// BlockID identifies the actions block, and comes back on every click.
 	BlockID string
-	// Text is the question itself, as Slack mrkdwn.
+	// Text is the question itself, as standard Markdown: it goes into a
+	// markdown block, which is Slack's own renderer for it.
 	Text string
 	// Options are the buttons, in the order the owner sees them.
 	Options []QuestionOption
