@@ -44,6 +44,17 @@ type candidate struct {
 	Text     string
 	TS       string
 	ThreadTS string
+	// Username is the display name carried by posts that have no user to look
+	// up: incoming webhooks and bots that set their own name. Only
+	// slack_history uses it; the relay filter rejects those posts outright.
+	Username string
+	// ReplyCount is how many replies hang off this message, which
+	// slack_history reports so the caller knows a thread is there to read.
+	ReplyCount int
+	// LatestReply is the timestamp of the newest reply in this message's
+	// thread. It is how catch-up spots a thread that has been talked in since
+	// the cursor was last moved, without reading every thread in the channel.
+	LatestReply string
 }
 
 // accept reports whether the candidate is an owner message on the bound

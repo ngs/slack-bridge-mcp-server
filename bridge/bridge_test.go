@@ -3,7 +3,9 @@ package bridge
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,15 +23,52 @@ type fakeAPI struct {
 	historyErr error
 
 	historyCalls []HistoryRequest
-	posts        []postCall
-	reactions    []reactionCall
-	postTS       string
-	postErr      error
-	reactErr     error
+	replyCalls   []RepliesRequest
+	// replies is the thread conversations.replies serves, oldest first.
+	replies []candidate
+	// repliesPageSize, when set, makes the fake page its replies the way
+	// Slack does, handing back a cursor.
+	repliesPageSize int
+	repliesErr      error
+	// names is what users.info resolves, and nameLookups counts the calls so a
+	// test can see the cache working.
+	names       map[string]string
+	nameErr     error
+	nameLookups int
+	// nameDelay makes each users.info call take time, so a test can tell
+	// parallel resolution from serial.
+	nameDelay   time.Duration
+	posts       []postCall
+	questions   []questionCall
+	reactions   []reactionCall
+	updates     []updateCall
+	resolutions []updateCall
+	deletes     []deleteCall
+	postTS      string
+	questionTS  string
+	// beforeQuestionReturns runs inside PostQuestion, after Slack would have
+	// created the message but before the caller learns its ts.
+	beforeQuestionReturns func()
+	postErr               error
+	questionErr           error
+	reactErr              error
+	updateErr             error
+	resolveErr            error
+	deleteErr             error
+	// deleteGate, when set, holds Delete open until the test closes it, which
+	// is how a slow chat.delete is simulated.
+	deleteGate chan struct{}
 }
 
 type postCall struct{ Channel, ThreadTS, Text string }
+type questionCall struct {
+	Channel  string
+	ThreadTS string
+	Question Question
+}
 type reactionCall struct{ Channel, TS, Emoji string }
+type updateCall struct{ Channel, TS, Text string }
+type deleteCall struct{ Channel, TS string }
 
 func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, error) {
 	f.mu.Lock()
@@ -45,6 +84,11 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
 			continue
 		}
+		// Both bounds are exclusive, the way Slack behaves with `inclusive`
+		// left off.
+		if req.Latest != "" && !tsLess(c.TS, req.Latest) {
+			continue
+		}
 		matched = append(matched, c)
 	}
 
@@ -53,10 +97,78 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 	for i := len(matched) - 1; i >= 0; i-- {
 		reversed = append(reversed, matched[i])
 	}
+
+	hasMore := false
 	if req.Limit > 0 && len(reversed) > req.Limit {
 		reversed = reversed[:req.Limit]
+		hasMore = true
 	}
-	return HistoryPage{Messages: reversed}, nil
+	return HistoryPage{Messages: reversed, HasMore: hasMore}, nil
+}
+
+func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.replyCalls = append(f.replyCalls, req)
+	if f.repliesErr != nil {
+		return HistoryPage{}, f.repliesErr
+	}
+
+	// Slack returns the parent plus the replies belonging to that thread,
+	// oldest first, honouring the same exclusive bounds as history.
+	matched := make([]candidate, 0, len(f.replies))
+	for _, c := range f.replies {
+		if req.ThreadTS != "" && c.ThreadTS != req.ThreadTS && c.TS != req.ThreadTS {
+			continue
+		}
+		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
+			continue
+		}
+		if req.Latest != "" && !tsLess(c.TS, req.Latest) {
+			continue
+		}
+		matched = append(matched, c)
+	}
+
+	// Slack pages long threads. The cursor here is simply how many replies the
+	// caller has already been given.
+	if size := f.repliesPageSize; size > 0 {
+		start := 0
+		if req.Cursor != "" {
+			var err error
+			if start, err = strconv.Atoi(req.Cursor); err != nil {
+				return HistoryPage{}, err
+			}
+		}
+		if start > len(matched) {
+			start = len(matched)
+		}
+		end := min(start+size, len(matched))
+
+		page := HistoryPage{Messages: matched[start:end]}
+		if end < len(matched) {
+			page.NextCursor = strconv.Itoa(end)
+			page.HasMore = true
+		}
+		return page, nil
+	}
+	return HistoryPage{Messages: matched}, nil
+}
+
+func (f *fakeAPI) UserName(_ context.Context, userID string) (string, error) {
+	f.mu.Lock()
+	f.nameLookups++
+	delay, name, err := f.nameDelay, f.names[userID], f.nameErr
+	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (string, error) {
@@ -70,12 +182,59 @@ func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (strin
 	return f.postTS, nil
 }
 
+func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
+	f.mu.Lock()
+	f.questions = append(f.questions, questionCall{Channel: channel, ThreadTS: threadTS, Question: q})
+	hook, ts, err := f.beforeQuestionReturns, f.questionTS, f.questionErr
+	f.mu.Unlock()
+
+	// The message exists in Slack before this call returns, so a test can use
+	// the hook to click on it while the caller is still waiting.
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return "", err
+	}
+	return ts, nil
+}
+
+func (f *fakeAPI) ResolveQuestion(_ context.Context, channel, ts, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.resolutions = append(f.resolutions, updateCall{Channel: channel, TS: ts, Text: text})
+	return f.resolveErr
+}
+
 func (f *fakeAPI) React(_ context.Context, channel, ts, emoji string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.reactions = append(f.reactions, reactionCall{Channel: channel, TS: ts, Emoji: emoji})
 	return f.reactErr
+}
+
+func (f *fakeAPI) Update(_ context.Context, channel, ts, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.updates = append(f.updates, updateCall{Channel: channel, TS: ts, Text: text})
+	return f.updateErr
+}
+
+// Delete records the call before waiting on deleteGate, so a test can hold a
+// deletion open and still see that it started.
+func (f *fakeAPI) Delete(_ context.Context, channel, ts string) error {
+	f.mu.Lock()
+	f.deletes = append(f.deletes, deleteCall{Channel: channel, TS: ts})
+	gate, err := f.deleteGate, f.deleteErr
+	f.mu.Unlock()
+
+	if gate != nil {
+		<-gate
+	}
+	return err
 }
 
 func (f *fakeAPI) calls() []HistoryRequest {
@@ -86,14 +245,20 @@ func (f *fakeAPI) calls() []HistoryRequest {
 
 // fakeStream is a hand-driven live event stream.
 type fakeStream struct {
-	events chan StreamEvent
+	events       chan StreamEvent
+	interactions chan Interaction
 }
 
 func newFakeStream() *fakeStream {
-	return &fakeStream{events: make(chan StreamEvent, 16)}
+	return &fakeStream{
+		events:       make(chan StreamEvent, 16),
+		interactions: make(chan Interaction, 16),
+	}
 }
 
 func (s *fakeStream) Events() <-chan StreamEvent { return s.events }
+
+func (s *fakeStream) Interactions() <-chan Interaction { return s.interactions }
 
 // fakeConnector hands out a fixed API and stream, and records how often it was
 // asked to connect.
@@ -539,6 +704,74 @@ func TestCatchUpAsksSlackForEverythingAfterTheCursor(t *testing.T) {
 	}
 }
 
+// The click channel closing is the same disconnection as the event channel
+// closing, and it has to be noticed rather than spun on.
+func TestWaitFailsWhenTheClickChannelCloses(t *testing.T) {
+	cfg := testConfig(t)
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	stream := newFakeStream()
+	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
+	defer func() { _ = b.Close() }()
+
+	close(stream.interactions)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Wait(context.Background(), MaxWaitTimeout)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Wait() = nil error after the click channel closed, want the disconnection reported")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait() never returned; a closed channel is always ready, so it was spinning")
+	}
+}
+
+// Two calls can watch the same stream close. The first reports it and a later
+// call reconnects; the second must not then mark the replacement dead, or the
+// call after that opens a third socket while the second one is still reading.
+func TestAStaleStreamClosingDoesNotInvalidateTheReplacement(t *testing.T) {
+	cfg := testConfig(t)
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	old := newFakeStream()
+	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: old})
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.Wait(context.Background(), 10*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A replacement connection is installed, as a reconnect would.
+	replacement := newFakeStream()
+	b.mu.Lock()
+	b.stream = replacement
+	b.connected = true
+	b.mu.Unlock()
+
+	// The straggler now notices the old stream closing.
+	b.noteStreamClosed(old)
+
+	if !b.Status().Connected {
+		t.Error("Status() reports disconnected after a stale stream closed, which would open a second socket alongside the live one")
+	}
+
+	// The live one closing is a different matter.
+	b.noteStreamClosed(replacement)
+	if b.Status().Connected {
+		t.Error("Status() still reports connected after the current stream closed")
+	}
+}
+
 func TestWaitFailsWhenTheStreamClosesForGood(t *testing.T) {
 	cfg := testConfig(t)
 	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
@@ -607,6 +840,11 @@ func TestClampTimeout(t *testing.T) {
 		{1500, MaxWaitTimeout},
 		{1501, MaxWaitTimeout},
 		{86400, MaxWaitTimeout},
+		// Seconds are compared before they are multiplied out: a number this
+		// large would wrap time.Duration round into a negative and clamp to
+		// the wrong end, or to nothing at all.
+		{1 << 62, MaxWaitTimeout},
+		{math.MaxInt, MaxWaitTimeout},
 	}
 
 	for _, tt := range tests {

@@ -1,20 +1,69 @@
 package bridge
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrThreadUnreadable reports that a thread is not there to be read — the
+// parent was deleted, or the bridge is no longer in the channel. It is
+// distinguished from every other failure because catch-up answers the two
+// differently: a thread that is gone is skipped, while a thread Slack merely
+// refused this time is retried, so its replies are not stepped over.
+var ErrThreadUnreadable = errors.New("the thread cannot be read")
 
 // HistoryPage is one page of conversations.history, newest message first, as
 // Slack returns it.
 type HistoryPage struct {
 	Messages   []candidate
 	NextCursor string
+	// HasMore reports that Slack held messages back from this page, which
+	// slack_history passes on so the caller knows it is reading a window
+	// rather than everything.
+	HasMore bool
 }
 
-// HistoryRequest asks for messages after Oldest, exclusive.
+// HistoryRequest asks for messages between Oldest and Latest. Both bounds are
+// exclusive, which is what Slack does when `inclusive` is left off, and either
+// may be empty. Oldest exclusive is load-bearing: it is the cursor, and a
+// message the agent already has must not come back.
 type HistoryRequest struct {
 	Channel string
 	Oldest  string
+	Latest  string
 	Cursor  string
 	Limit   int
+}
+
+// RepliesRequest asks for the replies to one thread.
+type RepliesRequest struct {
+	Channel string
+	// ThreadTS is the parent message's timestamp, which Slack also returns as
+	// the first message of the thread.
+	ThreadTS string
+	Oldest   string
+	Latest   string
+	Cursor   string
+	Limit    int
+}
+
+// Question is the message slack_ask posts: one line of mrkdwn and one button
+// per option. It is a plain description of the Block Kit payload so the bridge
+// never has to name a slack-go type; slackclient.go turns it into blocks.
+type Question struct {
+	// BlockID identifies the actions block, and comes back on every click.
+	BlockID string
+	// Text is the question itself, as Slack mrkdwn.
+	Text string
+	// Options are the buttons, in the order the owner sees them.
+	Options []QuestionOption
+}
+
+// QuestionOption is one button of a Question.
+type QuestionOption struct {
+	ActionID string
+	Value    string
+	Label    string
 }
 
 // API is the slice of the Slack Web API the bridge uses. It exists so the
@@ -23,11 +72,26 @@ type HistoryRequest struct {
 type API interface {
 	// History fetches one page of channel history.
 	History(ctx context.Context, req HistoryRequest) (HistoryPage, error)
+	// Replies fetches one thread, parent message included.
+	Replies(ctx context.Context, req RepliesRequest) (HistoryPage, error)
+	// UserName resolves a Slack user ID to the name a person would recognise.
+	UserName(ctx context.Context, userID string) (string, error)
 	// Post sends a message to a channel, optionally into a thread, and
 	// returns the timestamp of the posted message.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)
+	// PostQuestion sends a question with clickable answers and returns the
+	// timestamp of the posted message.
+	PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error)
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, channel, ts, emoji string) error
+	// Update rewrites the text of a message the bridge posted.
+	Update(ctx context.Context, channel, ts, text string) error
+	// ResolveQuestion rewrites a question to plain text and removes its
+	// buttons, which is how an answered or expired question stops being
+	// clickable.
+	ResolveQuestion(ctx context.Context, channel, ts, text string) error
+	// Delete removes a message the bridge posted.
+	Delete(ctx context.Context, channel, ts string) error
 }
 
 // StreamEventKind distinguishes the things that can happen on the Socket Mode
@@ -53,11 +117,41 @@ type StreamEvent struct {
 	Message Message
 }
 
+// Interaction is one button click on a message the bridge posted. It is
+// already acknowledged to Slack by the time it reaches the bridge: an
+// unacknowledged envelope is redelivered, so the ack belongs next to the
+// socket rather than behind the bridge's own routing.
+//
+// Clicks travel on a channel of their own rather than alongside messages. A
+// message the bridge fails to queue is recovered from conversations.history; a
+// click is not in any history, so a dropped one is an answer the owner gave
+// and the agent will never see. Keeping the two apart means a flood of
+// messages cannot cost a question its answer.
+type Interaction struct {
+	// User is the Slack user ID of whoever clicked, which the bridge checks
+	// against the configured owner.
+	User string
+	// Channel is where the clicked message lives.
+	Channel string
+	// MessageTS identifies the message the button belongs to, which is how a
+	// click is matched to the question that is waiting for it.
+	MessageTS string
+	// BlockID and ActionID are the identifiers the bridge put on the block
+	// and the button when it posted the question.
+	BlockID  string
+	ActionID string
+	// Value is the button's value, which carries the option index.
+	Value string
+}
+
 // Stream is the live half of the Slack connection.
 type Stream interface {
-	// Events delivers stream events until the stream's context is done, at
-	// which point the channel is closed.
+	// Events delivers messages and connection notices until the stream's
+	// context is done, at which point the channel is closed.
 	Events() <-chan StreamEvent
+	// Interactions delivers button clicks, on a separate channel because they
+	// cannot be recovered from history if they are dropped.
+	Interactions() <-chan Interaction
 }
 
 // Connector opens both halves of the Slack connection. Connect is called

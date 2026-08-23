@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -29,7 +30,35 @@ const (
 	maxHistoryPages  = 5
 )
 
-// Bridge owns the Slack connection and the message cursor. All four MCP tools
+// Bounds on the thread pass of catch-up. threadScanLimit is how far back the
+// bridge looks for threads that have been replied to; maxThreadsPerCatchUp is
+// how many of those it will actually read.
+//
+// The worst case is one scan plus twenty threads of up to maxThreadCatchUpPages
+// each, and it takes twenty separate threads each holding thousands of unread
+// replies to get anywhere near it. A typical reconnect makes one call and finds
+// nothing to read; a busy night makes a handful. The pass is bounded rather than budgeted deliberately: a budget
+// spent halfway through a thread would leave the cursor advancing over replies
+// that were never read, which is the failure this whole pass exists to stop.
+const (
+	threadScanLimit      = 200
+	maxThreadsPerCatchUp = 20
+	// maxThreadCatchUpPages is how far one thread is followed. Fifty pages is
+	// ten thousand replies missed in a single thread while the bridge was
+	// away, which is past any conversation and into a machine writing into the
+	// channel.
+	maxThreadCatchUpPages = 50
+)
+
+// shutdownIndicatorWait is how long Close waits for the indicator to clear
+// itself from the channel. It covers the whole of what the indicator can still
+// be doing when it is told to stop — a post or update already in flight,
+// followed by the delete that finishes the job — plus a margin, so the wait
+// ends because the work finished or failed rather than because the clocks
+// disagreed and the process exited mid-cleanup.
+const shutdownIndicatorWait = indicatorRequestTimeout + indicatorDeleteTimeout + 2*time.Second
+
+// Bridge owns the Slack connection and the message cursor. All six MCP tools
 // go through it.
 type Bridge struct {
 	cfg       Config
@@ -53,6 +82,23 @@ type Bridge struct {
 	// pending holds messages read from the stream while merging, so nothing
 	// is lost if a later step fails.
 	pending []Message
+	// indicator is the live "⏳ Working…" message, if one is running. At most
+	// one exists at a time; see indicator.go.
+	indicator *indicator
+	// indicatorDone belongs to the most recent indicator, running or already
+	// stopped. It outlives the indicator itself because the next one has to
+	// wait for this one's chat.delete before posting its own message.
+	indicatorDone <-chan struct{}
+	// indicatorGeneration counts every start and stop, so a call that retired
+	// an indicator can tell whether anything has happened since.
+	indicatorGeneration uint64
+	// ask is the slack_ask question waiting for a click, if any. At most one
+	// is outstanding: a second question while one is pending is refused rather
+	// than queued, so a click is never ambiguous.
+	ask *pendingAsk
+	// nameCache holds display names resolved for slack_history. It has its own
+	// lock, so a users.info call never happens under b.mu.
+	nameCache *nameCache
 }
 
 // New returns a Bridge that connects on first use. cfg may be incomplete; the
@@ -104,18 +150,37 @@ func (b *Bridge) Status() Status {
 	return status
 }
 
-// Close releases the lock and is safe to call on a bridge that never
-// connected.
+// Close retires the indicator and releases the lock. It is safe to call on a
+// bridge that never connected.
+//
+// Unlike the tool calls, which never wait on the indicator, this one does: it
+// runs as the process is about to exit, and the indicator's chat.delete lives
+// on a goroutine that exiting would kill. Waiting for it here is the
+// difference between the channel being left tidy and a "⏳ Working…" message
+// sitting there until someone notices. The wait is bounded, so a Slack that
+// never answers delays shutdown rather than preventing it.
 func (b *Bridge) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	b.connected = false
-	if b.lock == nil {
-		return nil
-	}
+	b.stopIndicatorLocked()
+	done := b.indicatorDone
 	lock := b.lock
 	b.lock = nil
+	b.mu.Unlock()
+
+	if done != nil {
+		timeout := time.NewTimer(shutdownIndicatorWait)
+		defer timeout.Stop()
+		select {
+		case <-done:
+		case <-timeout.C:
+			log.Printf("gave up waiting for the processing indicator to clear itself from the channel")
+		}
+	}
+
+	if lock == nil {
+		return nil
+	}
 	return lock.Release()
 }
 
@@ -180,6 +245,10 @@ type WaitResult struct {
 // trickling in. After that it waits on the live stream, running catch-up again
 // on every reconnect.
 func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, error) {
+	// Waiting again means the agent is done with whatever it was given last
+	// time, even if it never posted a reply.
+	b.stopIndicator()
+
 	b.mu.Lock()
 	if err := b.ensure(); err != nil {
 		b.mu.Unlock()
@@ -199,7 +268,21 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return WaitResult{}, err
 		}
 		if len(msgs) > 0 {
+			// From here the agent is working on these messages, which is the
+			// span the owner sees counted in the channel.
+			b.startIndicator()
+			b.autoAck(msgs)
 			return WaitResult{Messages: msgs}, nil
+		}
+
+		// A pending question owns the click channel. Reading it here as well
+		// would mean a click could be taken by this goroutine and handed
+		// across to the question, and the question's own deadline cannot see
+		// a click that is still in transit. A nil channel blocks forever,
+		// which is exactly "leave those to the asker".
+		clicks := stream.Interactions()
+		if b.askPending() {
+			clicks = nil
 		}
 
 		select {
@@ -209,11 +292,19 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		case <-deadline.C:
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
 
+		case in, ok := <-clicks:
+			if !ok {
+				b.noteStreamClosed(stream)
+				return WaitResult{}, errors.New("the Slack connection closed")
+			}
+			// A click arriving while nobody is asking anything is answered by
+			// whoever is: routing it here keeps slack_wait from starving the
+			// click channel while it holds the connection.
+			b.routeInteraction(in)
+
 		case evt, ok := <-stream.Events():
 			if !ok {
-				b.mu.Lock()
-				b.connected = false
-				b.mu.Unlock()
+				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
 			if err := b.absorb(evt); err != nil {
@@ -223,7 +314,35 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	}
 }
 
+// noteStreamClosed records that the live connection is gone, but only if the
+// stream that closed is the one the bridge is still using.
+//
+// Two calls can be reading the same stream when it closes. The first reports
+// the disconnection, and a tool call after it opens a replacement; if the
+// second then cleared the flag unconditionally, the next call would open a
+// third connection while the replacement was still consuming events, and the
+// owner's messages would arrive on a socket nobody reads.
+func (b *Bridge) noteStreamClosed(stream Stream) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stream == stream {
+		b.connected = false
+	}
+}
+
+// askPending reports whether a slack_ask question is waiting for a click.
+func (b *Bridge) askPending() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ask != nil
+}
+
 // absorb folds one stream event into the bridge's pending state.
+//
+// Both slack_wait and slack_ask read the stream, so a message goes to the same
+// place whichever of them happened to pick it up: the queue the next
+// slack_wait drains.
 func (b *Bridge) absorb(evt StreamEvent) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -304,10 +423,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	return merged, nil
 }
 
-// seedCursor records the newest message in the channel without returning it,
-// establishing a starting point for a channel the bridge has never read.
+// seedCursor records where the conversation already is, without returning any
+// of it, establishing a starting point for a channel the bridge has never
+// read.
+//
+// The newest surface message is not enough on its own. A thread hanging off an
+// older message can hold the most recent thing anyone said, and the thread
+// pass of catch-up would then find those replies sitting past the cursor and
+// hand the owner's own history back to them as if it were new. So the seed is
+// the newest timestamp anywhere in the scanned window — surface messages and
+// their latest replies alike.
 func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (string, error) {
-	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: 1})
+	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
 		return "", err
 	}
@@ -315,7 +442,17 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 		return "", nil
 	}
 
-	ts := page.Messages[0].TS
+	var ts string
+	for _, m := range page.Messages {
+		for _, candidateTS := range []string{m.TS, m.LatestReply} {
+			if candidateTS != "" && (ts == "" || tsLess(ts, candidateTS)) {
+				ts = candidateTS
+			}
+		}
+	}
+	if ts == "" {
+		return "", nil
+	}
 	if b.store != nil && ts != "" {
 		if err := b.store.SetLastTS(channel, ts); err != nil {
 			log.Printf("could not persist the initial cursor: %v", err)
@@ -324,10 +461,14 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 	return ts, nil
 }
 
-// catchUp walks conversations.history forward from after, returning the owner
-// messages Slack has that the caller has not seen. conversations.history
-// returns every author in the channel, so the same owner filter the live
-// stream applies has to be applied here too.
+// catchUp returns the owner messages Slack has that the caller has not seen.
+// conversations.history returns every author in the channel, so the same owner
+// filter the live stream applies has to be applied here too.
+//
+// It takes two passes, because one is not enough: conversations.history only
+// ever returns channel-surface messages, so a reply the owner typed inside a
+// thread while the bridge was away is invisible to it. The second pass goes
+// and finds those.
 func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
 	if api == nil {
 		return nil, errors.New("the bridge is not connected to Slack")
@@ -360,8 +501,146 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 		}
 	}
 
+	replies, err := catchUpThreads(ctx, api, channel, owner, after)
+	if err != nil {
+		return nil, err
+	}
+
 	// History pages arrive newest-first; mergeMessages sorts and deduplicates.
-	return mergeMessages(after, messages), nil
+	return mergeMessages(after, messages, replies), nil
+}
+
+// catchUpThreads recovers thread replies newer than the cursor.
+//
+// A thread reply never appears in conversations.history, and its parent may be
+// far older than the cursor — an hour of conversation can hang off a message
+// from last week — so the window that finds the parents deliberately ignores
+// the cursor. What identifies a thread worth reading is latest_reply, which
+// Slack puts on every threaded parent: newer than the cursor means somebody
+// has spoken in there since the bridge last looked.
+//
+// Two caps keep the scan bounded, and both lose messages when they bite, which
+// is the trade accepted here rather than walking the channel's whole history
+// on every reconnect. Only the newest threadScanLimit surface messages are
+// examined, so a reply in a thread pushed off that window is never seen. And
+// at most maxThreadsPerCatchUp threads are read: the cursor advances past the
+// rest, so their replies are not recovered later either. Both are logged, and
+// the threads read are the ones nearest the top of the channel, which is where
+// a conversation the owner is actually having will be.
+func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
+	if after == "" {
+		// A first run seeds the cursor from the newest message instead of
+		// replaying, and reading every thread in the channel would be exactly
+		// the replay that avoids.
+		return nil, nil
+	}
+
+	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
+	if err != nil {
+		return nil, err
+	}
+	if page.HasMore {
+		// The channel is busier than the scan window. Threads older than these
+		// messages were not even looked at, so a reply in one of them is
+		// missed without anything else noticing.
+		log.Printf("catch-up scanned the newest %d messages for threads; older threads were not examined", threadScanLimit)
+	}
+
+	// Sorted by when each thread was last spoken in, not by how recently its
+	// parent was posted, because that is what the cap has to choose between: a
+	// week-old thread the owner answered ten minutes ago matters more than a
+	// thread started this morning and quiet since.
+	eligible := make([]candidate, 0, len(page.Messages))
+	for _, parent := range page.Messages {
+		if parent.TS == "" || parent.LatestReply == "" || !tsLess(after, parent.LatestReply) {
+			continue
+		}
+		eligible = append(eligible, parent)
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		return tsLess(eligible[j].LatestReply, eligible[i].LatestReply)
+	})
+
+	var (
+		messages []Message
+		walked   int
+		skipped  int
+	)
+	for _, parent := range eligible {
+		if walked >= maxThreadsPerCatchUp {
+			skipped++
+			continue
+		}
+		walked++
+
+		replies, err := readThread(ctx, api, channel, owner, parent.TS, after)
+		if err != nil {
+			if !errors.Is(err, ErrThreadUnreadable) {
+				// Slack said "not now" rather than "not there". Failing the
+				// whole catch-up is what keeps it retryable: the cursor stays
+				// where it is, and the next attempt asks for the same window
+				// again instead of stepping over replies it never read.
+				return nil, err
+			}
+			// A thread that no longer exists will not exist next time either,
+			// and failing forever on it would wedge every later message
+			// behind it.
+			log.Printf("skipping a thread that cannot be read: %s", logSafe(err.Error(), maxLoggedError))
+			continue
+		}
+		messages = append(messages, replies...)
+	}
+
+	if skipped > 0 {
+		// Said plainly, because it is a loss and not a deferral: the cursor is
+		// about to move past these replies, and nothing goes back for them.
+		log.Printf("catch-up read %d threads and skipped %d with newer replies; replies in the skipped threads will not be delivered",
+			walked, skipped)
+	}
+	return messages, nil
+}
+
+// readThread collects the owner's replies in one thread, newer than after,
+// following Slack's paging to the end of the thread.
+//
+// Paging to the end is the point: the caller is about to move the cursor past
+// everything this returns, so a thread left half-read is a thread whose
+// remaining replies are older than the new cursor and will never be asked for
+// again. The page budget is set where a thread stops being a conversation
+// someone had and starts being a data set — and reaching it is reported, since
+// the same loss applies there.
+func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) ([]Message, error) {
+	var (
+		messages []Message
+		cursor   string
+	)
+	for page := 0; page < maxThreadCatchUpPages; page++ {
+		replies, err := api.Replies(ctx, RepliesRequest{
+			Channel:  channel,
+			ThreadTS: threadTS,
+			Oldest:   after,
+			Cursor:   cursor,
+			Limit:    historyPageLimit,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, c := range replies.Messages {
+			if msg, ok := accept(c, channel, owner); ok {
+				messages = append(messages, msg)
+			}
+		}
+
+		cursor = replies.NextCursor
+		if cursor == "" {
+			return messages, nil
+		}
+	}
+
+	log.Printf("stopped reading a thread after %d pages of replies; anything past that is older than the new cursor and will not be delivered",
+		maxThreadCatchUpPages)
+	return messages, nil
 }
 
 // ClampTimeout turns the tool's timeout_seconds argument into a duration,
@@ -372,14 +651,18 @@ func ClampTimeout(seconds int) time.Duration {
 	if seconds <= 0 {
 		return DefaultWaitTimeout
 	}
-	d := time.Duration(seconds) * time.Second
-	if d < MinWaitTimeout {
+
+	// Compare while the value is still a count of seconds. Converting first
+	// multiplies by a billion, and a large enough number wraps time.Duration
+	// round into a negative — so an hour would clamp correctly while
+	// 1<<62 seconds would come out as the minimum, or as nothing at all.
+	if seconds <= int(MinWaitTimeout/time.Second) {
 		return MinWaitTimeout
 	}
-	if d > MaxWaitTimeout {
+	if seconds >= int(MaxWaitTimeout/time.Second) {
 		return MaxWaitTimeout
 	}
-	return d
+	return time.Duration(seconds) * time.Second
 }
 
 // Post sends a message to the bound channel, connecting first if needed.
@@ -388,15 +671,59 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 		return "", errors.New("text is required")
 	}
 
+	// The reply is the answer the indicator was standing in for, so retire it
+	// before the reply lands rather than after.
+	retired := b.stopIndicator()
+
 	api, channel, err := b.apiForCall()
 	if err != nil {
+		b.restoreIndicator(ctx, retired)
 		return "", err
 	}
-	return api.Post(ctx, channel, threadTS, text)
+
+	ts, err := api.Post(ctx, channel, threadTS, text)
+	if err != nil {
+		// The answer never landed, so the agent is still on the hook for it
+		// and the channel should go back to saying so.
+		b.restoreIndicator(ctx, retired)
+		return "", err
+	}
+	return ts, nil
+}
+
+// restoreIndicator puts back the progress signal that a failed attempt to
+// speak had retired, so the channel does not fall silent while the agent is
+// still working.
+//
+// It restores only what was there. A reply that fails when no indicator was
+// running means the agent was never handed anything to work on, and inventing
+// a "⏳ Working…" for it would be a lie the owner cannot check. It also stays
+// quiet when the call was cancelled: Slack may have accepted the message
+// anyway, with the confirmation lost on the way back, and a cancelled call
+// means nobody is waiting on this turn any more either.
+func (b *Bridge) restoreIndicator(ctx context.Context, retired retiredIndicator) {
+	if !retired.wasRunning || ctx.Err() != nil || b.ctx.Err() != nil {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Slack calls take time, and another call may have moved on while this one
+	// was failing — a reply that succeeded, or a new turn with its own clock.
+	// Undo only this call's own retirement, and only if it is still the last
+	// thing that happened.
+	if b.indicatorGeneration != retired.generation {
+		return
+	}
+	b.startIndicatorLocked(retired.startedAt)
 }
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"
 // without posting a message.
+//
+// It deliberately leaves the processing indicator alone: an ack means "seen,
+// still working", which is exactly the situation the indicator is there for.
 func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 	if ts == "" {
 		return errors.New("ts is required")
@@ -409,7 +736,98 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 	if err != nil {
 		return err
 	}
-	return api.React(ctx, channel, ts, emoji)
+	// The automatic receipt reaction may well have got there first with the
+	// same emoji. The message is marked either way, which is all slack_ack
+	// promises, so that is a success rather than something to report.
+	if err := api.React(ctx, channel, ts, emoji); err != nil && !errors.Is(err, ErrAlreadyReacted) {
+		return err
+	}
+	return nil
+}
+
+// startIndicator begins counting for the messages just handed to the agent,
+// replacing any indicator still running so two of them can never coexist in the
+// channel.
+//
+// The replacement is handed its predecessor's done channel and waits for it
+// before posting anything, which is what makes "never two at once" hold even
+// when the outgoing chat.delete is slower than the grace period. That wait
+// happens on the new indicator's own goroutine, so this call still returns
+// immediately.
+//
+// The indicator is given the bridge's own context rather than the tool call's:
+// the call that starts it returns immediately, and a per-call context would be
+// cancelled before the first tick.
+func (b *Bridge) startIndicator() {
+	b.startIndicatorAt(time.Now())
+}
+
+// startIndicatorAt is startIndicator with the clock set, so an indicator put
+// back after a failed reply carries on counting from when the agent actually
+// started rather than restarting at zero.
+func (b *Bridge) startIndicatorAt(startedAt time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.startIndicatorLocked(startedAt)
+}
+
+func (b *Bridge) startIndicatorLocked(startedAt time.Time) {
+	b.stopIndicatorLocked()
+	if b.cfg.IndicatorDisabled || b.api == nil {
+		return
+	}
+
+	grace, interval := b.cfg.indicatorTimings()
+	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval, b.indicatorDone)
+	b.indicator.startedAt = startedAt
+	b.indicatorDone = b.indicator.done
+	b.indicatorGeneration++
+	b.indicator.start()
+}
+
+// retiredIndicator is what stopping one leaves behind: enough to put it back
+// if whatever retired it turned out not to happen.
+type retiredIndicator struct {
+	// wasRunning distinguishes "there was one and it is now stopped" from
+	// "there was nothing to stop", which is what keeps a failed reply from
+	// inventing a progress signal for work nobody handed the agent.
+	wasRunning bool
+	// startedAt is when the agent received the work, not when the indicator
+	// was created, so a restored one shows the true elapsed time.
+	startedAt time.Time
+	// generation is the bridge's indicator counter at the moment of this
+	// retirement. It is what makes a restore safe to attempt after a slow
+	// Slack call: if anything else has started or stopped an indicator since,
+	// this retirement is no longer the current state and putting it back would
+	// overwrite whatever replaced it.
+	generation uint64
+}
+
+// stopIndicator retires the running indicator, if any. It returns without
+// waiting for the chat.delete, so no tool call is ever slowed down by it.
+func (b *Bridge) stopIndicator() retiredIndicator {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stopIndicatorLocked()
+}
+
+// stopIndicatorLocked is stopIndicator for callers that already hold b.mu. The
+// done channel is kept behind, so the next indicator knows what it is waiting
+// for.
+func (b *Bridge) stopIndicatorLocked() retiredIndicator {
+	// Every stop counts, including one that found nothing to stop. A call that
+	// says "no indicator from here" is a decision, and a slow failing reply
+	// must not be able to overrule it by putting its own back afterwards.
+	b.indicatorGeneration++
+
+	if b.indicator == nil {
+		return retiredIndicator{generation: b.indicatorGeneration}
+	}
+	b.indicator.stop()
+	b.indicatorDone = b.indicator.done
+	startedAt := b.indicator.startedAt
+	b.indicator = nil
+	return retiredIndicator{wasRunning: true, startedAt: startedAt, generation: b.indicatorGeneration}
 }
 
 // apiForCall connects if necessary and returns the Web API handle.

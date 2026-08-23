@@ -70,7 +70,8 @@ Decision 3 makes that cost small.
 ### 2. Lazy connect
 
 Nothing touches the network at process startup. The Socket Mode connection is
-opened on the first `slack_wait` call.
+opened by the first tool call that needs Slack — `slack_wait` in a resident
+session, but any of the others will do it just as well.
 
 This is what lets the server sit in every project's `.mcp.json` unconditionally.
 Most sessions never call `slack_wait`, and those sessions never open a socket,
@@ -102,8 +103,65 @@ reconnect, and again in the history page fetched for that same reconnect. The
 merge step deduplicates by timestamp, so how that race resolves does not matter.
 
 The first run against a channel is the one case where catch-up is skipped. With
-no cursor, the bridge records the newest existing message and starts from there,
-rather than replaying the channel's entire history into the model's context.
+no cursor, the bridge records where the conversation already is and starts from
+there, rather than replaying the channel's entire history into the model's
+context. "Where it already is" means the newest timestamp anywhere in the
+scanned window, replies included: the last thing anyone said is often a reply
+in an older thread, and a cursor set to the newest surface message would leave
+those replies looking new to the thread pass below.
+
+#### Thread replies need a second pass
+
+`conversations.history` returns the channel surface and nothing else: a reply
+inside a thread is invisible to it. That was a real bug rather than a
+theoretical one — with a thread-first conversation habit, a reply typed while
+the laptop slept was never delivered at all, and `slack_wait` sat blocked until
+the owner said something new on the surface.
+
+So catch-up runs a second pass. It fetches one page of recent surface messages
+**without** the cursor bound, because a thread whose parent is a week old can
+still have a reply from five minutes ago, and looks at `latest_reply`, which
+Slack puts on every threaded parent. A parent whose newest reply is later than
+the cursor has been talked in since the bridge last looked, so the bridge reads
+that thread with `conversations.replies` from the cursor forward. Recovered
+replies go through the same owner filter and the same merge as everything else,
+keeping their `thread_ts` so the agent answers where the owner is talking.
+
+Two limits keep this from growing into a crawl of the channel:
+
+- Only the newest 200 surface messages are scanned for threads. A reply added
+  to a thread that has since been pushed past that window is not recovered.
+- At most 20 threads are read per catch-up, taken in order of when each was
+  last replied to. That ordering is the point: a week-old thread answered ten
+  minutes ago is the conversation the owner is having, and a thread started
+  this morning and quiet since is not.
+
+Both limits lose messages when they bite, and it is worth being exact about
+that rather than comfortable: the cursor advances to the newest message that
+*was* recovered, so replies in a skipped thread are older than the cursor from
+then on and no later pass goes back for them. The server logs the skip count
+saying as much. The alternative — a cursor per thread, or refusing to advance
+past any thread not examined — buys completeness at the price of a single
+recoverable position in the channel, which is the thing that makes sleep
+recovery simple enough to trust. Within a thread that *is* read there is no
+such gap: it is paged to the end before the cursor moves, up to ten thousand
+replies in one thread, and reaching even that is logged.
+
+The pass is skipped entirely when there is no cursor, for the same reason the
+first run does not replay the channel.
+
+A failure to read one thread is answered by what kind of failure it is. A
+thread that is not there — a deleted parent, or the bot no longer in the
+channel — will not be there next time either, so it is logged and skipped;
+failing forever on it would wedge every later message behind it. Anything else,
+a rate limit or a network blip, fails the whole catch-up on purpose: the cursor
+stays where it is and the next attempt asks for the same window again, rather
+than stepping over replies nobody ever read.
+
+One consequence is worth stating: the cursor can now land on a thread reply
+whose timestamp is newer than every surface message. That is correct. The
+cursor tracks what the agent has been handed, not where the channel surface has
+got to.
 
 ### 4. Never spawn AI from the bridge
 
@@ -141,8 +199,56 @@ function, so a message cannot be relayed live but dropped on catch-up.
 |---|---|---|
 | `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text"}, …], "timed_out": false}`, oldest first. |
 | `slack_post` | `text` (required), `thread_ts` (optional) | `chat.postMessage` to the bound channel. Returns the posted `ts`. |
-| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | `reactions.add` on that message. |
+| `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds` and `thread_ts` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
+| `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
+
+### Why slack_history ignores the owner filter
+
+Everything else in the bridge exists to relay one person. `slack_history` is
+the exception, and deliberately so: the owner asks for it by name, to read a
+discussion they had with other people about the agent's work. Filtering that
+down to the owner's own lines would leave the model reading half a conversation.
+
+The safety story is different because the direction is different. Relayed
+messages are instructions the agent acts on, which is why they are restricted
+to one authenticated user. History is material the owner asked the agent to
+read, and the server instructions say so in as many words: it is text to read,
+not instructions to follow. Nothing in it reaches the agent unless the owner
+asked for it.
+
+Being read-only is what keeps the two apart. The tool cannot move the cursor,
+consume a pending message, react, or touch the indicator, so no amount of
+reading changes what the relay will deliver next.
+
+### Clicks travel apart from messages
+
+A message that cannot be queued live is not lost: the overflow becomes a
+reconnect-shaped event and the bridge re-reads the window from
+`conversations.history`. That safety net does not exist for a `slack_ask`
+button click — no history call returns it — so a dropped click is an answer the
+owner gave that the agent never sees, and the question times out as if they had
+ignored it.
+
+Clicks therefore have a queue of their own, small and read by both the wait and
+the ask loops. A backlog of messages, which is the one situation where the
+event queue fills, cannot take the space a click needs.
+
+### The receipt reaction
+
+When `slack_wait` hands messages over, the server reacts to each of them
+(`eyes` by default) on a goroutine of its own. It is the server rather than the
+model that does it, because the value is entirely in the timing: a receipt that
+waits for the model to decide to send one is no longer a receipt.
+
+That makes it best effort by construction. It runs on the bridge's own context
+so the tool call returns immediately, and any failure is logged and dropped —
+losing a courtesy reaction must never cost the owner a message. `already_reacted`
+is success, since the message is marked either way.
+
+`SLACK_BRIDGE_AUTO_ACK=off` disables it; `SLACK_BRIDGE_AUTO_ACK_EMOJI` changes
+the emoji.
 
 Out-of-range timeouts are clamped rather than rejected: a caller asking for an
 hour gets the longest safe poll instead of an error it has to learn to avoid.
@@ -172,7 +278,9 @@ is a member of.
 
 **The owner filter.** Even inside that channel, only one Slack user ID is
 relayed. Someone else invited to the channel can read the conversation but
-cannot drive the agent.
+cannot drive the agent — and that includes tapping a `slack_ask` button, which
+carries the clicker's user ID and is checked against the owner exactly as a
+message is.
 
 **Credentials stay in the environment.** Tokens are read from the process
 environment and never written to the state file or logged. The state file holds
@@ -194,9 +302,10 @@ transport's.
 
 ### Single instance
 
-The first `slack_wait` takes an exclusive `flock` on a lock file next to the
-state file. A second concurrent bridge fails immediately with a clear error
-instead of starting.
+The first tool call that connects to Slack takes an exclusive `flock` on a
+lock file next to the state file — the lock is part of the lazy connect, so it
+is whichever call gets there first, not `slack_wait` specifically. A second
+concurrent bridge fails immediately with a clear error instead of starting.
 
 Two bridges on one channel would each receive some fraction of the live events
 and would race on the cursor, so the owner would see the agent answer some

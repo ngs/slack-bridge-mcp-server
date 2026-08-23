@@ -1,0 +1,51 @@
+# Slack app manifest for slack-bridge-mcp-server.
+#
+# Create the app from this file at https://api.slack.com/apps → Create New App
+# → From an app manifest, and it arrives with Socket Mode on, interactivity
+# enabled, the four bot scopes the server actually calls, and the one message
+# event it listens for.
+# You still have to generate the app-level token and install the app; see
+# docs/setup.md.
+#
+# This manifest is written for a PRIVATE bridge channel. For a public one,
+# replace groups:history with channels:history and message.groups with
+# message.channels.
+display_information:
+  name: Slack Bridge
+  description: Bridges a resident Claude CLI session to a private Slack channel
+  long_description: >-
+    slack-bridge-mcp-server relays messages between one private Slack channel
+    and a Claude CLI session running on your own machine, so you can talk to
+    that session from your phone. Only messages from the configured owner in
+    the configured channel are relayed.
+  background_color: "#1f2933"
+features:
+  bot_user:
+    display_name: slack-bridge
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      # chat.postMessage for replies, chat.update and chat.delete for the
+      # processing indicator. All three are covered by chat:write.
+      - chat:write
+      # conversations.history, used for catch-up after sleep or a restart.
+      - groups:history
+      # reactions.add: the automatic receipt reaction on every delivered
+      # message, and whatever slack_ack asks for on top of it.
+      - reactions:write
+      # users.info, which turns the user IDs in slack_history results into
+      # names. Optional in practice: without it the tool falls back to IDs.
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.groups
+  interactivity:
+    # Required for slack_ask: without it Slack refuses to deliver the button
+    # clicks. Socket Mode apps need no request URL, since the clicks arrive
+    # over the same WebSocket as the messages.
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
