@@ -795,9 +795,6 @@ type PostRequest struct {
 }
 
 // Post sends a message to a channel, connecting first if needed.
-//
-// The text is normalized from the Markdown models habitually write into the
-// mrkdwn Slack renders, so a reply is not delivered with its asterisks showing.
 func (b *Bridge) Post(ctx context.Context, req PostRequest) (string, error) {
 	if req.Text == "" {
 		return "", errors.New("text is required")
@@ -813,7 +810,7 @@ func (b *Bridge) Post(ctx context.Context, req PostRequest) (string, error) {
 		return "", err
 	}
 
-	ts, err := api.Post(ctx, b.channelFor(req.Channel), req.ThreadTS, normalizeMrkdwn(req.Text))
+	ts, err := api.Post(ctx, b.channelFor(req.Channel), req.ThreadTS, req.Text)
 	if err != nil {
 		// The answer never landed, so the agent is still on the hook for it
 		// and the channel should go back to saying so.

@@ -204,12 +204,25 @@ func toCandidate(channel string, m slack.Message) candidate {
 }
 
 func (w *webAPI) Post(ctx context.Context, channel, threadTS, text string) (string, error) {
-	options := []slack.MsgOption{slack.MsgOptionText(text, false)}
+	ts, err := w.postBody(ctx, channel, threadTS, markdownBody(text))
+	if err != nil && fitsMarkdownBlock(text) && rejectedForSize(err) {
+		// Slack measures the block's budget after expanding what it finds
+		// inside — an emoji becomes its :shortcode: — so a message can be
+		// within the character count and still be turned away. Sending it as
+		// plain text is what the bridge did before markdown blocks existed:
+		// the owner reads their answer with some markup showing, rather than
+		// not reading it at all.
+		return w.postBody(ctx, channel, threadTS, plainBody(text))
+	}
+	return ts, err
+}
+
+func (w *webAPI) postBody(ctx context.Context, channel, threadTS string, body []slack.MsgOption) (string, error) {
 	if threadTS != "" {
-		options = append(options, slack.MsgOptionTS(threadTS))
+		body = append(body, slack.MsgOptionTS(threadTS))
 	}
 
-	_, ts, err := w.client.PostMessageContext(ctx, channel, options...)
+	_, ts, err := w.client.PostMessageContext(ctx, channel, body...)
 	if err != nil {
 		return "", fmt.Errorf("chat.postMessage: %w", err)
 	}
@@ -227,12 +240,15 @@ func (w *webAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Q
 		))
 	}
 
+	// A question is capped at maxQuestionText, well inside the markdown
+	// block's budget, so it never needs the plain-text fallback a free-form
+	// post does.
 	options := []slack.MsgOption{
 		// The text is the notification fallback, which is what the owner's
-		// phone shows on the lock screen; the section block is the message.
+		// phone shows on the lock screen; the blocks are the message.
 		slack.MsgOptionText(q.Text, false),
 		slack.MsgOptionBlocks(
-			slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, q.Text, false, false), nil, nil),
+			slack.NewMarkdownBlock("", q.Text),
 			slack.NewActionBlock(q.BlockID, buttons...),
 		),
 	}
@@ -247,14 +263,18 @@ func (w *webAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Q
 	return ts, nil
 }
 
-// ResolveQuestion rewrites the question as plain text. The empty
-// MsgOptionBlocks is the part that matters: chat.update leaves the existing
-// blocks in place unless it is sent an explicit empty list, and blocks left
-// behind are buttons the owner can still click.
+// ResolveQuestion rewrites the question as a message with no buttons left in
+// it.
+//
+// Replacing the block list is the part that matters: chat.update leaves the
+// existing blocks in place unless it is sent a new list, and blocks left
+// behind are buttons the owner can still click. Sending the markdown block on
+// its own both retires the buttons and keeps the retired question rendered the
+// way the live one was.
 func (w *webAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) error {
 	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts,
 		slack.MsgOptionText(text, false),
-		slack.MsgOptionBlocks(),
+		slack.MsgOptionBlocks(slack.NewMarkdownBlock("", text)),
 	); err != nil {
 		return fmt.Errorf("chat.update: %w", err)
 	}

@@ -443,14 +443,9 @@ func buildQuestion(question string, options []string) (Question, []string, error
 		return Question{}, nil, fmt.Errorf("options must hold between %d and %d choices, got %d", MinAskOptions, MaxAskOptions, len(options))
 	}
 
-	// The question is the only mrkdwn here, and normalizing it before the
-	// Question is built means the rewrites that replace it later — answered,
-	// expired — quote the same text the owner first read. Option labels are
-	// left alone: they render as plain text on a button, where mrkdwn is not
-	// markup but literal asterisks.
 	q := Question{
 		BlockID: askBlockID,
-		Text:    truncate(normalizeMrkdwn(question), maxQuestionText),
+		Text:    truncate(question, maxQuestionText),
 		Options: make([]QuestionOption, 0, len(options)),
 	}
 	labels := make([]string, 0, len(options))

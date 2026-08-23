@@ -147,12 +147,18 @@ home channel — so a session that never leaves it never has to think about the
 argument. Messages come back with the channel they were sent in; pass it back
 with `thread_ts` and the reply lands in the conversation it answers.
 
-Outbound text — a `slack_post` message, a `slack_ask` question, a
-`slack_progress` label — is normalized from the Markdown models tend to write
-into the mrkdwn Slack renders, so `**bold**` arrives bold rather than arriving
-with its asterisks showing. Only bold, links and headings are converted; code
-spans and fenced blocks are left exactly as written, and anything ambiguous is
-left alone.
+`slack_post` messages and `slack_ask` questions go out as Block Kit
+[`markdown` blocks](https://docs.slack.dev/reference/block-kit/blocks/markdown-block),
+so they take standard Markdown — the dialect a model writes by habit — and let
+Slack render it: `**bold**`, `# headings`, tables and fenced code all arrive
+rendered instead of showing their markup. The text is sent as the message's
+`text` as well, which is the fallback Slack puts in push notifications.
+
+A markdown block holds 12,000 characters per message. A longer post goes as
+plain text instead, whole and unrendered: splitting it across blocks would not
+help, since the budget is for the whole message rather than for each block. The
+`slack_progress` label stays plain text too — it shares one line with a
+stopwatch, where there is nothing to render.
 
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
