@@ -14,13 +14,14 @@ import (
 // a glance and starts being a paragraph.
 const maxProgressLabel = 200
 
-// ProgressRequest is the status line to show, and where to show it if no
-// indicator is running yet.
+// ProgressRequest is the status line to show, and which conversation it
+// belongs to.
 type ProgressRequest struct {
 	Text string
-	// ThreadTS and Channel place an indicator this call has to start. They are
-	// ignored when one is already running, and an empty channel means the home
-	// channel.
+	// ThreadTS and Channel place the indicator. They start one here when none
+	// is running — an empty channel meaning the home channel — and move a
+	// running one that is somewhere else. Leaving both out labels the indicator
+	// wherever it already is.
 	ThreadTS string
 	Channel  string
 }
@@ -30,7 +31,9 @@ type ProgressRequest struct {
 // TS is the indicator message the label was attached to, and is left out
 // entirely when there is no message to name yet: the indicator posts on its own
 // goroutine, so a label given before the first post belongs to a message that
-// does not exist at the moment this call returns.
+// does not exist at the moment this call returns. A call that moves the
+// indicator is one of those, since the message at the new location has still to
+// be posted.
 type ProgressResult struct {
 	OK bool   `json:"ok"`
 	TS string `json:"ts,omitempty"`
@@ -50,10 +53,22 @@ type ProgressResult struct {
 // is where an agent that starts long work after a timed-out wait finds itself,
 // this starts one; it then retires like any other, on the next reply or wait.
 //
-// channel and threadTS only decide where a newly started indicator goes, and an
-// empty channel means the home one. An indicator that already exists belongs to
-// a turn that has already chosen its surface, and moving it would mean deleting
-// and reposting the message the owner is watching.
+// channel and threadTS say where the status belongs, and naming one is how a
+// running indicator is moved. The indicator starts wherever the owner last
+// spoke, which is a guess about what the agent is working on, and it is wrong
+// as soon as two topics interleave: the label for one conversation lands under
+// the other. So a call that names a different conversation retires the
+// indicator where it is and starts a fresh one there, carrying the label and
+// the original start time — the elapsed counter measures the turn, not the
+// message, and must not reset because the status moved.
+//
+// Only what the call names is changed: a request with a thread and no channel
+// moves within the channel the indicator is already in, since an argument left
+// out is not an argument to act on. The exception is a thread that would be
+// carried into a different channel, which is dropped — a thread belongs to its
+// channel, and means nothing in another one. A call naming nothing keeps
+// today's behaviour exactly and labels in place, so a session that never
+// leaves one conversation never has to think about any of this.
 //
 // The call's context is unused, unlike the other tools'. Labelling a running
 // indicator is a handful of assignments, and the posts and updates that follow
@@ -102,14 +117,73 @@ func (b *Bridge) Progress(_ context.Context, req ProgressRequest) (ProgressResul
 		b.mu.Unlock()
 	}
 
+	in = b.relocateIndicator(in, req.Channel, req.ThreadTS)
+
 	if in == nil {
-		// Nothing was started, which at this point means the indicator was
-		// turned off while this call was connecting. Same answer as above.
+		// Nothing to label: either the indicator was turned off while this call
+		// was connecting, or the turn ended while it was moving. Same answer as
+		// above.
 		return ProgressResult{}, nil
 	}
 
 	in.setLabel(label)
 	return ProgressResult{OK: true, TS: in.messageTS()}, nil
+}
+
+// relocateIndicator moves a running indicator to the conversation the call
+// named, and returns the indicator to label — the new one if it moved, the
+// original if it did not.
+//
+// The move is a retirement and a fresh start rather than an edit, because a
+// Slack message cannot change channel or thread: chat.update addresses a
+// message where it already is. Going through startIndicatorLocked is what
+// keeps that from being visible as two indicators at once — the outgoing
+// message is deleted, and the incoming one is handed its predecessor's done
+// channel and waits for it before posting, exactly as a new turn does.
+//
+// The original start time is carried over. The elapsed counter belongs to the
+// work the owner is waiting on, and that work did not restart because the
+// status line found a better place to sit.
+func (b *Bridge) relocateIndicator(in *indicator, channel, threadTS string) *indicator {
+	if in == nil || (channel == "" && threadTS == "") {
+		return in
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Something else retired or replaced the indicator while this call was
+	// working out what to do with it. Whatever is running now belongs to a
+	// turn this call knows nothing about, so it is labelled where it is rather
+	// than dragged somewhere on the strength of a stale decision.
+	if b.indicator != in {
+		return b.indicator
+	}
+
+	// An argument left out is not an argument to act on: a thread named
+	// without a channel moves within the channel the indicator is already in,
+	// not to the home channel.
+	target, targetThread := in.channel, in.threadTS
+	if channel != "" {
+		target = b.channelOr(channel)
+	}
+	switch {
+	case threadTS != "":
+		targetThread = threadTS
+	case target != in.channel:
+		// A thread identifies a message only within its own channel, so the
+		// one being carried means nothing in the channel this is moving to —
+		// at best Slack refuses the post, at worst it lands under whatever
+		// message over there happens to share the timestamp. A move across
+		// channels that names no thread goes to the new channel's surface.
+		targetThread = ""
+	}
+	if target == in.channel && targetThread == in.threadTS {
+		return in
+	}
+
+	b.startIndicatorLocked(in.startedAt, target, targetThread)
+	return b.indicator
 }
 
 // sanitizeProgressLabel renders the agent's status line as one short line of
