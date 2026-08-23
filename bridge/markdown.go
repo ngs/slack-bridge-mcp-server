@@ -54,6 +54,14 @@ func fitsMarkdownBlock(text string) bool {
 	return utf8.RuneCountInString(text) <= maxMarkdownBlock
 }
 
+// maxSectionBlock is what a section block's text holds, a quarter of what a
+// markdown block does. It bounds the fallback a refused question takes.
+const maxSectionBlock = 3000
+
+func fitsSectionBlock(text string) bool {
+	return utf8.RuneCountInString(text) <= maxSectionBlock
+}
+
 // rejectedForSize reports whether Slack turned this payload away for being too
 // big, which is the one failure a plain-text retry can fix.
 //

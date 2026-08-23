@@ -453,7 +453,11 @@ func buildQuestion(question string, options []string) (Question, []string, error
 	labels := make([]string, 0, len(options))
 
 	for i, option := range options {
-		label := truncate(strings.TrimSpace(option), maxOptionLabel)
+		// Flattened, not merely trimmed at the ends: a line break inside a
+		// label survives on the button, where plain_text keeps it, and is
+		// turned into a space wherever the label is quoted back as Markdown.
+		// One shape for both is worth more than the break.
+		label := truncate(flattenLines(strings.TrimSpace(option)), maxOptionLabel)
 		if label == "" {
 			return Question{}, nil, fmt.Errorf("option %d is empty; every choice needs a label", i)
 		}
@@ -466,6 +470,12 @@ func buildQuestion(question string, options []string) (Question, []string, error
 		labels = append(labels, label)
 	}
 	return q, labels, nil
+}
+
+// flattenLines turns every run of line breaks and surrounding blanks into a
+// single space.
+func flattenLines(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // answeredText is the question with the chosen answer under it.

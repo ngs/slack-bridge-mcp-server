@@ -320,10 +320,16 @@ func (w *webAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) 
 		return err
 	}
 
-	err = w.updateBlocks(ctx, channel, ts, text,
-		slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil))
-	if err == nil || !rejectedForSize(err, text) {
-		return err
+	// Skipped when the text would not fit a section either: a question is
+	// capped at maxQuestionText, but the resolved text carries a marker and an
+	// answer on top of it, and a step that cannot succeed is one more chance
+	// to fail before the buttons come off.
+	if fitsSectionBlock(text) {
+		err = w.updateBlocks(ctx, channel, ts, text,
+			slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil))
+		if err == nil || !rejectedForSize(err, text) {
+			return err
+		}
 	}
 
 	return w.updateBlocks(ctx, channel, ts, text)

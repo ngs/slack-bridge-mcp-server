@@ -487,3 +487,41 @@ func TestBridgePostHandsTheMarkdownOverUntouched(t *testing.T) {
 		t.Errorf("the bridge changed the text on the way out:\n got %q\nwant %q", posts[0].Text, text)
 	}
 }
+
+// A resolved question can outgrow a section block even though the question
+// itself was capped, because the marker and the answer are added to it. The
+// step that cannot succeed is skipped rather than spent.
+func TestResolveQuestionSkipsTheSectionWhenItCannotFit(t *testing.T) {
+	f, api := newFakeSlack(t,
+		`{"ok":false,"error":"msg_too_long"}`,
+		`{"ok":true,"channel":"C1","ts":"100.000900"}`,
+	)
+
+	text := strings.Repeat("a", maxSectionBlock+1)
+	if err := api.ResolveQuestion(context.Background(), "C1", "100.000900", text); err != nil {
+		t.Fatalf("ResolveQuestion() error = %v", err)
+	}
+
+	if len(f.calls) != 2 {
+		t.Fatalf("made %d calls, want the block attempt and then no blocks at all", len(f.calls))
+	}
+	if len(f.calls[1].Blocks) != 0 {
+		t.Errorf("second attempt blocks = %v, want the empty list that drops the buttons", blockTypes(f.calls[1]))
+	}
+}
+
+// A label showing on two lines on the button and on one in the resolution
+// would stop matching what the owner clicked, so it is one line from the
+// start.
+func TestBuildQuestionFlattensMultilineLabels(t *testing.T) {
+	_, labels, err := buildQuestion("Deploy?", []string{"yes\nplease", "no"})
+	if err != nil {
+		t.Fatalf("buildQuestion() error = %v", err)
+	}
+	if labels[0] != "yes please" {
+		t.Errorf("option label = %q, want the line break flattened to a space", labels[0])
+	}
+	if got := answeredText("Deploy?", labels[0]); !strings.Contains(got, "`yes please`") {
+		t.Errorf("answeredText() = %q, want it to quote the same one-line label", got)
+	}
+}
