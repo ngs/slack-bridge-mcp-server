@@ -472,10 +472,38 @@ func buildQuestion(question string, options []string) (Question, []string, error
 	return q, labels, nil
 }
 
-// flattenLines turns every run of line breaks and surrounding blanks into a
-// single space.
+// flattenLines replaces each run of whitespace that contains a line break with
+// a single space, and leaves every other run exactly as it was.
+//
+// Only the breaks: a label written with two spaces or a tab in it keeps them,
+// because plain_text would have shown them and nothing about quoting the
+// label later makes them a problem.
 func flattenLines(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for i := 0; i < len(s); {
+		if !isSpace(s[i]) {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		run := i
+		for i < len(s) && isSpace(s[i]) {
+			i++
+		}
+		if strings.ContainsAny(s[run:i], "\n\r") {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteString(s[run:i])
+	}
+	return b.String()
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
 }
 
 // answeredText is the question with the chosen answer under it.

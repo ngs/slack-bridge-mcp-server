@@ -521,6 +521,19 @@ func TestBuildQuestionFlattensMultilineLabels(t *testing.T) {
 	if labels[0] != "yes please" {
 		t.Errorf("option label = %q, want the line break flattened to a space", labels[0])
 	}
+
+	// Only the breaks. Spacing the caller chose is spacing the button would
+	// have shown.
+	_, spaced, err := buildQuestion("Deploy?", []string{"go  now", "wait\ta bit", "no"})
+	if err != nil {
+		t.Fatalf("buildQuestion() error = %v", err)
+	}
+	if spaced[0] != "go  now" {
+		t.Errorf("option label = %q, want the double space kept", spaced[0])
+	}
+	if spaced[1] != "wait\ta bit" {
+		t.Errorf("option label = %q, want the tab kept", spaced[1])
+	}
 	if got := answeredText("Deploy?", labels[0]); !strings.Contains(got, "`yes please`") {
 		t.Errorf("answeredText() = %q, want it to quote the same one-line label", got)
 	}
