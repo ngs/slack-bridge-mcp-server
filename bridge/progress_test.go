@@ -382,4 +382,11 @@ func TestProgressLabelIsTruncated(t *testing.T) {
 	if got := sanitizeProgressLabel(exact); got != exact {
 		t.Errorf("a label of exactly %d runes was altered: %q", maxProgressLabel, got)
 	}
+
+	// A model that pastes a log file gets the same one line as everyone else,
+	// and the sanitizer stops reading it long before the end.
+	huge := strings.Repeat("stack frame ", 100_000)
+	if n := utf8.RuneCountInString(sanitizeProgressLabel(huge)); n != maxProgressLabel {
+		t.Errorf("a %d-rune label came back as %d runes, want %d", utf8.RuneCountInString(huge), n, maxProgressLabel)
+	}
 }

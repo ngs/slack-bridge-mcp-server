@@ -111,6 +111,7 @@ func (b *Bridge) Progress(_ context.Context, text, threadTS string) (ProgressRes
 func sanitizeProgressLabel(s string) string {
 	var b strings.Builder
 	space := false
+	kept := 0
 
 	for _, r := range s {
 		if unicode.IsSpace(r) || !unicode.IsPrint(r) {
@@ -121,9 +122,18 @@ func sanitizeProgressLabel(s string) string {
 		}
 		if space {
 			b.WriteRune(' ')
+			kept++
 			space = false
 		}
 		b.WriteRune(r)
+		kept++
+
+		if kept > maxProgressLabel {
+			// One rune past the cap already settles it, and the rest of
+			// whatever this is — a stack trace, a log file — does not need
+			// copying to find that out.
+			break
+		}
 	}
 
 	return truncateRunes(b.String(), maxProgressLabel)
