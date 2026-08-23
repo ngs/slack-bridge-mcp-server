@@ -147,6 +147,12 @@ home channel — so a session that never leaves it never has to think about the
 argument. Messages come back with the channel they were sent in; pass it back
 with `thread_ts` and the reply lands in the conversation it answers.
 
+`slack_progress` is the one exception, and only while an indicator is running:
+there the omitted `channel` means the channel that indicator is already in
+rather than the home one, because the argument is asking whether to move it.
+With nothing running it starts one, and an omitted `channel` means home as
+everywhere else.
+
 Outbound text — a `slack_post` message, a `slack_ask` question, a
 `slack_progress` label — is normalized from the Markdown models tend to write
 into the mrkdwn Slack renders, so `**bold**` arrives bold rather than arriving
