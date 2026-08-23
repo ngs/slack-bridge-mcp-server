@@ -134,6 +134,35 @@ func TestProgressStillWaitsForTheOutgoingIndicator(t *testing.T) {
 	}
 }
 
+// The label wakes the indicator's goroutine, and the reply that ends the turn
+// can land before it gets there — leaving "post now" and "stop" ready at the
+// same moment. select picks between ready cases at random, so this only failed
+// half the time, and what it left behind was a "⏳ Working…" posted after the
+// answer it was standing in for.
+func TestALabelledIndicatorStoppedBeforeItPostsStaysQuiet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	// Long enough that only the label could bring the post forward.
+	b.cfg.IndicatorGrace = 60 * time.Second
+
+	waitForMessages(ctx, t, b)
+
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+	// The answer arrives before the goroutine has acted on the label.
+	if _, err := b.Post(ctx, PostRequest{Text: "done already"}); err != nil {
+		t.Fatalf("Post() error = %v", err)
+	}
+
+	time.Sleep(10 * testGrace)
+	if got := indicatorPosts(api); len(got) != 0 {
+		t.Errorf("indicator posted %+v after the turn had ended, want nothing", got)
+	}
+}
+
 // Long work does not always start inside a turn: a wait that timed out leaves
 // the agent working with nothing counting in the channel. Saying so has to be
 // enough to start the indicator.

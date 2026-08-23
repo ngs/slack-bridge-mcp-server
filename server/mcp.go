@@ -122,7 +122,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_wait",
 		Title:       "Wait for a Slack message",
-		Description: "Block until the owner sends a message to the bridged Slack channel, or the timeout expires. Returns any messages missed while the session was down. Marks what it delivers as received, and starts the progress indicator, so it is not a read-only call.",
+		Description: "Block until the owner sends a message, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. Returns any messages missed while the session was down. Marks what it delivers as received, and starts the progress indicator, so it is not a read-only call.",
 		// Not ReadOnlyHint: delivering messages reacts to them and starts the
 		// elapsed-time indicator, both of which write to the channel. A client
 		// may use that hint to decide what to allow without asking.
@@ -141,7 +141,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_post",
 		Title:       "Post to Slack",
-		Description: "Send a message to the bridged Slack channel, optionally as a reply inside a thread.",
+		Description: "Send a message, optionally as a reply inside a thread. Pass the channel and thread_ts of the message you are answering so the reply lands in that conversation; without a channel it goes to the owner's home channel. Returns the posted ts and the channel it went to.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args PostArgs) (*mcp.CallToolResult, PostResult, error) {
 		ts, err := b.Post(ctx, bridge.PostRequest{Text: args.Text, ThreadTS: args.ThreadTS, Channel: args.Channel})
@@ -160,7 +160,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_ack",
 		Title:       "Acknowledge a Slack message",
-		Description: "Add an emoji reaction to a message. Receipt is already marked automatically for everything slack_wait returns, so use this for a deliberate signal beyond that, with the emoji you mean.",
+		Description: "Add an emoji reaction to a message, in the channel the message is in — a ts means nothing anywhere else, so pass the channel unless it is the home one. Receipt is already marked automatically for everything slack_wait returns, so use this for a deliberate signal beyond that, with the emoji you mean.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args AckArgs) (*mcp.CallToolResult, AckResult, error) {
 		emoji := args.Emoji
@@ -176,7 +176,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_ask",
 		Title:       "Ask the owner a question",
-		Description: "Post a multiple-choice question to the bridged Slack channel and block until the owner taps an answer, or the timeout expires. Returns the chosen option.",
+		Description: "Post a multiple-choice question and block until the owner taps an answer, or the timeout expires. Ask in the conversation you are having — pass its channel and thread_ts — and it defaults to the home channel. Returns the chosen option.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args AskArgs) (*mcp.CallToolResult, bridge.AskResult, error) {
 		result, err := b.Ask(ctx, bridge.AskRequest{
@@ -195,7 +195,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_history",
 		Title:       "Read the Slack channel",
-		Description: "Read recent messages from the bridged channel, or one thread of it, from every author including other people and bots. For when the owner asks you to read or summarise the channel. Changes nothing: it does not consume messages slack_wait would deliver.",
+		Description: "Read recent messages from a channel, or one thread of it, from every author including other people and bots. Reads the home channel unless you name another. For when the owner asks you to read or summarise the channel. Changes nothing: it does not consume messages slack_wait would deliver.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args HistoryArgs) (*mcp.CallToolResult, bridge.HistoryResult, error) {
 		result, err := b.History(ctx, bridge.ReadRequest{

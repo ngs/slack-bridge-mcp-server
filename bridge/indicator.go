@@ -137,6 +137,13 @@ func (in *indicator) run() {
 	case <-grace.C:
 	}
 
+	// A nudge and a stop can be ready in the same instant, and select picks
+	// between ready cases at random. The stop wins: a turn that has ended must
+	// not put a message in the channel, however recently it was labelled.
+	if in.stopping() {
+		return
+	}
+
 	// The indicator this one replaces may still be deleting its message —
 	// chat.delete is allowed several seconds, which can outlast a short grace
 	// period. Posting before it finishes would put two indicators in the
@@ -179,14 +186,36 @@ func (in *indicator) run() {
 			in.tick(ts)
 		case <-ticker.C:
 			in.tick(ts)
+
 		}
+	}
+}
+
+// stopping reports that the indicator has been told to wind down, or that the
+// session is going away. It is the tie-breaker wherever a stop can be ready at
+// the same moment as something else, since select does not rank its cases.
+func (in *indicator) stopping() bool {
+	select {
+	case <-in.stopped:
+		return true
+	case <-in.ctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
 // tick redraws the message, and treats a failure as nothing worse than a stale
 // line: one bad update is not worth tearing the indicator down, and the next
 // one may well land.
+//
+// A tick that finds the indicator already stopped does nothing: the message is
+// about to be deleted, and an update racing the delete is one Slack call that
+// can only fail.
 func (in *indicator) tick(ts string) {
+	if in.stopping() {
+		return
+	}
 	if err := in.update(ts); err != nil {
 		log.Printf("could not update the processing indicator: %s", logSafe(err.Error(), maxLoggedError))
 	}
