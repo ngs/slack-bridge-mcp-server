@@ -176,7 +176,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	for {
 		select {
 		case choice := <-ask.answered:
-			b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
+			b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 			// The answer is new work handed to the agent, exactly like the
 			// messages slack_wait returns, so the clock starts again here —
 			// and in the thread the question was asked in, which is where the
@@ -188,7 +188,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask, stream); ok {
-				b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
+				b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 				b.startIndicator(channel, threadTS)
 				return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
 			}
@@ -443,20 +443,21 @@ func buildQuestion(question string, options []string) (Question, []string, error
 		return Question{}, nil, fmt.Errorf("options must hold between %d and %d choices, got %d", MinAskOptions, MaxAskOptions, len(options))
 	}
 
-	// The question is the only mrkdwn here, and normalizing it before the
-	// Question is built means the rewrites that replace it later — answered,
-	// expired — quote the same text the owner first read. Option labels are
-	// left alone: they render as plain text on a button, where mrkdwn is not
-	// markup but literal asterisks.
+	// Option labels stay exactly as written: they render as plain text on a
+	// button, where Markdown is not markup but literal asterisks.
 	q := Question{
 		BlockID: askBlockID,
-		Text:    truncate(normalizeMrkdwn(question), maxQuestionText),
+		Text:    truncate(question, maxQuestionText),
 		Options: make([]QuestionOption, 0, len(options)),
 	}
 	labels := make([]string, 0, len(options))
 
 	for i, option := range options {
-		label := truncate(strings.TrimSpace(option), maxOptionLabel)
+		// Flattened, not merely trimmed at the ends: a line break inside a
+		// label survives on the button, where plain_text keeps it, and is
+		// turned into a space wherever the label is quoted back as Markdown.
+		// One shape for both is worth more than the break.
+		label := truncate(flattenLines(strings.TrimSpace(option)), maxOptionLabel)
 		if label == "" {
 			return Question{}, nil, fmt.Errorf("option %d is empty; every choice needs a label", i)
 		}
@@ -469,6 +470,50 @@ func buildQuestion(question string, options []string) (Question, []string, error
 		labels = append(labels, label)
 	}
 	return q, labels, nil
+}
+
+// flattenLines replaces each run of whitespace that contains a line break with
+// a single space, and leaves every other run exactly as it was.
+//
+// Only the breaks: a label written with two spaces or a tab in it keeps them,
+// because plain_text would have shown them and nothing about quoting the
+// label later makes them a problem.
+func flattenLines(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for i := 0; i < len(s); {
+		if !isSpace(s[i]) {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		run := i
+		for i < len(s) && isSpace(s[i]) {
+			i++
+		}
+		if strings.ContainsAny(s[run:i], "\n\r") {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteString(s[run:i])
+	}
+	return b.String()
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
+
+// answeredText is the question with the chosen answer under it.
+//
+// The label is quoted literally because it was chosen on a button, where
+// plain_text showed it exactly as the caller wrote it. The resolved question
+// is Markdown, where an option like **yes** would arrive in bold, <https://x>
+// as a link and :shipit: as a picture — none of them what the owner clicked.
+func answeredText(question, label string) string {
+	return fmt.Sprintf("%s\n\n✅ %s", question, literal(label))
 }
 
 // truncate shortens a string to limit characters, spending the last one on an

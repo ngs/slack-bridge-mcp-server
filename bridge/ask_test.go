@@ -98,7 +98,9 @@ func TestAskReturnsTheClickedOption(t *testing.T) {
 	if len(resolutions) != 1 {
 		t.Fatalf("Ask() resolved the question %d times, want 1", len(resolutions))
 	}
-	if !strings.Contains(resolutions[0].Text, "✅ No") || resolutions[0].TS != askTS {
+	// The label is quoted literally: it was chosen on a plain_text button, and
+	// the resolved question is Markdown.
+	if !strings.Contains(resolutions[0].Text, "✅ `No`") || resolutions[0].TS != askTS {
 		t.Errorf("resolution = %+v, want the chosen option shown on the question message", resolutions[0])
 	}
 }

@@ -78,10 +78,7 @@ type ProgressResult struct {
 // open yet; that runs on the bridge's context too, as it does for every other
 // tool.
 func (b *Bridge) Progress(_ context.Context, req ProgressRequest) (ProgressResult, error) {
-	// Normalized before sanitizing, while the text still has the line breaks a
-	// heading marker is recognised by; what survives is then flattened onto the
-	// single line the indicator has room for.
-	label := sanitizeProgressLabel(normalizeMrkdwn(req.Text))
+	label := sanitizeProgressLabel(req.Text)
 	if label == "" {
 		return ProgressResult{}, errors.New("text is required")
 	}

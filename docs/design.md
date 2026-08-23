@@ -462,8 +462,11 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
   conversation, which belongs to the agent and not to the transport; nothing is
   written to disk, and the `files:read` scope stays optional for anyone who
   never wants the bytes.
-- **Block Kit and interactive components.** Replies are plain mrkdwn. No
-  buttons, no modals, no slash commands, and so no interactivity payloads to
-  handle.
+- **Block Kit beyond what a reply needs.** Messages go out as a markdown block,
+  and `slack_ask` adds one actions block of buttons. A reply too big for a
+  block falls back to the message body, where only Slack's mrkdwn applies; a
+  question Slack will not render falls back to a section block, keeping its
+  buttons. No modals, no slash commands, and no interactivity payloads beyond a
+  button click.
 - **Editing and deletion.** `message_changed` and `message_deleted` are ignored;
   an edited message is not re-delivered.

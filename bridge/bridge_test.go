@@ -105,7 +105,13 @@ func (f *fakeAPI) JoinedChannels(_ context.Context, limit int) ([]string, error)
 
 // postCall records one chat.postMessage, TS included: a test that checks the
 // right message was deleted has to be able to tell the messages apart.
-type postCall struct{ Channel, ThreadTS, Text, TS string }
+type postCall struct {
+	Channel, ThreadTS, Text, TS string
+	// Plain records that this went through PostPlain rather than Post, which
+	// is the difference between an indicator that can be updated and one
+	// frozen behind its own block.
+	Plain bool
+}
 type questionCall struct {
 	Channel  string
 	ThreadTS string
@@ -262,6 +268,20 @@ func (f *fakeAPI) nextPostTSLocked() string {
 		return f.postTS + "-" + strconv.Itoa(n)
 	}
 	return strconv.FormatInt(seconds, 10) + "." + fmt.Sprintf("%06d", sequence+int64(n))
+}
+
+func (f *fakeAPI) PostPlain(_ context.Context, channel, threadTS, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.postErr != nil {
+		f.posts = append(f.posts, postCall{Channel: channel, ThreadTS: threadTS, Text: text, Plain: true})
+		return "", f.postErr
+	}
+
+	ts := f.nextPostTSLocked()
+	f.posts = append(f.posts, postCall{Channel: channel, ThreadTS: threadTS, Text: text, TS: ts, Plain: true})
+	return ts, nil
 }
 
 func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {

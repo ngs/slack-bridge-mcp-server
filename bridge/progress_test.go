@@ -692,3 +692,55 @@ func TestMovingToAThreadInAnotherChannelKeepsThatThread(t *testing.T) {
 		t.Errorf("moved indicator posted as %+v, want thread 100.000700 of C0ELSEWHERE", moved)
 	}
 }
+
+// The indicator must not go out with blocks on it. It is updated with text
+// alone, and Slack keeps the blocks of a message an update does not mention,
+// so a block would freeze the stopwatch at whatever it said when it was
+// posted. Asserting the method, not just the text: the two differ only in
+// whether the message carries a block, which the fake cannot show any other
+// way.
+func TestTheIndicatorPostsWithoutBlocks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if got := indicatorPosts(api)[0]; !got.Plain {
+		t.Errorf("indicator posted through Post, want PostPlain so a later text-only update replaces it: %+v", got)
+	}
+
+	// The contrast that gives the assertion meaning: an agent's reply does
+	// take the rendered path.
+	if _, err := b.Post(ctx, PostRequest{Text: "**done**"}); err != nil {
+		t.Fatalf("Post() error = %v", err)
+	}
+	replies := agentPosts(api)
+	if len(replies) != 1 {
+		t.Fatalf("agent posts = %d, want the one reply", len(replies))
+	}
+	if replies[0].Plain {
+		t.Error("the reply went through PostPlain, want the rendered path")
+	}
+}
+
+// The label is no longer rewritten on its way to the indicator. Nothing else
+// pins that: every other Progress test uses a label with no markup in it.
+func TestProgressLabelIsNotRewritten(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	const label = "# **release chain**: waiting for [CI](https://ci.example)"
+	if _, err := b.Progress(ctx, ProgressRequest{Text: label}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the label to reach the indicator", func() bool {
+		return strings.Contains(lastIndicatorUpdate(api), label)
+	})
+}

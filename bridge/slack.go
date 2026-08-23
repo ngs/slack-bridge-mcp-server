@@ -54,13 +54,14 @@ type RepliesRequest struct {
 	Limit    int
 }
 
-// Question is the message slack_ask posts: one line of mrkdwn and one button
+// Question is the message slack_ask posts: one line of Markdown and one button
 // per option. It is a plain description of the Block Kit payload so the bridge
 // never has to name a slack-go type; slackclient.go turns it into blocks.
 type Question struct {
 	// BlockID identifies the actions block, and comes back on every click.
 	BlockID string
-	// Text is the question itself, as Slack mrkdwn.
+	// Text is the question itself, as standard Markdown: it goes into a
+	// markdown block, which is Slack's own renderer for it.
 	Text string
 	// Options are the buttons, in the order the owner sees them.
 	Options []QuestionOption
@@ -91,9 +92,19 @@ type API interface {
 	// the connection was opened. A mention is that ID appearing in the text, so
 	// the bridge cannot recognise one without it.
 	BotUserID() string
-	// Post sends a message to a channel, optionally into a thread, and
-	// returns the timestamp of the posted message.
+	// Post sends an agent-written message to a channel, optionally into a
+	// thread, and returns the timestamp of the posted message. The text is
+	// Markdown, and Slack renders it — except when it is too long for that,
+	// where an implementation may fall back to sending it as the body, with
+	// only Slack's own mrkdwn applied.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)
+	// PostPlain sends a message as the body text alone, with no blocks, so a
+	// later text-only Update replaces all of what the channel shows. It
+	// exists for the bridge's own furniture — the processing indicator — which
+	// a block would freeze in place, since an update carrying no blocks leaves
+	// the ones already on the message standing. Slack's own mrkdwn still
+	// applies to the text; what it does not get is Markdown.
+	PostPlain(ctx context.Context, channel, threadTS, text string) (string, error)
 	// PostQuestion sends a question with clickable answers and returns the
 	// timestamp of the posted message.
 	PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error)
@@ -101,9 +112,10 @@ type API interface {
 	React(ctx context.Context, channel, ts, emoji string) error
 	// Update rewrites the text of a message the bridge posted.
 	Update(ctx context.Context, channel, ts, text string) error
-	// ResolveQuestion rewrites a question to plain text and removes its
-	// buttons, which is how an answered or expired question stops being
-	// clickable.
+	// ResolveQuestion rewrites an answered or expired question and removes
+	// its buttons, which is how it stops being clickable. The text is
+	// Markdown, rendered as the live question was; an implementation that
+	// cannot render it must still drop the buttons.
 	ResolveQuestion(ctx context.Context, channel, ts, text string) error
 	// Delete removes a message the bridge posted.
 	Delete(ctx context.Context, channel, ts string) error

@@ -99,6 +99,18 @@ func waitForMessages(ctx context.Context, t *testing.T, b *Bridge) {
 
 // indicatorPost finds the indicator among the fake's posts. The reply the agent
 // sends is a post too, so they are told apart by their text.
+// agentPosts is indicatorPosts' complement: what the agent itself said, as
+// opposed to the bridge's own furniture.
+func agentPosts(api *fakeAPI) []postCall {
+	var found []postCall
+	for _, p := range api.snapshotPosts() {
+		if !strings.HasPrefix(p.Text, "⏳") {
+			found = append(found, p)
+		}
+	}
+	return found
+}
+
 func indicatorPosts(api *fakeAPI) []postCall {
 	var found []postCall
 	for _, p := range api.snapshotPosts() {
