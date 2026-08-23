@@ -314,9 +314,10 @@ channel and has not been reinstalled since, so `users.conversations` — or
 reading a page of a channel that is not the home one — is refused. The bridge
 says so once and turns that catch-up off for the rest of the connection rather
 than failing the calls around it: the home channel, the live stream and every
-other tool go on working. Add `channels:read`, `groups:read` and
-`channels:history` under **OAuth & Permissions**, reinstall, and restart the
-session — the next connection tries again.
+other tool go on working. Add `channels:read` and `groups:read` under **OAuth &
+Permissions** — plus `channels:history` and `groups:history` for the public and
+private channels it should be reading — then reinstall and restart the session:
+the next connection tries again.
 
 **`slack_history` shows user IDs instead of names.** The `users:read` scope is
 missing. Add it under **OAuth & Permissions** and reinstall the app — a scope,

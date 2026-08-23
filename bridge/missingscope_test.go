@@ -220,6 +220,35 @@ func TestALaterConnectionRetriesTheScan(t *testing.T) {
 	}
 }
 
+// Catch-up runs with the lock released, so a slow one can outlive the
+// connection it belongs to. What it reports about that installation says
+// nothing about the connection that replaced it — which, after a reinstall, is
+// exactly the one whose scan must run.
+func TestAStaleRefusalDoesNotDegradeTheNextConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	waitFor(ctx, t, b)
+
+	b.mu.Lock()
+	stale := b.connGeneration
+	// The connection is replaced while a catch-up on the old one is still out.
+	b.connGeneration++
+	current := b.connGeneration
+	b.mu.Unlock()
+
+	logs := captureLog(t)
+	b.degradeConversations(stale, missingScope("users.conversations"))
+
+	if b.conversationsAreDegraded(current) {
+		t.Error("a refusal from the previous connection switched off the new connection's scan")
+	}
+	if notices := degradationNotices(logs); notices != 0 {
+		t.Errorf("the log carries %d degradation notices for a connection that is gone, want 0", notices)
+	}
+}
+
 // The client is what decides a failure is a missing scope, and it has to tell
 // that one apart from the failures worth retrying.
 func TestMissingScopeIsRecognisedOnTheWire(t *testing.T) {

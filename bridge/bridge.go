@@ -99,11 +99,17 @@ type Bridge struct {
 	// mentionCursor is how far through time the search for missed mentions has
 	// looked.
 	mentionCursor string
-	// conversationsDegraded is set when Slack refuses the catch-up outside the
-	// home channel for want of a scope. It lasts as long as the connection
-	// because that is how long the answer can stay the same: scopes arrive with
-	// a reinstall, and a reinstall is a new connection, which tries again.
-	conversationsDegraded bool
+	// connGeneration counts the connections this bridge has opened, starting at
+	// one. A catch-up runs without b.mu held and can still be in flight when the
+	// connection under it is replaced, so what it reports is tagged with the
+	// generation it belongs to and ignored if that generation is over.
+	connGeneration uint64
+	// degradedGeneration is the connection whose catch-up outside the home
+	// channel was refused for want of a scope; zero is none. It is a generation
+	// rather than a flag because the answer only lasts as long as the
+	// connection: scopes arrive with a reinstall, and a reinstall is a new
+	// connection, which tries again.
+	degradedGeneration uint64
 	// indicator is the live "⏳ Working…" message, if one is running. At most
 	// one exists at a time; see indicator.go.
 	indicator *indicator
@@ -262,8 +268,9 @@ func (b *Bridge) ensure() error {
 	b.stream = stream
 	b.connected = true
 	// A fresh connection is the one moment the scopes can have changed, so the
-	// catch-up outside the home channel is offered another go.
-	b.conversationsDegraded = false
+	// catch-up outside the home channel is offered another go — and anything the
+	// old connection is still doing no longer speaks for this one.
+	b.connGeneration++
 	// The first catch-up covers everything missed since the last session;
 	// StreamConnected events later cover reconnects.
 	b.needCatchUp = true
@@ -420,6 +427,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	b.mu.Lock()
 	needCatchUp := b.needCatchUp
 	api := b.api
+	generation := b.connGeneration
 	lastTS := b.lastTS
 	channel := b.cfg.Channel
 	owner := b.cfg.Owner
@@ -447,7 +455,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 		// Everywhere else: the conversations opened by a mention, and any
 		// mention that opened one while nobody was listening.
 		var err error
-		conversations, err = b.catchUpConversations(ctx, api, owner)
+		conversations, err = b.catchUpConversations(ctx, api, owner, generation)
 		if err != nil {
 			return nil, err
 		}
