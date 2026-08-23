@@ -630,3 +630,57 @@ func TestProgressMovesWithinTheCurrentChannelWhenOnlyAThreadIsNamed(t *testing.T
 		t.Errorf("moved indicator posted as %+v, want thread 100.000700 of C0ELSEWHERE", moved)
 	}
 }
+
+// A thread_ts identifies a message only within its own channel. Carrying the
+// current one into a different channel would at best have Slack refuse the
+// post, and at worst hang the indicator off whatever message over there shares
+// the timestamp — so a move across channels that names no thread lands on the
+// new channel's surface.
+func TestMovingToAnotherChannelLeavesTheOldThreadBehind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	// The turn is happening inside a thread of the home channel.
+	b.startIndicatorAt(time.Now(), testChannel, "100.000200")
+	eventually(t, "the indicator to post in the thread", func() bool { return len(indicatorPosts(api)) == 2 })
+
+	// The work has moved to a different channel, and the call says so without
+	// naming a thread over there.
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, Channel: "C0ELSEWHERE"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to move to the other channel", func() bool { return len(indicatorPosts(api)) == 3 })
+	moved := indicatorPosts(api)[2]
+	if moved.Channel != "C0ELSEWHERE" {
+		t.Errorf("moved indicator posted in %q, want C0ELSEWHERE", moved.Channel)
+	}
+	if moved.ThreadTS != "" {
+		t.Errorf("moved indicator posted into thread %q, want the channel surface: that thread belongs to %s", moved.ThreadTS, testChannel)
+	}
+}
+
+// Naming both means both are honoured, thread included, which is the ordinary
+// way an agent says where the work it is doing lives.
+func TestMovingToAThreadInAnotherChannelKeepsThatThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, Channel: "C0ELSEWHERE", ThreadTS: "100.000700"}); err != nil {
+		t.Fatalf("Progress() error = %v", err)
+	}
+
+	eventually(t, "the indicator to move", func() bool { return len(indicatorPosts(api)) == 2 })
+	moved := indicatorPosts(api)[1]
+	if moved.Channel != "C0ELSEWHERE" || moved.ThreadTS != "100.000700" {
+		t.Errorf("moved indicator posted as %+v, want thread 100.000700 of C0ELSEWHERE", moved)
+	}
+}

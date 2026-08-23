@@ -303,7 +303,12 @@ showing it. What the call does not name it does not change: a thread with no
 channel moves within the current channel rather than defaulting to the home one,
 which is the one place in the API where an omitted `channel` does not mean
 "home" — an indicator has a channel already, and this argument says whether to
-change it.
+change it. The symmetric case does not hold, though, and is the exception to
+the rule: a thread cannot be carried into a different channel, because a
+`thread_ts` identifies a message only within its own channel. Taking it along
+would at best have Slack refuse the post and at worst attach the indicator to
+whatever message over there shares the timestamp, so a move across channels
+that names no thread goes to the new channel's surface.
 
 ### Why slack_history ignores the owner filter
 

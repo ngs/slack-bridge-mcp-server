@@ -139,7 +139,7 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts`, `channel` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
-| `slack_progress` | `text` (required), `thread_ts` and `channel` (optional — where the status belongs; they start the indicator, or move a running one) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the indicator is turned off. |
+| `slack_progress` | `text` (required), `thread_ts` and `channel` (optional — where the status belongs; they start the indicator, or move a running one) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the label had nowhere to go: the indicator is turned off, or the turn ended before it could be applied. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
 Every tool that speaks takes an optional `channel`, and leaving it out means the
@@ -303,8 +303,11 @@ naming a different conversation moves the indicator into it: the message
 standing in the wrong place is deleted and a new one appears in the right one,
 still counting from when the work started rather than from the move. Only what
 you name changes — a `thread_ts` with no `channel` moves within the channel the
-indicator is already in — and a call that names nothing labels it where it is,
-which is what a session talking in one place only ever needs.
+indicator is already in — with one exception: a thread cannot come along to a
+different channel, since it identifies a message only within its own, so a move
+across channels that names no thread goes to the new channel's surface. A call
+that names nothing labels the indicator where it is, which is what a session
+talking in one place only ever needs.
 
 With `SLACK_BRIDGE_INDICATOR=off` there is nowhere to put a label, so the call
 does nothing and answers `{"ok": false}`.

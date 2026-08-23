@@ -64,9 +64,11 @@ type ProgressResult struct {
 //
 // Only what the call names is changed: a request with a thread and no channel
 // moves within the channel the indicator is already in, since an argument left
-// out is not an argument to act on. A call naming nothing keeps today's
-// behaviour exactly and labels in place, so a session that never leaves one
-// conversation never has to think about any of this.
+// out is not an argument to act on. The exception is a thread that would be
+// carried into a different channel, which is dropped — a thread belongs to its
+// channel, and means nothing in another one. A call naming nothing keeps
+// today's behaviour exactly and labels in place, so a session that never
+// leaves one conversation never has to think about any of this.
 //
 // The call's context is unused, unlike the other tools'. Labelling a running
 // indicator is a handful of assignments, and the posts and updates that follow
@@ -165,8 +167,16 @@ func (b *Bridge) relocateIndicator(in *indicator, channel, threadTS string) *ind
 	if channel != "" {
 		target = b.channelOr(channel)
 	}
-	if threadTS != "" {
+	switch {
+	case threadTS != "":
 		targetThread = threadTS
+	case target != in.channel:
+		// A thread identifies a message only within its own channel, so the
+		// one being carried means nothing in the channel this is moving to —
+		// at best Slack refuses the post, at worst it lands under whatever
+		// message over there happens to share the timestamp. A move across
+		// channels that names no thread goes to the new channel's surface.
+		targetThread = ""
 	}
 	if target == in.channel && targetThread == in.threadTS {
 		return in
