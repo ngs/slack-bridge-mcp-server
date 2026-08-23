@@ -31,18 +31,27 @@ const (
 
 // Bounds on the thread pass of catch-up. threadScanLimit is how far back the
 // bridge looks for threads that have been replied to; maxThreadsPerCatchUp is
-// how many of those it will actually read. Together they put a ceiling of
-// twenty-one API calls on recovering a night's worth of threaded conversation.
+// how many of those it will actually read.
+//
+// The worst case is one scan plus twenty threads of up to maxHistoryPages
+// each — 101 calls, or 106 with the surface catch-up — and it takes twenty
+// separate threads each replied to since the cursor, with hundreds of replies
+// in them, to get there. A typical reconnect makes one call and finds nothing
+// to read. The pass is bounded rather than budgeted deliberately: a budget
+// spent halfway through a thread would leave the cursor advancing over replies
+// that were never read, which is the failure this whole pass exists to stop.
 const (
 	threadScanLimit      = 200
 	maxThreadsPerCatchUp = 20
 )
 
-// shutdownIndicatorWait is how long Close waits for the indicator to delete
-// its message. It is the indicator's own delete timeout plus a margin, so the
-// wait ends because the delete finished or failed, not because the two clocks
-// disagreed.
-const shutdownIndicatorWait = indicatorDeleteTimeout + 2*time.Second
+// shutdownIndicatorWait is how long Close waits for the indicator to clear
+// itself from the channel. It covers the whole of what the indicator can still
+// be doing when it is told to stop — a post or update already in flight,
+// followed by the delete that finishes the job — plus a margin, so the wait
+// ends because the work finished or failed rather than because the clocks
+// disagreed and the process exited mid-cleanup.
+const shutdownIndicatorWait = indicatorRequestTimeout + indicatorDeleteTimeout + 2*time.Second
 
 // Bridge owns the Slack connection and the message cursor. All six MCP tools
 // go through it.

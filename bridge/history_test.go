@@ -219,6 +219,81 @@ func TestHistoryReadsAThreadWhenGivenOne(t *testing.T) {
 	}
 }
 
+// "Read this thread" means how the discussion ended, not how it started.
+// conversations.replies walks forward from the parent, so passing the limit
+// straight through would answer with the oldest few — for a limit of one, the
+// parent alone.
+func TestHistoryKeepsTheNewestEndOfALimitedThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := historyBridge(ctx, t)
+	api.mu.Lock()
+	api.replies = []candidate{
+		{Channel: testChannel, User: testOwner, Text: "the question", TS: "100.000300", ThreadTS: "100.000300"},
+		{Channel: testChannel, User: "U0COLLEAGUE", Text: "an early guess", TS: "100.000310", ThreadTS: "100.000300"},
+		{Channel: testChannel, User: "U0COLLEAGUE", Text: "what we actually decided", TS: "100.000320", ThreadTS: "100.000300"},
+	}
+	api.mu.Unlock()
+
+	result, err := b.History(ctx, ReadRequest{ThreadTS: "100.000300", Limit: 2})
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+
+	var got []string
+	for _, m := range result.Messages {
+		got = append(got, m.Text)
+	}
+	want := []string{"an early guess", "what we actually decided"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("History() messages = %v, want %v: the newest end, still oldest first", got, want)
+	}
+	if !result.HasMore {
+		t.Error("has_more = false after dropping the start of the thread, want true")
+	}
+
+	// And the one-message case, which is where the old behaviour was at its
+	// most useless: it returned the parent and nothing else.
+	single, err := b.History(ctx, ReadRequest{ThreadTS: "100.000300", Limit: 1})
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if len(single.Messages) != 1 || single.Messages[0].Text != "what we actually decided" {
+		t.Errorf("History() with limit 1 = %+v, want the last thing said", single.Messages)
+	}
+}
+
+// A thread longer than one page has to be walked to its end before the newest
+// messages can be picked out of it.
+func TestHistoryPagesAThreadBeforeTakingItsNewestMessages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := historyBridge(ctx, t)
+	api.mu.Lock()
+	api.replies = []candidate{
+		{Channel: testChannel, User: testOwner, Text: "first", TS: "100.000300", ThreadTS: "100.000300"},
+		{Channel: testChannel, User: testOwner, Text: "second", TS: "100.000310", ThreadTS: "100.000300"},
+		{Channel: testChannel, User: testOwner, Text: "third", TS: "100.000320", ThreadTS: "100.000300"},
+	}
+	api.repliesPageSize = 1
+	api.mu.Unlock()
+
+	result, err := b.History(ctx, ReadRequest{ThreadTS: "100.000300", Limit: 2})
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+
+	var got []string
+	for _, m := range result.Messages {
+		got = append(got, m.Text)
+	}
+	if !reflect.DeepEqual(got, []string{"second", "third"}) {
+		t.Errorf("History() messages = %v, want the last two of a paged thread", got)
+	}
+}
+
 // The users:read scope is optional in practice: an app installed before it was
 // added has not got it, and the tool has to stay useful on raw IDs.
 func TestHistoryFallsBackToUserIDsWhenNamesCannotBeResolved(t *testing.T) {

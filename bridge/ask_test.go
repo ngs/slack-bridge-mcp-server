@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -370,6 +371,33 @@ func TestAskExpiresTheQuestionWhenTheCallIsAborted(t *testing.T) {
 	if len(resolutions) != 1 || !strings.Contains(resolutions[0].Text, "⌛") {
 		t.Errorf("resolutions = %+v, want the abandoned question expired", resolutions)
 	}
+}
+
+// If the question never reaches the channel, the agent is still working on
+// what it was doing — and the owner should still be able to see that.
+func TestAskRestoresTheIndicatorWhenTheQuestionCannotBePosted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.history = []candidate{
+		ownerMsg("100.000100", "already answered"),
+		ownerMsg("100.000200", "please look into this"),
+	}
+	api.questionErr = errors.New("channel_not_found")
+	api.mu.Unlock()
+
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to appear", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err == nil {
+		t.Fatal("Ask() = nil error when the question could not be posted, want the failure surfaced")
+	}
+
+	// The first indicator went down with the attempt; a new one has to take
+	// its place, or the channel falls silent while the agent is still busy.
+	eventually(t, "the indicator to come back", func() bool { return len(indicatorPosts(api)) == 2 })
 }
 
 // A dead socket cannot deliver a click, so the buttons must not outlive it.

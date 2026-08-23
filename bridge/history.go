@@ -16,6 +16,11 @@ const (
 	DefaultHistoryLimit = 50
 )
 
+// maxThreadReadPages caps how much of a thread slack_history will walk to find
+// its newest messages. Five pages is a thousand replies, which is a longer
+// thread than anyone summarises in one go.
+const maxThreadReadPages = 5
+
 // ReadRequest is what slack_history asks for. Every field is optional.
 type ReadRequest struct {
 	// Limit caps how many messages come back, newest-end first if the window
@@ -72,35 +77,31 @@ func (b *Bridge) History(ctx context.Context, req ReadRequest) (HistoryResult, e
 
 	limit := clampHistoryLimit(req.Limit)
 
-	var page HistoryPage
+	var (
+		messages []candidate
+		hasMore  bool
+	)
 	if req.ThreadTS != "" {
-		page, err = api.Replies(ctx, RepliesRequest{
-			Channel:  channel,
-			ThreadTS: req.ThreadTS,
-			Oldest:   req.Oldest,
-			Latest:   req.Latest,
-			Limit:    limit,
-		})
+		messages, hasMore, err = readThreadWindow(ctx, api, channel, req, limit)
 	} else {
+		var page HistoryPage
 		page, err = api.History(ctx, HistoryRequest{
 			Channel: channel,
 			Oldest:  req.Oldest,
 			Latest:  req.Latest,
 			Limit:   limit,
 		})
+		messages, hasMore = page.Messages, page.HasMore
+		// History comes back newest-first, so the front of the page is the
+		// end of the conversation. Slack's limit is a request rather than a
+		// promise, and trimming here keeps the contract the tool advertises.
+		if len(messages) > limit {
+			messages = messages[:limit]
+			hasMore = true
+		}
 	}
 	if err != nil {
 		return HistoryResult{}, err
-	}
-
-	messages := page.Messages
-	hasMore := page.HasMore
-	// Slack's own limit is a request, not a promise, and conversations.replies
-	// counts the parent message against it. Trimming here keeps the contract
-	// the tool advertises.
-	if len(messages) > limit {
-		messages = messages[:limit]
-		hasMore = true
 	}
 
 	result := HistoryResult{
@@ -108,6 +109,52 @@ func (b *Bridge) History(ctx context.Context, req ReadRequest) (HistoryResult, e
 		HasMore:  hasMore,
 	}
 	return result, nil
+}
+
+// readThreadWindow reads a thread and keeps its newest limit messages.
+//
+// A thread cannot be read from the end: conversations.replies starts at the
+// parent and walks forward. Passing the limit straight through would answer
+// "read this thread" with its oldest few messages — for a limit of one, the
+// parent alone — when what the caller wants is how the discussion ended. So
+// the thread is paged and the tail kept.
+func readThreadWindow(ctx context.Context, api API, channel string, req ReadRequest, limit int) ([]candidate, bool, error) {
+	var (
+		messages []candidate
+		cursor   string
+		hasMore  bool
+	)
+	for page := 0; page < maxThreadReadPages; page++ {
+		replies, err := api.Replies(ctx, RepliesRequest{
+			Channel:  channel,
+			ThreadTS: req.ThreadTS,
+			Oldest:   req.Oldest,
+			Latest:   req.Latest,
+			Cursor:   cursor,
+			Limit:    historyPageLimit,
+		})
+		if err != nil {
+			return nil, false, err
+		}
+
+		messages = append(messages, replies.Messages...)
+		cursor = replies.NextCursor
+		if cursor == "" {
+			hasMore = hasMore || replies.HasMore
+			break
+		}
+	}
+	// A thread longer than the page budget is read from its start, so the tail
+	// kept here is the newest of what was read rather than of the thread. Say
+	// so through has_more, which is what it is for.
+	if cursor != "" {
+		hasMore = true
+	}
+	if len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+		hasMore = true
+	}
+	return messages, hasMore, nil
 }
 
 // describe turns raw messages into the reported form, oldest first, resolving
