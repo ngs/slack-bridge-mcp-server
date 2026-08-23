@@ -308,6 +308,16 @@ and the server says so on stderr when it happens.
 Turn it on under **Interactivity & Shortcuts** — it is a setting, not a scope,
 so nothing needs reinstalling — and ask again.
 
+**A mention in another channel is never picked up after a sleep, and stderr
+says a scope is missing.** The app predates conversations outside the home
+channel and has not been reinstalled since, so `users.conversations` — or
+reading a page of a channel that is not the home one — is refused. The bridge
+says so once and turns that catch-up off for the rest of the connection rather
+than failing the calls around it: the home channel, the live stream and every
+other tool go on working. Add `channels:read`, `groups:read` and
+`channels:history` under **OAuth & Permissions**, reinstall, and restart the
+session — the next connection tries again.
+
 **`slack_history` shows user IDs instead of names.** The `users:read` scope is
 missing. Add it under **OAuth & Permissions** and reinstall the app — a scope,
 unlike a setting, does not reach an existing token. Everything else about the

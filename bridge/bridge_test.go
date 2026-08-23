@@ -24,6 +24,9 @@ type fakeAPI struct {
 	channelHistory map[string][]candidate
 	// historyErr, when set, fails the next History call.
 	historyErr error
+	// channelHistoryErr fails History for one channel only, which is how a
+	// scope the app has in its home channel and nowhere else behaves.
+	channelHistoryErr map[string]error
 
 	historyCalls []HistoryRequest
 	replyCalls   []RepliesRequest
@@ -124,6 +127,9 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 	f.historyCalls = append(f.historyCalls, req)
 	if f.historyErr != nil {
 		return HistoryPage{}, f.historyErr
+	}
+	if err := f.channelHistoryErr[req.Channel]; err != nil {
+		return HistoryPage{}, err
 	}
 
 	var matched []candidate

@@ -99,6 +99,11 @@ type Bridge struct {
 	// mentionCursor is how far through time the search for missed mentions has
 	// looked.
 	mentionCursor string
+	// conversationsDegraded is set when Slack refuses the catch-up outside the
+	// home channel for want of a scope. It lasts as long as the connection
+	// because that is how long the answer can stay the same: scopes arrive with
+	// a reinstall, and a reinstall is a new connection, which tries again.
+	conversationsDegraded bool
 	// indicator is the live "⏳ Working…" message, if one is running. At most
 	// one exists at a time; see indicator.go.
 	indicator *indicator
@@ -256,6 +261,9 @@ func (b *Bridge) ensure() error {
 	b.botUserID = api.BotUserID()
 	b.stream = stream
 	b.connected = true
+	// A fresh connection is the one moment the scopes can have changed, so the
+	// catch-up outside the home channel is offered another go.
+	b.conversationsDegraded = false
 	// The first catch-up covers everything missed since the last session;
 	// StreamConnected events later cover reconnects.
 	b.needCatchUp = true

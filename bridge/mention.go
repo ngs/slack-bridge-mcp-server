@@ -168,10 +168,20 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 	if api == nil {
 		return nil, nil
 	}
+	if b.conversationsAreDegraded() {
+		// Already established that this installation cannot do it. Asking again
+		// on every catch-up would spend two API calls a tick to be told the same
+		// thing, and say so in the log each time.
+		return nil, nil
+	}
 
 	mentions, cursor, err := b.scanForMentions(ctx, api, owner)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, ErrMissingScope) {
+			return nil, err
+		}
+		b.degradeConversations(err)
+		return nil, nil
 	}
 
 	// Opening the threads before the walk is what lets the walk find them, and
@@ -190,13 +200,49 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 
 	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, ErrMissingScope) {
+			return nil, err
+		}
+		// The mentions are already read and are handed over; only the walk
+		// through the threads is given up. Their cursors have not moved, so the
+		// replies are still there to be found once the app is reinstalled.
+		b.degradeConversations(err)
+		replies = nil
 	}
 
 	if cursor != "" {
 		b.noteMentionCursor(cursor)
 	}
 	return mergeConversations(mentions, replies), nil
+}
+
+// conversationsAreDegraded reports whether the catch-up outside the home
+// channel has been given up on for this connection.
+func (b *Bridge) conversationsAreDegraded() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.conversationsDegraded
+}
+
+// degradeConversations turns off the catch-up outside the home channel for the
+// rest of the connection, and says once what the operator has to do about it.
+//
+// The alternative — failing the call — is what the bridge used to do, and it
+// took an app that had simply not been reinstalled since these scopes were
+// added and stopped it receiving anything at all, home channel included. A
+// feature nobody has granted permission for is not an error; it is a feature
+// that is off.
+func (b *Bridge) degradeConversations(err error) {
+	b.mu.Lock()
+	already := b.conversationsDegraded
+	b.conversationsDegraded = true
+	b.mu.Unlock()
+
+	if already {
+		return
+	}
+	log.Printf("slack refused a call for want of a scope (%s); conversations outside the home channel are off until the app is reinstalled with channels:read, groups:read and channels:history. The home channel is unaffected.",
+		logSafe(err.Error(), maxLoggedError))
 }
 
 // catchUpThreadConversations reads every open thread from the point it was
