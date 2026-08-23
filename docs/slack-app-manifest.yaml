@@ -1,0 +1,43 @@
+# Slack app manifest for slack-bridge-mcp-server.
+#
+# Create the app from this file at https://api.slack.com/apps → Create New App
+# → From an app manifest, and it arrives with Socket Mode on, the three bot
+# scopes the server actually calls, and the one message event it listens for.
+# You still have to generate the app-level token and install the app; see
+# docs/setup.md.
+#
+# This manifest is written for a PRIVATE bridge channel. For a public one,
+# replace groups:history with channels:history and message.groups with
+# message.channels.
+display_information:
+  name: Slack Bridge
+  description: Bridges a resident Claude CLI session to a private Slack channel
+  long_description: >-
+    slack-bridge-mcp-server relays messages between one private Slack channel
+    and a Claude CLI session running on your own machine, so you can talk to
+    that session from your phone. Only messages from the configured owner in
+    the configured channel are relayed.
+  background_color: "#1f2933"
+features:
+  bot_user:
+    display_name: slack-bridge
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      # chat.postMessage for replies, chat.update and chat.delete for the
+      # processing indicator. All three are covered by chat:write.
+      - chat:write
+      # conversations.history, used for catch-up after sleep or a restart.
+      - groups:history
+      # reactions.add, which is what slack_ack does.
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.groups
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

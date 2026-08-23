@@ -46,39 +46,24 @@ opening a socket in sessions that never use it.
 
 The full rationale is in [docs/design.md](docs/design.md).
 
-## Install
+## Setup
+
+**[docs/setup.md](docs/setup.md) is the full walkthrough**, from creating the
+Slack app to the first message: scopes, tokens, the channel, installing the
+binary, `.mcp.json`, and what to check when something does not work. There is a
+[Slack app manifest](docs/slack-app-manifest.yaml) that skips most of the app
+configuration.
+
+The short version, if you have done this kind of thing before:
 
 ```sh
-go install go.ngs.io/slack-bridge-mcp-server@latest
+brew install ngs/tap/slack-bridge-mcp-server   # or: go install go.ngs.io/slack-bridge-mcp-server@latest
 ```
 
-Or grab a binary from the [releases](https://github.com/ngs/slack-bridge-mcp-server/releases).
-
-## Slack app setup
-
-Create an app at [api.slack.com/apps](https://api.slack.com/apps) (**From
-scratch**), then:
-
-1. **Socket Mode** → turn it **on**. Generate an app-level token with the
-   `connections:write` scope. This is your `SLACK_APP_TOKEN` (`xapp-…`).
-2. **OAuth & Permissions** → add these **bot token scopes**:
-   - `chat:write` — post replies
-   - `groups:history` — read the private channel, both live and for catch-up
-   - `reactions:write` — acknowledge a message with an emoji
-3. **Event Subscriptions** → turn it on and subscribe to the **bot event**
-   `message.groups`.
-4. **Install to Workspace**. The **Bot User OAuth Token** (`xoxb-…`) is your
-   `SLACK_BOT_TOKEN`.
-5. Create a **private channel** for the conversation and **invite the bot** to
-   it: `/invite @your-app-name`. The bot can only read channels it is a member
-   of.
-6. Collect the two IDs:
-   - **Channel ID** (`C…`) — channel name → **View channel details** → bottom of
-     the About tab.
-   - **Your user ID** (`U…`) — your profile → **⋮** → **Copy member ID**.
-
-If you change scopes after installing, reinstall the app so the new scopes take
-effect.
+Create a Slack app with Socket Mode on, an app-level token with
+`connections:write`, the bot scopes `chat:write`, `groups:history` and
+`reactions:write`, and the `message.groups` bot event. Install it, invite it to
+a private channel, and set the four variables below.
 
 ## Configuration
 
@@ -130,6 +115,10 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
   }
 }
 ```
+
+`slack_status` answers `"connected": false` until the first `slack_wait` or
+`slack_post`, which is the lazy connect working as intended rather than a
+problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
 
