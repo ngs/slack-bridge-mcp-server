@@ -147,6 +147,15 @@ func (w *webAPI) UserName(ctx context.Context, userID string) (string, error) {
 // results are scoped to the channel that was asked for, and Slack does not
 // echo it back on each message.
 func toCandidate(channel string, m slack.Message) candidate {
+	// An app post carries its display name in one of two places depending on
+	// how it was sent: the top-level username for incoming webhooks and older
+	// bot messages, the bot profile for apps posting as themselves. Without
+	// the second, slack_history shows those posts as a raw bot ID.
+	username := m.Username
+	if username == "" && m.BotProfile != nil {
+		username = m.BotProfile.Name
+	}
+
 	return candidate{
 		Channel:     channel,
 		User:        m.User,
@@ -155,7 +164,7 @@ func toCandidate(channel string, m slack.Message) candidate {
 		Text:        m.Text,
 		TS:          m.Timestamp,
 		ThreadTS:    m.ThreadTimestamp,
-		Username:    m.Username,
+		Username:    username,
 		ReplyCount:  m.ReplyCount,
 		LatestReply: m.LatestReply,
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -315,6 +316,47 @@ func TestHistoryPagesAThreadBeforeTakingItsNewestMessages(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []string{"second", "third"}) {
 		t.Errorf("History() messages = %v, want the last two of a paged thread", got)
+	}
+}
+
+// A long thread is read to its end before the tail is taken, so "the newest
+// limit messages" means the newest of the thread rather than the newest of the
+// first page the bridge happened to fetch.
+func TestHistoryWalksALongThreadToItsEnd(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api := historyBridge(ctx, t)
+
+	var replies []candidate
+	for i := range 40 {
+		replies = append(replies, candidate{
+			Channel:  testChannel,
+			User:     testOwner,
+			Text:     "reply " + strconv.Itoa(i),
+			TS:       "100.000" + strconv.Itoa(300+i),
+			ThreadTS: "100.000300",
+		})
+	}
+	api.mu.Lock()
+	api.replies = replies
+	api.repliesPageSize = 3
+	api.mu.Unlock()
+
+	result, err := b.History(ctx, ReadRequest{ThreadTS: "100.000300", Limit: 2})
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+
+	var got []string
+	for _, m := range result.Messages {
+		got = append(got, m.Text)
+	}
+	if !reflect.DeepEqual(got, []string{"reply 38", "reply 39"}) {
+		t.Errorf("History() messages = %v, want the last two of the whole thread", got)
+	}
+	if !result.HasMore {
+		t.Error("has_more = false after dropping most of the thread, want true")
 	}
 }
 

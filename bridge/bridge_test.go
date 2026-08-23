@@ -42,12 +42,15 @@ type fakeAPI struct {
 	deletes     []deleteCall
 	postTS      string
 	questionTS  string
-	postErr     error
-	questionErr error
-	reactErr    error
-	updateErr   error
-	resolveErr  error
-	deleteErr   error
+	// beforeQuestionReturns runs inside PostQuestion, after Slack would have
+	// created the message but before the caller learns its ts.
+	beforeQuestionReturns func()
+	postErr               error
+	questionErr           error
+	reactErr              error
+	updateErr             error
+	resolveErr            error
+	deleteErr             error
 	// deleteGate, when set, holds Delete open until the test closes it, which
 	// is how a slow chat.delete is simulated.
 	deleteGate chan struct{}
@@ -173,13 +176,19 @@ func (f *fakeAPI) Post(_ context.Context, channel, threadTS, text string) (strin
 
 func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.questions = append(f.questions, questionCall{Channel: channel, ThreadTS: threadTS, Question: q})
-	if f.questionErr != nil {
-		return "", f.questionErr
+	hook, ts, err := f.beforeQuestionReturns, f.questionTS, f.questionErr
+	f.mu.Unlock()
+
+	// The message exists in Slack before this call returns, so a test can use
+	// the hook to click on it while the caller is still waiting.
+	if hook != nil {
+		hook()
 	}
-	return f.questionTS, nil
+	if err != nil {
+		return "", err
+	}
+	return ts, nil
 }
 
 func (f *fakeAPI) ResolveQuestion(_ context.Context, channel, ts, text string) error {

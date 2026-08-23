@@ -589,11 +589,11 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 
 	// The reply is the answer the indicator was standing in for, so retire it
 	// before the reply lands rather than after.
-	b.stopIndicator()
+	retired := b.stopIndicator()
 
 	api, channel, err := b.apiForCall()
 	if err != nil {
-		b.restoreIndicator(ctx)
+		b.restoreIndicator(ctx, retired)
 		return "", err
 	}
 
@@ -601,24 +601,27 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 	if err != nil {
 		// The answer never landed, so the agent is still on the hook for it
 		// and the channel should go back to saying so.
-		b.restoreIndicator(ctx)
+		b.restoreIndicator(ctx, retired)
 		return "", err
 	}
 	return ts, nil
 }
 
-// restoreIndicator brings the progress signal back after an attempt to speak
-// failed, so the channel does not fall silent while the agent is still
-// working.
+// restoreIndicator puts back the progress signal that a failed attempt to
+// speak had retired, so the channel does not fall silent while the agent is
+// still working.
 //
-// It stays quiet when the call was cancelled: Slack may have accepted the
-// message anyway, with the confirmation lost on the way back, and a cancelled
-// call means nobody is waiting on this turn any more either.
-func (b *Bridge) restoreIndicator(ctx context.Context) {
-	if ctx.Err() != nil || b.ctx.Err() != nil {
+// It restores only what was there. A reply that fails when no indicator was
+// running means the agent was never handed anything to work on, and inventing
+// a "⏳ Working…" for it would be a lie the owner cannot check. It also stays
+// quiet when the call was cancelled: Slack may have accepted the message
+// anyway, with the confirmation lost on the way back, and a cancelled call
+// means nobody is waiting on this turn any more either.
+func (b *Bridge) restoreIndicator(ctx context.Context, retired retiredIndicator) {
+	if !retired.wasRunning || ctx.Err() != nil || b.ctx.Err() != nil {
 		return
 	}
-	b.startIndicator()
+	b.startIndicatorAt(retired.startedAt)
 }
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"
@@ -661,6 +664,13 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 // the call that starts it returns immediately, and a per-call context would be
 // cancelled before the first tick.
 func (b *Bridge) startIndicator() {
+	b.startIndicatorAt(time.Now())
+}
+
+// startIndicatorAt is startIndicator with the clock set, so an indicator put
+// back after a failed reply carries on counting from when the agent actually
+// started rather than restarting at zero.
+func (b *Bridge) startIndicatorAt(startedAt time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -671,28 +681,43 @@ func (b *Bridge) startIndicator() {
 
 	grace, interval := b.cfg.indicatorTimings()
 	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval, b.indicatorDone)
+	b.indicator.startedAt = startedAt
 	b.indicatorDone = b.indicator.done
 	b.indicator.start()
 }
 
+// retiredIndicator is what stopping one leaves behind: enough to put it back
+// if whatever retired it turned out not to happen.
+type retiredIndicator struct {
+	// wasRunning distinguishes "there was one and it is now stopped" from
+	// "there was nothing to stop", which is what keeps a failed reply from
+	// inventing a progress signal for work nobody handed the agent.
+	wasRunning bool
+	// startedAt is when the agent received the work, not when the indicator
+	// was created, so a restored one shows the true elapsed time.
+	startedAt time.Time
+}
+
 // stopIndicator retires the running indicator, if any. It returns without
 // waiting for the chat.delete, so no tool call is ever slowed down by it.
-func (b *Bridge) stopIndicator() {
+func (b *Bridge) stopIndicator() retiredIndicator {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stopIndicatorLocked()
+	return b.stopIndicatorLocked()
 }
 
 // stopIndicatorLocked is stopIndicator for callers that already hold b.mu. The
 // done channel is kept behind, so the next indicator knows what it is waiting
 // for.
-func (b *Bridge) stopIndicatorLocked() {
+func (b *Bridge) stopIndicatorLocked() retiredIndicator {
 	if b.indicator == nil {
-		return
+		return retiredIndicator{}
 	}
+	retired := retiredIndicator{wasRunning: true, startedAt: b.indicator.startedAt}
 	b.indicator.stop()
 	b.indicatorDone = b.indicator.done
 	b.indicator = nil
+	return retired
 }
 
 // apiForCall connects if necessary and returns the Web API handle.

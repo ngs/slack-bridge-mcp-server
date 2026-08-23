@@ -40,6 +40,16 @@ const (
 // and leaving live buttons behind is exactly what this call is preventing.
 const askResolveTimeout = 5 * time.Second
 
+// askPostTimeout bounds posting the question. It runs detached from the tool
+// call, so this is what keeps a Slack that never answers from holding the call
+// open past its own timeout.
+const askPostTimeout = 10 * time.Second
+
+// maxEarlyClicks caps the clicks held while the question is being posted. The
+// window is one HTTP round trip and only the owner's clicks can matter, so a
+// handful is generous.
+const maxEarlyClicks = 8
+
 // AskResult is what slack_ask returns. ChoiceIndex is -1 when no choice was
 // made, so a timed-out answer cannot be misread as the first option.
 //
@@ -67,6 +77,10 @@ type pendingAsk struct {
 	// warned keeps the log to one line per question when clicks that do not
 	// belong to it keep arriving.
 	warned bool
+	// early holds clicks that arrived before the question had a timestamp to
+	// match them against. They are replayed, and matched properly, as soon as
+	// it does.
+	early []Interaction
 }
 
 // Ask posts a multiple-choice question to the channel and blocks until the
@@ -107,19 +121,27 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 	// indicator's elapsed counter would be measuring their thinking time, so
 	// retire it, and start a fresh one once they answer. Refusing the question
 	// above leaves it alone, since nothing about the agent's work changed.
-	b.stopIndicator()
+	retired := b.stopIndicator()
 
-	ts, err := api.PostQuestion(ctx, channel, threadTS, q)
+	ts, err := postQuestion(b.ctx, api, channel, threadTS, q)
 	if err != nil {
 		// No question went up, so the agent is still the one working and the
 		// channel should say so again.
-		b.restoreIndicator(ctx)
+		b.restoreIndicator(ctx, retired)
 		return AskResult{}, err
 	}
 
-	b.mu.Lock()
-	ask.ts = ts
-	b.mu.Unlock()
+	// The question is live from here, and clicks that arrived while it was
+	// being posted have been waiting for this.
+	b.adoptQuestion(ask, ts)
+
+	// The post deliberately outlives a cancelled call, so the cancellation has
+	// to be answered here instead — with the ts in hand, the buttons can
+	// actually be taken away.
+	if err := ctx.Err(); err != nil {
+		b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+		return AskResult{}, err
+	}
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -136,6 +158,10 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 		case <-deadline.C:
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
+			// select picks at random between a ready timer and a ready click,
+			// so anything already queued has to be taken in before the
+			// question can be called unanswered.
+			b.drainInteractions(stream)
 			if choice, ok := b.lastChance(ask); ok {
 				b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
 				b.startIndicator()
@@ -172,6 +198,52 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 			if err := b.absorb(evt); err != nil {
 				return AskResult{}, err
 			}
+		}
+	}
+}
+
+// postQuestion posts on a detached context with a deadline of its own.
+//
+// The reason is the same as the indicator's: a chat.postMessage abandoned in
+// flight can still create the message, and the ts needed to take the buttons
+// away would be lost with the response — a question left hanging in the
+// channel that no click can ever answer. The caller checks for cancellation
+// once the ts is known, which is the point at which it can do something about
+// it.
+func postQuestion(ctx context.Context, api API, channel, threadTS string, q Question) (string, error) {
+	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), askPostTimeout)
+	defer cancel()
+	return api.PostQuestion(postCtx, channel, threadTS, q)
+}
+
+// adoptQuestion gives the pending ask its timestamp and replays the clicks
+// that arrived before it had one.
+//
+// That window is real: Slack shows the buttons the moment the message is
+// created, which is before chat.postMessage answers, and a concurrent
+// slack_wait is reading the same interaction channel. Without the replay, an
+// owner quick on the draw would tap an answer that went nowhere.
+func (b *Bridge) adoptQuestion(ask *pendingAsk, ts string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	ask.ts = ts
+	early := ask.early
+	ask.early = nil
+	for _, in := range early {
+		b.deliverInteraction(in)
+	}
+}
+
+// drainInteractions takes everything already queued on the interaction channel
+// and routes it, without waiting for more.
+func (b *Bridge) drainInteractions(stream Stream) {
+	for {
+		select {
+		case in := <-stream.Interactions():
+			b.routeInteraction(in)
+		default:
+			return
 		}
 	}
 }
@@ -227,7 +299,17 @@ func (b *Bridge) routeInteraction(in Interaction) {
 // it — never that Slack will retry.
 func (b *Bridge) deliverInteraction(in Interaction) {
 	ask := b.ask
-	if ask == nil || ask.ts == "" {
+	if ask == nil {
+		return
+	}
+	if ask.ts == "" {
+		// The question is posted but its timestamp has not come back yet.
+		// Holding the click keeps it out of the bin until it can be checked
+		// against the message it belongs to; the cap is there because a click
+		// that never matches must not accumulate.
+		if len(ask.early) < maxEarlyClicks {
+			ask.early = append(ask.early, in)
+		}
 		return
 	}
 	if in.User != b.cfg.Owner || in.MessageTS != ask.ts {

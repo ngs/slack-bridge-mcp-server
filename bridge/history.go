@@ -17,9 +17,12 @@ const (
 )
 
 // maxThreadReadPages caps how much of a thread slack_history will walk to find
-// its newest messages. Five pages is a thousand replies, which is a longer
-// thread than anyone summarises in one go.
-const maxThreadReadPages = 5
+// its newest messages. A thread has to be read from its start — Slack pages it
+// forward from the parent — so reaching the end is the only way to know what
+// the newest messages are. Only the ones that will be returned are kept, so
+// the cost of a long thread is API calls rather than memory, and fifty pages
+// is ten thousand replies: past any real conversation, and still bounded.
+const maxThreadReadPages = 50
 
 // ReadRequest is what slack_history asks for. Every field is optional.
 type ReadRequest struct {
@@ -113,18 +116,21 @@ func (b *Bridge) History(ctx context.Context, req ReadRequest) (HistoryResult, e
 	return result, nil
 }
 
-// readThreadWindow reads a thread and keeps its newest limit messages.
+// readThreadWindow reads a thread to the end of the requested window and keeps
+// its newest limit messages.
 //
 // A thread cannot be read from the end: conversations.replies starts at the
 // parent and walks forward. Passing the limit straight through would answer
 // "read this thread" with its oldest few messages — for a limit of one, the
 // parent alone — when what the caller wants is how the discussion ended. So
-// the thread is paged and the tail kept.
+// the thread is walked to the end and only the tail is kept: pages are
+// discarded as they are superseded, so a long thread costs calls, not memory.
 func readThreadWindow(ctx context.Context, api API, channel string, req ReadRequest, limit int) ([]candidate, bool, error) {
 	var (
-		messages []candidate
-		cursor   string
-		hasMore  bool
+		kept    []candidate
+		dropped bool
+		cursor  string
+		hasMore bool
 	)
 	for page := 0; page < maxThreadReadPages; page++ {
 		replies, err := api.Replies(ctx, RepliesRequest{
@@ -139,24 +145,26 @@ func readThreadWindow(ctx context.Context, api API, channel string, req ReadRequ
 			return nil, false, err
 		}
 
-		messages = append(messages, replies.Messages...)
+		kept = append(kept, replies.Messages...)
+		if len(kept) > limit {
+			kept = kept[len(kept)-limit:]
+			dropped = true
+		}
+
 		cursor = replies.NextCursor
 		if cursor == "" {
-			hasMore = hasMore || replies.HasMore
+			hasMore = replies.HasMore
 			break
 		}
 	}
-	// A thread longer than the page budget is read from its start, so the tail
-	// kept here is the newest of what was read rather than of the thread. Say
-	// so through has_more, which is what it is for.
 	if cursor != "" {
+		// A thread with more than ten thousand replies in the window. The tail
+		// returned is the newest of what was read rather than of the thread,
+		// which is what has_more is there to warn about.
+		log.Printf("stopped reading a thread after %d pages; it is longer than slack_history will walk", maxThreadReadPages)
 		hasMore = true
 	}
-	if len(messages) > limit {
-		messages = messages[len(messages)-limit:]
-		hasMore = true
-	}
-	return messages, hasMore, nil
+	return kept, hasMore || dropped, nil
 }
 
 // describe turns raw messages into the reported form, oldest first, resolving

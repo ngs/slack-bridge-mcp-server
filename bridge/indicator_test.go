@@ -126,6 +126,64 @@ func TestCloseWaitsForTheIndicatorToClearTheChannel(t *testing.T) {
 	}
 }
 
+// A reply that never reaches Slack has not answered anything, so the progress
+// signal has to come back — and come back counting from when the agent was
+// handed the work, not from the failed attempt.
+func TestAFailedReplyPutsTheIndicatorBack(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+	eventually(t, "the indicator to appear", func() bool { return len(indicatorPosts(api)) == 1 })
+
+	started := b.indicatorStartedAt()
+
+	api.mu.Lock()
+	api.postErr = errors.New("channel_not_found")
+	api.mu.Unlock()
+
+	if _, err := b.Post(ctx, "here you go", ""); err == nil {
+		t.Fatal("Post() = nil error, want the failure surfaced")
+	}
+
+	eventually(t, "the indicator to come back", func() bool { return len(indicatorPosts(api)) == 2 })
+	if got := b.indicatorStartedAt(); !got.Equal(started) {
+		t.Errorf("restored indicator started at %v, want the original %v: the elapsed time must not reset", got, started)
+	}
+}
+
+// Nothing was working, so nothing should start claiming to be. A failed reply
+// from a session that never called slack_wait must not invent an indicator.
+func TestAFailedReplyDoesNotInventAnIndicator(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	api.mu.Lock()
+	api.postErr = errors.New("channel_not_found")
+	api.mu.Unlock()
+
+	if _, err := b.Post(ctx, "unprompted", ""); err == nil {
+		t.Fatal("Post() = nil error, want the failure surfaced")
+	}
+
+	time.Sleep(4 * testGrace)
+	if got := indicatorPosts(api); len(got) != 0 {
+		t.Errorf("indicator posts = %+v with no work in flight, want none", got)
+	}
+}
+
+// indicatorStartedAt reports the clock the running indicator is counting from.
+func (b *Bridge) indicatorStartedAt() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.indicator == nil {
+		return time.Time{}
+	}
+	return b.indicator.startedAt
+}
+
 // The common case is a reply within seconds. Nothing should reach the channel
 // then, or the owner gets a "working…" note that is gone before it can be read.
 func TestNoIndicatorForRepliesFasterThanTheGracePeriod(t *testing.T) {

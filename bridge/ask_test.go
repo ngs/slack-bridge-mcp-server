@@ -400,6 +400,56 @@ func TestAskRestoresTheIndicatorWhenTheQuestionCannotBePosted(t *testing.T) {
 	eventually(t, "the indicator to come back", func() bool { return len(indicatorPosts(api)) == 2 })
 }
 
+// The owner can tap an answer before chat.postMessage has answered: Slack
+// shows the buttons the moment the message exists. A click in that window is a
+// real answer and must not be thrown away for arriving early.
+func TestAskAcceptsAClickThatArrivesBeforeThePostReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+
+	// A concurrent slack_wait reads the same interaction channel, so a click
+	// can be routed while PostQuestion is still in flight — before the ask has
+	// a timestamp to match it against. Routing it from inside the fake is that
+	// race, made deterministic.
+	api.mu.Lock()
+	api.beforeQuestionReturns = func() { b.routeInteraction(click(testOwner, askTS, 1)) }
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the early click honoured as choice 1", result)
+	}
+}
+
+// select picks at random between a ready timer and a ready click, so a click
+// already queued when the deadline fires must not be reported as a timeout.
+func TestAskTakesAQueuedClickOverTheDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := askBridge(ctx, t)
+
+	// Queue the click first, then give the question a deadline that has
+	// effectively already passed: both cases are ready at once.
+	go func() {
+		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
+		stream.interactions <- click(testOwner, askTS, 0)
+	}()
+
+	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MinWaitTimeout, "")
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut {
+		t.Errorf("Ask() = %+v, want the queued click honoured rather than a timeout", result)
+	}
+}
+
 // A dead socket cannot deliver a click, so the buttons must not outlive it.
 func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
