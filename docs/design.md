@@ -296,8 +296,10 @@ and with two conversations in flight the guess puts the status line under the
 wrong one. A `slack_progress` call naming a conversation is better information
 than that guess, so it is acted on: since a Slack message cannot change channel
 or thread, the move is a retirement and a fresh start, going through the same
-predecessor handover a new turn does — the old message is deleted, and the new
-one waits for that before posting. The clock is carried across, because the
+predecessor handover a new turn does — the old message, if there is one yet, is
+deleted, and the new indicator waits for that before posting. Moved inside the
+grace period, which is where most moves happen, nothing has been posted and
+nothing is deleted: the retired indicator simply never speaks. The clock is carried across, because the
 elapsed time measures the work the owner is waiting on and not the message
 showing it. What the call does not name it does not change: a thread with no
 channel moves within the current channel rather than defaulting to the home one,

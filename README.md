@@ -299,9 +299,11 @@ and it retires on the next reply or wait like any other.
 is a guess about what the agent is working on — and a wrong one as soon as two
 topics are in flight, when the label for one lands under the other. So the
 `channel` and `thread_ts` on `slack_progress` say where the status belongs, and
-naming a different conversation moves the indicator into it: the message
-standing in the wrong place is deleted and a new one appears in the right one,
-still counting from when the work started rather than from the move. Only what
+naming a different conversation moves the indicator into it: anything standing
+in the wrong place is taken down and the indicator appears in the right one,
+still counting from when the work started rather than from the move. Inside the
+grace period there is nothing to take down yet, and the move is invisible — the
+first message the owner sees is the one in the right conversation. Only what
 you name changes — a `thread_ts` with no `channel` moves within the channel the
 indicator is already in — with one exception: a thread cannot come along to a
 different channel, since it identifies a message only within its own, so a move

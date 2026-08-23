@@ -91,8 +91,8 @@ type HistoryArgs struct {
 // ProgressArgs is the argument set for slack_progress.
 type ProgressArgs struct {
 	Text     string `json:"text" jsonschema:"a short line saying what you are working on or waiting for, e.g. 'release chain: waiting for CI'"`
-	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"the thread this status belongs to; starts the indicator there, or moves a running one that is somewhere else, keeping the elapsed time. Leave it out to label the indicator where it already is"`
-	Channel  string `json:"channel,omitempty" jsonschema:"the channel this status belongs to; starts the indicator there, or moves a running one that is somewhere else. Defaults to the home channel when nothing is running, and to the indicator's current channel when one is"`
+	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"the thread this status belongs to; starts the indicator there, or moves a running one, keeping the elapsed time. Omitted, it keeps the thread the indicator is in — except when channel moves it to a different channel, where a thread from the old one means nothing and the indicator goes to the channel surface"`
+	Channel  string `json:"channel,omitempty" jsonschema:"the channel this status belongs to; starts the indicator there, or moves a running one. Omitted, it means the home channel when nothing is running, and the indicator's current channel when one is. Omit both this and thread_ts to label the indicator where it already is"`
 }
 
 // StatusArgs is empty: slack_status takes no arguments.
