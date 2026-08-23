@@ -269,8 +269,10 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		}
 		if len(msgs) > 0 {
 			// From here the agent is working on these messages, which is the
-			// span the owner sees counted in the channel.
-			b.startIndicator()
+			// span the owner sees counted. It is counted where they are
+			// looking: the newest message is the one they just sent, so its
+			// thread is the conversation they are waiting on.
+			b.startIndicator(newestThreadTS(msgs))
 			b.autoAck(msgs)
 			return WaitResult{Messages: msgs}, nil
 		}
@@ -716,7 +718,9 @@ func (b *Bridge) restoreIndicator(ctx context.Context, retired retiredIndicator)
 	if b.indicatorGeneration != retired.generation {
 		return
 	}
-	b.startIndicatorLocked(retired.startedAt)
+	// Back where it was, thread included: the turn has not moved, only the
+	// attempt to end it failed.
+	b.startIndicatorLocked(retired.startedAt, retired.threadTS)
 }
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"
@@ -758,27 +762,29 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 // The indicator is given the bridge's own context rather than the tool call's:
 // the call that starts it returns immediately, and a per-call context would be
 // cancelled before the first tick.
-func (b *Bridge) startIndicator() {
-	b.startIndicatorAt(time.Now())
+//
+// threadTS says where the turn is happening; empty means the channel surface.
+func (b *Bridge) startIndicator(threadTS string) {
+	b.startIndicatorAt(time.Now(), threadTS)
 }
 
 // startIndicatorAt is startIndicator with the clock set, so an indicator put
 // back after a failed reply carries on counting from when the agent actually
 // started rather than restarting at zero.
-func (b *Bridge) startIndicatorAt(startedAt time.Time) {
+func (b *Bridge) startIndicatorAt(startedAt time.Time, threadTS string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.startIndicatorLocked(startedAt)
+	b.startIndicatorLocked(startedAt, threadTS)
 }
 
-func (b *Bridge) startIndicatorLocked(startedAt time.Time) {
+func (b *Bridge) startIndicatorLocked(startedAt time.Time, threadTS string) {
 	b.stopIndicatorLocked()
 	if b.cfg.IndicatorDisabled || b.api == nil {
 		return
 	}
 
 	grace, interval := b.cfg.indicatorTimings()
-	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval, b.indicatorDone)
+	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, threadTS, grace, interval, b.indicatorDone)
 	b.indicator.startedAt = startedAt
 	b.indicatorDone = b.indicator.done
 	b.indicatorGeneration++
@@ -795,6 +801,11 @@ type retiredIndicator struct {
 	// startedAt is when the agent received the work, not when the indicator
 	// was created, so a restored one shows the true elapsed time.
 	startedAt time.Time
+	// threadTS is the surface the retired indicator was posting to. A restore
+	// is the same turn resuming, so it has to go back to the same place;
+	// re-deriving it from the messages is not possible here, since the call
+	// that failed may not be the one that started the turn.
+	threadTS string
 	// generation is the bridge's indicator counter at the moment of this
 	// retirement. It is what makes a restore safe to attempt after a slow
 	// Slack call: if anything else has started or stopped an indicator since,
@@ -826,8 +837,24 @@ func (b *Bridge) stopIndicatorLocked() retiredIndicator {
 	b.indicator.stop()
 	b.indicatorDone = b.indicator.done
 	startedAt := b.indicator.startedAt
+	threadTS := b.indicator.threadTS
 	b.indicator = nil
-	return retiredIndicator{wasRunning: true, startedAt: startedAt, generation: b.indicatorGeneration}
+	return retiredIndicator{wasRunning: true, startedAt: startedAt, threadTS: threadTS, generation: b.indicatorGeneration}
+}
+
+// newestThreadTS reports the thread the most recent of these messages belongs
+// to, which is the conversation the agent is now expected to answer in. An
+// empty result means that message was posted on the channel surface.
+//
+// The messages arrive oldest-first, so the last one is the newest. Only that
+// one is consulted: a batch delivered after a reconnect can span several
+// threads, and the owner is waiting where they spoke last, not where the
+// backlog happens to start.
+func newestThreadTS(msgs []Message) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	return msgs[len(msgs)-1].ThreadTS
 }
 
 // apiForCall connects if necessary and returns the Web API handle.

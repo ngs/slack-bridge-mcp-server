@@ -160,8 +160,10 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 		case choice := <-ask.answered:
 			b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
 			// The answer is new work handed to the agent, exactly like the
-			// messages slack_wait returns, so the clock starts again here.
-			b.startIndicator()
+			// messages slack_wait returns, so the clock starts again here —
+			// and in the thread the question was asked in, which is where the
+			// owner just clicked and where they are watching for what follows.
+			b.startIndicator(threadTS)
 			return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
 
 		case <-deadline.C:
@@ -169,7 +171,7 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask, stream); ok {
 				b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
-				b.startIndicator()
+				b.startIndicator(threadTS)
 				return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
 			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")

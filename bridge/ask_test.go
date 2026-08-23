@@ -232,6 +232,30 @@ func TestAskStopsTheIndicatorAndRestartsItOnTheAnswer(t *testing.T) {
 	eventually(t, "a fresh indicator after the answer", func() bool { return len(indicatorPosts(api)) == 2 })
 }
 
+// A question asked inside a thread is answered there, and the work that
+// follows the answer belongs in the same place: the owner tapped a button in
+// the thread and is watching that thread for what happens next.
+func TestAskInAThreadRestartsTheIndicatorInThatThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		stream.interactions <- click(testOwner, askTS, 0)
+	}()
+
+	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "100.000200"); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	eventually(t, "an indicator after the answer", func() bool { return len(indicatorPosts(api)) == 1 })
+	if got := indicatorPosts(api)[0]; got.ThreadTS != "100.000200" {
+		t.Errorf("indicator posted as %+v, want it in thread 100.000200 where the question was asked", got)
+	}
+}
+
 // A timed-out question is not new work, so nothing should start counting.
 func TestAskLeavesTheIndicatorStoppedOnTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
