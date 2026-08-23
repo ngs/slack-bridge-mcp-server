@@ -364,6 +364,42 @@ func TestCatchUpPagesThroughALongThread(t *testing.T) {
 	}
 }
 
+// The cursor is about to move past everything this thread returns, so the
+// thread has to be followed to its end rather than to the end of a page or two.
+func TestCatchUpPagesAThreadToItsEnd(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var replies []candidate
+	for i := range 12 {
+		replies = append(replies, reply("100.000"+strconv.Itoa(300+i), "100.000200", "reply "+strconv.Itoa(i)))
+	}
+
+	b, api, _ := threadBridge(ctx, t,
+		[]candidate{
+			ownerMsg("100.000100", "already answered"),
+			threadedParent("100.000200", "here is the plan", "100.000311", 12),
+		},
+		replies,
+	)
+	// Two replies per page, so twelve replies take six pages — more than the
+	// old budget of five.
+	api.mu.Lock()
+	api.repliesPageSize = 2
+	api.mu.Unlock()
+
+	result, err := b.Wait(ctx, MaxWaitTimeout)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if len(result.Messages) != 13 {
+		t.Fatalf("Wait() returned %d messages, want the parent and all 12 replies", len(result.Messages))
+	}
+	if got := b.Status().LastTS; got != "100.000311" {
+		t.Errorf("last_ts = %q, want the newest reply; anything less means replies were skipped", got)
+	}
+}
+
 // The live socket delivers thread replies as they happen, and catch-up finds
 // the same reply on a reconnect. The owner must see the agent answer once.
 func TestRecoveredReplyIsNotDuplicatedByTheLiveStream(t *testing.T) {

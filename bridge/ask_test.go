@@ -512,6 +512,41 @@ func TestAFullMessageQueueCannotSwallowAClick(t *testing.T) {
 	}
 }
 
+// A closed channel is permanently ready. Without the closed check the ask
+// loop would spin on it instead of reporting the disconnection, and the drain
+// at the deadline would never finish at all.
+func TestAskReportsTheDisconnectionWhenTheClickChannelCloses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	go func() {
+		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
+		close(stream.interactions)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Ask() = nil error after the click channel closed, want the disconnection reported")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ask() never returned after the click channel closed")
+	}
+
+	resolutions := api.snapshotResolutions()
+	if len(resolutions) != 1 || !strings.Contains(resolutions[0].Text, "⌛") {
+		t.Errorf("resolutions = %+v, want the unanswerable question expired", resolutions)
+	}
+}
+
 // pendingAskTS reports the ts of the question waiting for an answer, for tests
 // that need to know the question has actually been posted.
 func (b *Bridge) pendingAskTS() string {

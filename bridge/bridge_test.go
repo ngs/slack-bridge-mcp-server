@@ -696,6 +696,36 @@ func TestCatchUpAsksSlackForEverythingAfterTheCursor(t *testing.T) {
 	}
 }
 
+// The click channel closing is the same disconnection as the event channel
+// closing, and it has to be noticed rather than spun on.
+func TestWaitFailsWhenTheClickChannelCloses(t *testing.T) {
+	cfg := testConfig(t)
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	stream := newFakeStream()
+	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
+	defer func() { _ = b.Close() }()
+
+	close(stream.interactions)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Wait(context.Background(), MaxWaitTimeout)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Wait() = nil error after the click channel closed, want the disconnection reported")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait() never returned; a closed channel is always ready, so it was spinning")
+	}
+}
+
 func TestWaitFailsWhenTheStreamClosesForGood(t *testing.T) {
 	cfg := testConfig(t)
 	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {

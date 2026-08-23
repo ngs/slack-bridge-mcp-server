@@ -137,7 +137,8 @@ saying as much. The alternative — a cursor per thread, or refusing to advance
 past any thread not examined — buys completeness at the price of a single
 recoverable position in the channel, which is the thing that makes sleep
 recovery simple enough to trust. Within a thread that *is* read there is no
-such gap: it is paged to the end of the window before the cursor moves.
+such gap: it is paged to the end before the cursor moves, up to ten thousand
+replies in one thread, and reaching even that is logged.
 
 The pass is skipped entirely when there is no cursor, for the same reason the
 first run does not replay the channel.

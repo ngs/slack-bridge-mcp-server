@@ -33,16 +33,20 @@ const (
 // bridge looks for threads that have been replied to; maxThreadsPerCatchUp is
 // how many of those it will actually read.
 //
-// The worst case is one scan plus twenty threads of up to maxHistoryPages
-// each — 101 calls, or 106 with the surface catch-up — and it takes twenty
-// separate threads each replied to since the cursor, with hundreds of replies
-// in them, to get there. A typical reconnect makes one call and finds nothing
-// to read. The pass is bounded rather than budgeted deliberately: a budget
+// The worst case is one scan plus twenty threads of up to maxThreadCatchUpPages
+// each, and it takes twenty separate threads each holding thousands of unread
+// replies to get anywhere near it. A typical reconnect makes one call and finds
+// nothing to read; a busy night makes a handful. The pass is bounded rather than budgeted deliberately: a budget
 // spent halfway through a thread would leave the cursor advancing over replies
 // that were never read, which is the failure this whole pass exists to stop.
 const (
 	threadScanLimit      = 200
 	maxThreadsPerCatchUp = 20
+	// maxThreadCatchUpPages is how far one thread is followed. Fifty pages is
+	// ten thousand replies missed in a single thread while the bridge was
+	// away, which is past any conversation and into a machine writing into the
+	// channel.
+	maxThreadCatchUpPages = 50
 )
 
 // shutdownIndicatorWait is how long Close waits for the indicator to clear
@@ -84,6 +88,9 @@ type Bridge struct {
 	// stopped. It outlives the indicator itself because the next one has to
 	// wait for this one's chat.delete before posting its own message.
 	indicatorDone <-chan struct{}
+	// indicatorGeneration counts every start and stop, so a call that retired
+	// an indicator can tell whether anything has happened since.
+	indicatorGeneration uint64
 	// ask is the slack_ask question waiting for a click, if any. At most one
 	// is outstanding: a second question while one is pending is refused rather
 	// than queued, so a click is never ambiguous.
@@ -274,7 +281,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		case <-deadline.C:
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
 
-		case in := <-stream.Interactions():
+		case in, ok := <-stream.Interactions():
+			if !ok {
+				b.mu.Lock()
+				b.connected = false
+				b.mu.Unlock()
+				return WaitResult{}, errors.New("the Slack connection closed")
+			}
 			// A click arriving while nobody is asking anything is answered by
 			// whoever is: routing it here keeps slack_wait from starving the
 			// click channel while it holds the connection.
@@ -527,17 +540,20 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 }
 
 // readThread collects the owner's replies in one thread, newer than after,
-// following Slack's paging to the end of the window.
+// following Slack's paging to the end of the thread.
 //
-// Paging matters here: a thread the owner worked through while the bridge was
-// away can hold more replies than one page, and the caller is about to move
-// the cursor past all of them.
+// Paging to the end is the point: the caller is about to move the cursor past
+// everything this returns, so a thread left half-read is a thread whose
+// remaining replies are older than the new cursor and will never be asked for
+// again. The page budget is set where a thread stops being a conversation
+// someone had and starts being a data set — and reaching it is reported, since
+// the same loss applies there.
 func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) ([]Message, error) {
 	var (
 		messages []Message
 		cursor   string
 	)
-	for page := 0; page < maxHistoryPages; page++ {
+	for page := 0; page < maxThreadCatchUpPages; page++ {
 		replies, err := api.Replies(ctx, RepliesRequest{
 			Channel:  channel,
 			ThreadTS: threadTS,
@@ -557,9 +573,12 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 
 		cursor = replies.NextCursor
 		if cursor == "" {
-			break
+			return messages, nil
 		}
 	}
+
+	log.Printf("stopped reading a thread after %d pages of replies; anything past that is older than the new cursor and will not be delivered",
+		maxThreadCatchUpPages)
 	return messages, nil
 }
 
@@ -621,7 +640,18 @@ func (b *Bridge) restoreIndicator(ctx context.Context, retired retiredIndicator)
 	if !retired.wasRunning || ctx.Err() != nil || b.ctx.Err() != nil {
 		return
 	}
-	b.startIndicatorAt(retired.startedAt)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Slack calls take time, and another call may have moved on while this one
+	// was failing — a reply that succeeded, or a new turn with its own clock.
+	// Undo only this call's own retirement, and only if it is still the last
+	// thing that happened.
+	if b.indicatorGeneration != retired.generation {
+		return
+	}
+	b.startIndicatorLocked(retired.startedAt)
 }
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"
@@ -673,7 +703,10 @@ func (b *Bridge) startIndicator() {
 func (b *Bridge) startIndicatorAt(startedAt time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.startIndicatorLocked(startedAt)
+}
 
+func (b *Bridge) startIndicatorLocked(startedAt time.Time) {
 	b.stopIndicatorLocked()
 	if b.cfg.IndicatorDisabled || b.api == nil {
 		return
@@ -683,6 +716,7 @@ func (b *Bridge) startIndicatorAt(startedAt time.Time) {
 	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, grace, interval, b.indicatorDone)
 	b.indicator.startedAt = startedAt
 	b.indicatorDone = b.indicator.done
+	b.indicatorGeneration++
 	b.indicator.start()
 }
 
@@ -696,6 +730,12 @@ type retiredIndicator struct {
 	// startedAt is when the agent received the work, not when the indicator
 	// was created, so a restored one shows the true elapsed time.
 	startedAt time.Time
+	// generation is the bridge's indicator counter at the moment of this
+	// retirement. It is what makes a restore safe to attempt after a slow
+	// Slack call: if anything else has started or stopped an indicator since,
+	// this retirement is no longer the current state and putting it back would
+	// overwrite whatever replaced it.
+	generation uint64
 }
 
 // stopIndicator retires the running indicator, if any. It returns without
@@ -711,13 +751,14 @@ func (b *Bridge) stopIndicator() retiredIndicator {
 // for.
 func (b *Bridge) stopIndicatorLocked() retiredIndicator {
 	if b.indicator == nil {
-		return retiredIndicator{}
+		return retiredIndicator{generation: b.indicatorGeneration}
 	}
-	retired := retiredIndicator{wasRunning: true, startedAt: b.indicator.startedAt}
 	b.indicator.stop()
 	b.indicatorDone = b.indicator.done
+	startedAt := b.indicator.startedAt
 	b.indicator = nil
-	return retired
+	b.indicatorGeneration++
+	return retiredIndicator{wasRunning: true, startedAt: startedAt, generation: b.indicatorGeneration}
 }
 
 // apiForCall connects if necessary and returns the Web API handle.

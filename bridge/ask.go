@@ -180,7 +180,17 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, b.ctx.Err()
 
-		case in := <-stream.Interactions():
+		case in, ok := <-stream.Interactions():
+			if !ok {
+				b.mu.Lock()
+				b.connected = false
+				b.mu.Unlock()
+				// The click channel closes with the socket, and a closed
+				// channel is permanently ready — so this has to be handled
+				// here or the loop spins on it. No answer can arrive now.
+				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+				return AskResult{}, errors.New("the Slack connection closed")
+			}
 			b.routeInteraction(in)
 
 		case evt, ok := <-stream.Events():
@@ -237,10 +247,17 @@ func (b *Bridge) adoptQuestion(ask *pendingAsk, ts string) {
 
 // drainInteractions takes everything already queued on the interaction channel
 // and routes it, without waiting for more.
+//
+// The closed check is not a formality: a closed channel is permanently ready,
+// so without it this loop would never reach its default and would spin for
+// ever the moment the socket went away.
 func (b *Bridge) drainInteractions(stream Stream) {
 	for {
 		select {
-		case in := <-stream.Interactions():
+		case in, ok := <-stream.Interactions():
+			if !ok {
+				return
+			}
 			b.routeInteraction(in)
 		default:
 			return
