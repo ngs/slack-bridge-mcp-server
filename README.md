@@ -147,6 +147,13 @@ home channel — so a session that never leaves it never has to think about the
 argument. Messages come back with the channel they were sent in; pass it back
 with `thread_ts` and the reply lands in the conversation it answers.
 
+Outbound text — a `slack_post` message, a `slack_ask` question, a
+`slack_progress` label — is normalized from the Markdown models tend to write
+into the mrkdwn Slack renders, so `**bold**` arrives bold rather than arriving
+with its asterisks showing. Only bold, links and headings are converted; code
+spans and fenced blocks are left exactly as written, and anything ambiguous is
+left alone.
+
 `slack_wait` caps at 1500 seconds because Claude Code aborts a stdio MCP tool
 call after 30 minutes with no response bytes; 25 minutes keeps a margin. A
 `timed_out: true` result is not an error — just call it again.

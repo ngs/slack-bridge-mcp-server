@@ -58,7 +58,7 @@ type WaitArgs struct {
 
 // PostArgs is the argument set for slack_post.
 type PostArgs struct {
-	Text     string `json:"text" jsonschema:"the message body to send, as Slack mrkdwn"`
+	Text     string `json:"text" jsonschema:"the message body to send, as Slack mrkdwn; common Markdown is normalized for you, so **bold**, [label](url) and # headings all arrive rendered"`
 	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"reply inside this thread instead of the channel; pass the thread_ts of a message from slack_wait"`
 	Channel  string `json:"channel,omitempty" jsonschema:"the channel to speak in; pass the channel of the message you are answering, and leave it out for the home channel"`
 }
@@ -72,7 +72,7 @@ type AckArgs struct {
 
 // AskArgs is the argument set for slack_ask.
 type AskArgs struct {
-	Question       string   `json:"question" jsonschema:"the question to ask, as Slack mrkdwn"`
+	Question       string   `json:"question" jsonschema:"the question to ask, as Slack mrkdwn; common Markdown is normalized for you, as it is for slack_post"`
 	Options        []string `json:"options" jsonschema:"the answers to offer as buttons, between 2 and 10; labels longer than 75 characters are shortened"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait for an answer, in seconds; defaults to 300 and is clamped to 5-1500"`
 	ThreadTS       string   `json:"thread_ts,omitempty" jsonschema:"ask inside this thread instead of the channel"`
