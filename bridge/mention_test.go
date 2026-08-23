@@ -660,3 +660,52 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", threads)
 	}
 }
+
+// A workspace where the app has just been added has nothing to scan, and the
+// scan has to record that it looked anyway. Otherwise the cursor stays unset,
+// the next scan is another first run, and the first mention the owner sends
+// while the session is down is read as history and dropped.
+func TestAnEmptyFirstScanStillRecordsThatItLooked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the home cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		joined:    []string{otherChannel},
+		channelHistory: map[string][]candidate{
+			testChannel:  {ownerMsg("100.000100", "already answered")},
+			otherChannel: nil,
+		},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
+		t.Fatalf("Wait() returned %v from an empty workspace, want nothing", texts(msgs))
+	}
+	if cursor, err := NewStore(cfg.StateDir).MentionCursor(); err != nil || cursor == "" {
+		t.Fatalf("mention cursor = %q (err %v), want the scan to have recorded that it looked", cursor, err)
+	}
+
+	// Now the owner mentions the app while the session is not listening.
+	sent := strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10) + ".000100"
+	api.mu.Lock()
+	api.channelHistory[otherChannel] = []candidate{
+		{Channel: otherChannel, User: testOwner, Text: mention("first thing I ever asked"), TS: sent},
+	}
+	api.mu.Unlock()
+	stream.events <- StreamEvent{Kind: StreamConnected}
+
+	msgs := waitFor(ctx, t, b)
+	if len(msgs) != 1 || msgs[0].TS != sent {
+		t.Fatalf("Wait() returned %v, want the first mention delivered rather than swallowed as history", texts(msgs))
+	}
+}

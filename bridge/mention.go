@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Bounds on the two passes that recover conversations outside the home
@@ -319,11 +321,30 @@ func (b *Bridge) scanForMentions(ctx context.Context, api API, owner string) ([]
 		log.Printf("looked for missed mentions in %d channels and skipped %d; a mention in one of those will only be seen when it is repeated",
 			scanned, skipped)
 	}
+	if newest == "" {
+		// Not one message in any channel scanned, which is what a workspace the
+		// app has just been added to looks like. The moment stands in for it, so
+		// that the next scan is a real search rather than another first run:
+		// without this the cursor would still be unset, and the first mention
+		// the owner sends while the session is down would be read as history and
+		// dropped.
+		//
+		// This is the one place the bridge trusts the local clock against
+		// Slack's. It can only skip a message posted between this instant and
+		// the next scan, and only if the two clocks disagree — a narrow window,
+		// and the alternative is losing a mention outright.
+		newest = nowTS()
+	}
 	if cursor == "" {
 		// A first run joins rather than replays.
 		return nil, newest, nil
 	}
 	return found, newest, nil
+}
+
+// nowTS renders this moment the way Slack writes a timestamp.
+func nowTS() string {
+	return strconv.FormatInt(time.Now().Unix(), 10) + ".000000"
 }
 
 // closeThread forgets a conversation whose thread no longer exists, on disk as
