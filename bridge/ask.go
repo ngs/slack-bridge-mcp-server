@@ -59,6 +59,17 @@ const (
 // handful is generous.
 const maxEarlyClicks = 8
 
+// AskRequest is the question to put to the owner, and where to put it.
+type AskRequest struct {
+	Question string
+	Options  []string
+	Timeout  time.Duration
+	// ThreadTS asks inside a thread instead of on the channel surface.
+	ThreadTS string
+	// Channel is the conversation to ask in. Empty means the home channel.
+	Channel string
+}
+
 // AskResult is what slack_ask returns. ChoiceIndex is -1 when no choice was
 // made, so a timed-out answer cannot be misread as the first option.
 //
@@ -79,8 +90,11 @@ type AskResult struct {
 // channel so the routing side can hand the answer over without blocking, and
 // without caring whether the asking goroutine is still there to take it.
 type pendingAsk struct {
-	ts     string
-	labels []string
+	ts string
+	// channel is where the question was posted, which is where a click has to
+	// come from to be this question's answer.
+	channel string
+	labels  []string
 	// answered carries the index of the option the owner clicked.
 	answered chan int
 	// warned keeps the log to one line per question when clicks that do not
@@ -100,7 +114,10 @@ type pendingAsk struct {
 // The question stops being clickable either way — the answered case is
 // rewritten with the choice, the expired case says so — so the owner never
 // faces buttons that no longer lead anywhere.
-func (b *Bridge) Ask(ctx context.Context, question string, options []string, timeout time.Duration, threadTS string) (AskResult, error) {
+func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
+	question, options := req.Question, req.Options
+	threadTS, timeout := req.ThreadTS, req.Timeout
+
 	q, labels, err := buildQuestion(question, options)
 	if err != nil {
 		return AskResult{}, err
@@ -115,9 +132,10 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 		b.mu.Unlock()
 		return AskResult{}, errors.New("a question is already waiting for an answer; wait for it to be answered or to time out before asking another")
 	}
-	ask := &pendingAsk{labels: labels, answered: make(chan int, 1)}
+	channel := b.channelOr(req.Channel)
+	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel}
 	b.ask = ask
-	api, channel, stream := b.api, b.cfg.Channel, b.stream
+	api, stream := b.api, b.stream
 	b.mu.Unlock()
 
 	defer b.clearAsk(ask)
@@ -163,7 +181,7 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 			// messages slack_wait returns, so the clock starts again here —
 			// and in the thread the question was asked in, which is where the
 			// owner just clicked and where they are watching for what follows.
-			b.startIndicator(threadTS)
+			b.startIndicator(channel, threadTS)
 			return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
 
 		case <-deadline.C:
@@ -171,7 +189,7 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask, stream); ok {
 				b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
-				b.startIndicator(threadTS)
+				b.startIndicator(channel, threadTS)
 				return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
 			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
@@ -356,7 +374,7 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 	// answer. Otherwise unrelated traffic during the posting window could fill
 	// it and push the owner's real click out.
 	if in.User != b.cfg.Owner || in.BlockID != askBlockID ||
-		(in.Channel != "" && in.Channel != b.cfg.Channel) {
+		(in.Channel != "" && in.Channel != ask.channel) {
 		ask.warn(in)
 		return
 	}

@@ -69,7 +69,7 @@ func TestAskReturnsTheClickedOption(t *testing.T) {
 		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No", "Later"}, MaxWaitTimeout, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No", "Later"}, Timeout: MaxWaitTimeout, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -119,7 +119,7 @@ func TestAskIgnoresClicksThatAreNotTheOwnerAnsweringThisQuestion(t *testing.T) {
 		stream.interactions <- click(testOwner, "100.000111", 0)
 	}()
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, 120*time.Millisecond, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: 120 * time.Millisecond, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -144,7 +144,7 @@ func TestAskExpiresTheQuestionOnTimeout(t *testing.T) {
 
 	b, api, _ := askBridge(ctx, t)
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, 20*time.Millisecond, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: 20 * time.Millisecond, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -171,7 +171,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 
 	first := make(chan error, 1)
 	go func() {
-		_, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+		_, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""})
 		first <- err
 	}()
 
@@ -179,7 +179,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 		return len(b.pendingAskTS()) > 0
 	})
 
-	if _, err := b.Ask(ctx, "And now?", []string{"Yes", "No"}, MinWaitTimeout, ""); err == nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "And now?", Options: []string{"Yes", "No"}, Timeout: MinWaitTimeout, ThreadTS: ""}); err == nil {
 		t.Error("second Ask() = nil error, want it refused while a question is pending")
 	}
 
@@ -193,7 +193,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		stream.interactions <- click(testOwner, askTS, 1)
 	}()
-	if _, err := b.Ask(ctx, "And now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "And now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err != nil {
 		t.Errorf("Ask() after the first was answered = %v, want it to succeed", err)
 	}
 }
@@ -221,7 +221,7 @@ func TestAskStopsTheIndicatorAndRestartsItOnTheAnswer(t *testing.T) {
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
-	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
 
@@ -246,7 +246,7 @@ func TestAskInAThreadRestartsTheIndicatorInThatThread(t *testing.T) {
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
-	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "100.000200"); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: "100.000200"}); err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestAskLeavesTheIndicatorStoppedOnTimeout(t *testing.T) {
 
 	b, api, _ := askBridge(ctx, t)
 
-	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, 20*time.Millisecond, ""); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: 20 * time.Millisecond, ThreadTS: ""}); err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
 
@@ -288,7 +288,7 @@ func TestAskKeepsMessagesForTheNextWait(t *testing.T) {
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
-	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
 
@@ -310,7 +310,7 @@ func TestAskShortensLabelsToSlacksLimit(t *testing.T) {
 	b, api, _ := askBridge(ctx, t)
 
 	long := strings.Repeat("a", 200)
-	if _, err := b.Ask(ctx, "Which one?", []string{long, "short"}, 20*time.Millisecond, ""); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Which one?", Options: []string{long, "short"}, Timeout: 20 * time.Millisecond, ThreadTS: ""}); err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
 
@@ -340,12 +340,12 @@ func TestAskRejectsUnusableOptionSets(t *testing.T) {
 		"blank label": {"Yes", "   "},
 	}
 	for name, options := range tests {
-		if _, err := b.Ask(ctx, "Which one?", options, MinWaitTimeout, ""); err == nil {
+		if _, err := b.Ask(ctx, AskRequest{Question: "Which one?", Options: options, Timeout: MinWaitTimeout, ThreadTS: ""}); err == nil {
 			t.Errorf("Ask() with %s = nil error, want it rejected", name)
 		}
 	}
 
-	if _, err := b.Ask(ctx, "  ", []string{"Yes", "No"}, MinWaitTimeout, ""); err == nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "  ", Options: []string{"Yes", "No"}, Timeout: MinWaitTimeout, ThreadTS: ""}); err == nil {
 		t.Error("Ask() with an empty question = nil error, want it rejected")
 	}
 
@@ -366,7 +366,7 @@ func TestAskAcceptsTheFullRangeOfOptionCounts(t *testing.T) {
 	for i := range options {
 		options[i] = "option"
 	}
-	if _, err := b.Ask(ctx, "Which one?", options, 20*time.Millisecond, ""); err != nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Which one?", Options: options, Timeout: 20 * time.Millisecond, ThreadTS: ""}); err != nil {
 		t.Fatalf("Ask() with %d options = %v, want it accepted", MaxAskOptions, err)
 	}
 	if got := len(api.snapshotQuestions()[0].Question.Options); got != MaxAskOptions {
@@ -388,7 +388,7 @@ func TestAskExpiresTheQuestionWhenTheCallIsAborted(t *testing.T) {
 		abort()
 	}()
 
-	if _, err := b.Ask(callCtx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err == nil {
+	if _, err := b.Ask(callCtx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err == nil {
 		t.Fatal("Ask() = nil error after the call was aborted, want the cancellation surfaced")
 	}
 	resolutions := api.snapshotResolutions()
@@ -415,7 +415,7 @@ func TestAskRestoresTheIndicatorWhenTheQuestionCannotBePosted(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the indicator to appear", func() bool { return len(indicatorPosts(api)) == 1 })
 
-	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err == nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err == nil {
 		t.Fatal("Ask() = nil error when the question could not be posted, want the failure surfaced")
 	}
 
@@ -441,7 +441,7 @@ func TestAskAcceptsAClickThatArrivesBeforeThePostReturns(t *testing.T) {
 	api.beforeQuestionReturns = func() { b.routeInteraction(click(testOwner, askTS, 1)) }
 	api.mu.Unlock()
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -465,7 +465,7 @@ func TestAskTakesAQueuedClickOverTheDeadline(t *testing.T) {
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MinWaitTimeout, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MinWaitTimeout, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -505,7 +505,7 @@ func TestAskChecksWhoAndWhereBeforeBufferingAClick(t *testing.T) {
 	}
 	api.mu.Unlock()
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -533,7 +533,7 @@ func TestAskWaitsForAClickThatIsAlreadyOnItsWay(t *testing.T) {
 		b.routeInteraction(click(testOwner, askTS, 1))
 	}()
 
-	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, 40*time.Millisecond, "")
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: 40 * time.Millisecond, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
@@ -554,7 +554,7 @@ func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 		close(stream.events)
 	}()
 
-	if _, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, ""); err == nil {
+	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err == nil {
 		t.Fatal("Ask() = nil error after the connection closed, want the disconnection reported")
 	}
 
@@ -620,7 +620,7 @@ func TestAskReportsTheDisconnectionWhenTheClickChannelCloses(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, MaxWaitTimeout, "")
+		_, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""})
 		done <- err
 	}()
 

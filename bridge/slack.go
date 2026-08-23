@@ -76,6 +76,14 @@ type API interface {
 	Replies(ctx context.Context, req RepliesRequest) (HistoryPage, error)
 	// UserName resolves a Slack user ID to the name a person would recognise.
 	UserName(ctx context.Context, userID string) (string, error)
+	// JoinedChannels lists the channels the bot itself is a member of, newest
+	// page first and at most limit of them. It is how the search for mentions
+	// missed while the session was down knows where to look.
+	JoinedChannels(ctx context.Context, limit int) ([]string, error)
+	// BotUserID is the user ID of the bot the tokens belong to, learned when
+	// the connection was opened. A mention is that ID appearing in the text, so
+	// the bridge cannot recognise one without it.
+	BotUserID() string
 	// Post sends a message to a channel, optionally into a thread, and
 	// returns the timestamp of the posted message.
 	Post(ctx context.Context, channel, threadTS, text string) (string, error)

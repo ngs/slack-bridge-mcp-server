@@ -13,8 +13,14 @@ type Message struct {
 	// channel and as the ordering key.
 	TS string `json:"ts"`
 	// ThreadTS is set when the message is a reply inside a thread, so the
-	// caller can reply into the same thread via slack_post.
+	// caller can reply into the same thread via slack_post. Outside the home
+	// channel it is always set: a conversation opened by a mention lives in the
+	// thread under the message that opened it.
 	ThreadTS string `json:"thread_ts,omitempty"`
+	// Channel is where the message was sent. The home channel is only one of
+	// the conversations the bridge relays, so a reply has to say which one it
+	// belongs to: pass this back to slack_post along with ThreadTS.
+	Channel string `json:"channel"`
 	// User is the Slack user ID of the author. Always the configured owner.
 	User string `json:"user"`
 	// Text is the message body as Slack stores it (mrkdwn source).
@@ -57,17 +63,23 @@ type candidate struct {
 	LatestReply string
 }
 
-// accept reports whether the candidate is an owner message on the bound
-// channel that should be handed to the caller, returning the relayable form.
+// accept reports whether the candidate is owner text worth relaying, returning
+// the relayable form. It applies the rules that hold in every channel: the
+// owner wrote it, an app did not, it is a plain message, and it says something.
+//
+// channel restricts the result to one channel, which is what a caller reading a
+// known conversation wants. An empty channel accepts any, and is for the live
+// stream: which conversations are open changes while the session runs, so that
+// decision belongs to the bridge rather than to the socket.
 //
 // Bot messages are rejected even when they carry the owner's user ID, which is
 // what stops the bridge from feeding the agent's own slack_post echoes back to
 // it as new input.
 func accept(c candidate, channel, owner string) (Message, bool) {
-	if channel == "" || owner == "" {
+	if owner == "" {
 		return Message{}, false
 	}
-	if c.Channel != "" && c.Channel != channel {
+	if channel != "" && c.Channel != "" && c.Channel != channel {
 		return Message{}, false
 	}
 	if c.BotID != "" || c.User != owner {
@@ -79,12 +91,51 @@ func accept(c candidate, channel, owner string) (Message, bool) {
 	if c.TS == "" || strings.TrimSpace(c.Text) == "" {
 		return Message{}, false
 	}
+	// The channel asked for is the authority when the candidate does not carry
+	// one: conversations.history results are scoped to the channel requested,
+	// and the caller has to be able to say which conversation a reply belongs
+	// to.
+	from := c.Channel
+	if from == "" {
+		from = channel
+	}
 	return Message{
 		TS:       c.TS,
 		ThreadTS: c.ThreadTS,
 		User:     c.User,
 		Text:     c.Text,
+		Channel:  from,
 	}, true
+}
+
+// mergeConversations orders messages from several conversations into one
+// oldest-first run, dropping duplicates.
+//
+// Unlike mergeMessages it deduplicates by channel and timestamp together, and
+// filters nothing by age: each conversation has its own cursor, and the caller
+// has already applied them. A timestamp identifies a message only within its
+// channel, so keying on it alone would let a message in one channel hide a
+// message in another that happened in the same instant.
+func mergeConversations(sources ...[]Message) []Message {
+	seen := make(map[string]bool)
+	var merged []Message
+	for _, source := range sources {
+		for _, m := range source {
+			if m.TS == "" {
+				continue
+			}
+			key := m.Channel + "\x00" + m.TS
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			merged = append(merged, m)
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		return tsLess(merged[i].TS, merged[j].TS)
+	})
+	return merged
 }
 
 // tsLess orders two Slack timestamps. They look like "1723456789.000200": a

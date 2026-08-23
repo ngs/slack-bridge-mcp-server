@@ -166,3 +166,75 @@ func TestAcquireLockIsExclusive(t *testing.T) {
 		t.Errorf("a second Release() = %v, want it to be a no-op", err)
 	}
 }
+
+// A state file written before conversation threads existed has to keep working:
+// the operator upgrades the binary, not the file, and a bridge that could not
+// read it would replay the home channel from scratch.
+func TestAnOlderStateFileStillLoads(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	older := `{"channels":{"C1":{"last_ts":"1723456789.000100"}}}` + "\n"
+	if err := os.WriteFile(store.Path(), []byte(older), 0o600); err != nil {
+		t.Fatalf("writing the older state file: %v", err)
+	}
+
+	if got, err := store.LastTS("C1"); err != nil || got != "1723456789.000100" {
+		t.Errorf("LastTS() = %q (err %v), want the cursor the older build wrote", got, err)
+	}
+	threads, err := store.Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	if len(threads) != 0 {
+		t.Errorf("Threads() = %+v on an older file, want none open", threads)
+	}
+	if got, err := store.MentionCursor(); err != nil || got != "" {
+		t.Errorf("MentionCursor() = %q (err %v), want it unset so the first scan seeds it", got, err)
+	}
+
+	// And writing the new fields does not disturb the old one.
+	if err := store.SetThread("C2", "1723456789.000200", ""); err != nil {
+		t.Fatalf("SetThread() error = %v", err)
+	}
+	if got, err := store.LastTS("C1"); err != nil || got != "1723456789.000100" {
+		t.Errorf("LastTS() = %q (err %v) after opening a thread, want it untouched", got, err)
+	}
+}
+
+func TestThreadCursorsOnlyMoveForward(t *testing.T) {
+	store := NewStore(t.TempDir())
+
+	if err := store.SetThread("C1", "100.000100", ""); err != nil {
+		t.Fatalf("SetThread() error = %v", err)
+	}
+	if err := store.SetThread("C1", "100.000100", "100.000300"); err != nil {
+		t.Fatalf("SetThread() error = %v", err)
+	}
+	// A stale value is what a slow catch-up finishing after a live message
+	// looks like; honouring it would replay replies already handed over.
+	if err := store.SetThread("C1", "100.000100", "100.000200"); err != nil {
+		t.Fatalf("SetThread() error = %v", err)
+	}
+
+	threads, err := store.Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	if len(threads) != 1 {
+		t.Fatalf("Threads() = %+v, want the one thread recorded once", threads)
+	}
+	if threads[0].LastTS != "100.000300" {
+		t.Errorf("thread cursor = %q, want the newest of the values written", threads[0].LastTS)
+	}
+
+	if err := store.SetMentionCursor("100.000300"); err != nil {
+		t.Fatalf("SetMentionCursor() error = %v", err)
+	}
+	if err := store.SetMentionCursor("100.000200"); err != nil {
+		t.Fatalf("SetMentionCursor() error = %v", err)
+	}
+	if got, err := store.MentionCursor(); err != nil || got != "100.000300" {
+		t.Errorf("MentionCursor() = %q (err %v), want it never to go backwards", got, err)
+	}
+}

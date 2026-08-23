@@ -33,7 +33,7 @@ func TestProgressLabelRidesTheIndicatorUpdates(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
 
-	result, err := b.Progress(ctx, progressLabel, "")
+	result, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Progress() error = %v", err)
 	}
@@ -78,7 +78,7 @@ func TestProgressCutsTheGracePeriodShort(t *testing.T) {
 		t.Fatalf("indicator posts = %+v before the grace period is up, want none", got)
 	}
 
-	if _, err := b.Progress(ctx, progressLabel, ""); err != nil {
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""}); err != nil {
 		t.Fatalf("Progress() error = %v", err)
 	}
 
@@ -116,7 +116,7 @@ func TestProgressStillWaitsForTheOutgoingIndicator(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the outgoing indicator to start deleting", func() bool { return len(api.snapshotDeletes()) == 1 })
 
-	if _, err := b.Progress(ctx, progressLabel, ""); err != nil {
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""}); err != nil {
 		t.Fatalf("Progress() error = %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestProgressStartsAnIndicatorWhenNoneIsRunning(t *testing.T) {
 		defer cancel()
 
 		b, api, _ := indicatorBridge(ctx, t)
-		if _, err := b.Progress(ctx, progressLabel, ""); err != nil {
+		if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""}); err != nil {
 			t.Fatalf("Progress() error = %v", err)
 		}
 
@@ -157,7 +157,7 @@ func TestProgressStartsAnIndicatorWhenNoneIsRunning(t *testing.T) {
 		}
 
 		// It is an ordinary indicator from here: the reply ends it.
-		if _, err := b.Post(ctx, "done", ""); err != nil {
+		if _, err := b.Post(ctx, PostRequest{Text: "done", ThreadTS: ""}); err != nil {
 			t.Fatalf("Post() error = %v", err)
 		}
 		eventually(t, "the indicator to be deleted", func() bool { return len(api.snapshotDeletes()) == 1 })
@@ -168,7 +168,7 @@ func TestProgressStartsAnIndicatorWhenNoneIsRunning(t *testing.T) {
 		defer cancel()
 
 		b, api, _ := indicatorBridge(ctx, t)
-		if _, err := b.Progress(ctx, progressLabel, "100.000200"); err != nil {
+		if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: "100.000200"}); err != nil {
 			t.Fatalf("Progress() error = %v", err)
 		}
 
@@ -196,7 +196,7 @@ func TestProgressDoesNotMoveARunningIndicator(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
 
-	if _, err := b.Progress(ctx, progressLabel, "100.000200"); err != nil {
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: "100.000200"}); err != nil {
 		t.Fatalf("Progress() error = %v", err)
 	}
 
@@ -218,14 +218,14 @@ func TestProgressReplacesTheLabel(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
 
-	if _, err := b.Progress(ctx, "waiting for CI", ""); err != nil {
+	if _, err := b.Progress(ctx, ProgressRequest{Text: "waiting for CI", ThreadTS: ""}); err != nil {
 		t.Fatalf("Progress() error = %v", err)
 	}
 	eventually(t, "the first label to reach the channel", func() bool {
 		return strings.Contains(lastIndicatorUpdate(api), "waiting for CI")
 	})
 
-	if _, err := b.Progress(ctx, "publishing the release", ""); err != nil {
+	if _, err := b.Progress(ctx, ProgressRequest{Text: "publishing the release", ThreadTS: ""}); err != nil {
 		t.Fatalf("second Progress() error = %v", err)
 	}
 	eventually(t, "the second label to replace the first", func() bool {
@@ -245,7 +245,7 @@ func TestTheLabelRetiresWithTheIndicator(t *testing.T) {
 	waitForMessages(ctx, t, b)
 	eventually(t, "the indicator to be posted", func() bool { return len(indicatorPosts(api)) == 1 })
 
-	if _, err := b.Progress(ctx, progressLabel, ""); err != nil {
+	if _, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""}); err != nil {
 		t.Fatalf("Progress() error = %v", err)
 	}
 	eventually(t, "the label to reach the channel", func() bool {
@@ -272,7 +272,7 @@ func TestProgressDoesNothingWhenTheIndicatorIsOff(t *testing.T) {
 	b, api, _ := indicatorBridge(ctx, t)
 	b.cfg.IndicatorDisabled = true
 
-	result, err := b.Progress(ctx, progressLabel, "")
+	result, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Progress() error = %v, want the call to succeed quietly", err)
 	}
@@ -297,7 +297,7 @@ func TestProgressWithTheIndicatorOffDoesNotConnect(t *testing.T) {
 	b := New(ctx, Config{StateDir: t.TempDir(), IndicatorDisabled: true}, connector)
 	t.Cleanup(func() { _ = b.Close() })
 
-	result, err := b.Progress(ctx, progressLabel, "")
+	result, err := b.Progress(ctx, ProgressRequest{Text: progressLabel, ThreadTS: ""})
 	if err != nil {
 		t.Fatalf("Progress() error = %v, want the call to succeed quietly", err)
 	}
@@ -318,7 +318,7 @@ func TestProgressRequiresSomethingToSay(t *testing.T) {
 	b, api, _ := indicatorBridge(ctx, t)
 
 	for _, text := range []string{"", "   ", "\n\t"} {
-		if _, err := b.Progress(ctx, text, ""); err == nil {
+		if _, err := b.Progress(ctx, ProgressRequest{Text: text, ThreadTS: ""}); err == nil {
 			t.Errorf("Progress(%q) = nil error, want it refused", text)
 		}
 	}

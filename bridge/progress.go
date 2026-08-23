@@ -14,6 +14,17 @@ import (
 // a glance and starts being a paragraph.
 const maxProgressLabel = 200
 
+// ProgressRequest is the status line to show, and where to show it if no
+// indicator is running yet.
+type ProgressRequest struct {
+	Text string
+	// ThreadTS and Channel place an indicator this call has to start. They are
+	// ignored when one is already running, and an empty channel means the home
+	// channel.
+	ThreadTS string
+	Channel  string
+}
+
 // ProgressResult is what slack_progress returns.
 //
 // TS is the indicator message the label was attached to, and is left out
@@ -39,9 +50,10 @@ type ProgressResult struct {
 // is where an agent that starts long work after a timed-out wait finds itself,
 // this starts one; it then retires like any other, on the next reply or wait.
 //
-// threadTS only decides where a newly started indicator goes. An indicator that
-// already exists belongs to a turn that has already chosen its surface, and
-// moving it would mean deleting and reposting the message the owner is watching.
+// channel and threadTS only decide where a newly started indicator goes, and an
+// empty channel means the home one. An indicator that already exists belongs to
+// a turn that has already chosen its surface, and moving it would mean deleting
+// and reposting the message the owner is watching.
 //
 // The call's context is unused, unlike the other tools'. Labelling a running
 // indicator is a handful of assignments, and the posts and updates that follow
@@ -50,8 +62,8 @@ type ProgressResult struct {
 // the lazy connect, and only when there is no indicator to label and no session
 // open yet; that runs on the bridge's context too, as it does for every other
 // tool.
-func (b *Bridge) Progress(_ context.Context, text, threadTS string) (ProgressResult, error) {
-	label := sanitizeProgressLabel(text)
+func (b *Bridge) Progress(_ context.Context, req ProgressRequest) (ProgressResult, error) {
+	label := sanitizeProgressLabel(req.Text)
 	if label == "" {
 		return ProgressResult{}, errors.New("text is required")
 	}
@@ -81,7 +93,7 @@ func (b *Bridge) Progress(_ context.Context, text, threadTS string) (ProgressRes
 			// Counting from now, because now is when the agent said it was
 			// working: whatever happened before this call is not what the owner
 			// is being asked to wait for.
-			b.startIndicatorLocked(time.Now(), threadTS)
+			b.startIndicatorLocked(time.Now(), req.Channel, req.ThreadTS)
 		}
 		in = b.indicator
 		b.mu.Unlock()

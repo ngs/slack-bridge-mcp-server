@@ -24,10 +24,18 @@ const ServerName = "slack-bridge-mcp-server"
 // instructions tell the model how the tools fit together, since the intended
 // use is an unusual one: a long-running poll loop rather than a request per
 // user turn.
-const instructions = `Bridges this session to a private Slack channel so the owner can talk to you from their phone.
+const instructions = `Bridges this session to the owner's Slack so they can talk to you from their phone.
 
 Call slack_wait to block until the owner sends a message; it returns immediately with
 anything that arrived while you were busy or the session was down. Reply with slack_post.
+Every message carries the channel it was sent in and, in a thread, its thread_ts. Pass both
+back to slack_post so the reply lands in the conversation it answers: the owner's home
+channel is only one of the places they may be talking to you, and a reply that leaves out
+the channel goes to the home channel regardless of where the question came from.
+Only the owner reaches you. In the home channel everything they say is relayed; in any
+other channel, they open a conversation by mentioning you, and from then on everything they
+say in that thread reaches you without another mention. Nobody else's messages are relayed
+anywhere — use slack_history when the owner asks you to read what other people said.
 Every message slack_wait returns is marked as received in Slack automatically, so you do
 not need slack_ack for that; use it only for a deliberate signal beyond receipt, such as
 marking a request done or rejected with a specific emoji.
@@ -52,12 +60,14 @@ type WaitArgs struct {
 type PostArgs struct {
 	Text     string `json:"text" jsonschema:"the message body to send, as Slack mrkdwn"`
 	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"reply inside this thread instead of the channel; pass the thread_ts of a message from slack_wait"`
+	Channel  string `json:"channel,omitempty" jsonschema:"the channel to speak in; pass the channel of the message you are answering, and leave it out for the home channel"`
 }
 
 // AckArgs is the argument set for slack_ack.
 type AckArgs struct {
-	TS    string `json:"ts" jsonschema:"the ts of the message to react to, as returned by slack_wait"`
-	Emoji string `json:"emoji,omitempty" jsonschema:"emoji name without colons; defaults to eyes"`
+	TS      string `json:"ts" jsonschema:"the ts of the message to react to, as returned by slack_wait"`
+	Emoji   string `json:"emoji,omitempty" jsonschema:"emoji name without colons; defaults to eyes"`
+	Channel string `json:"channel,omitempty" jsonschema:"the channel the message is in; pass the channel of the message you are marking, and leave it out for the home channel"`
 }
 
 // AskArgs is the argument set for slack_ask.
@@ -66,6 +76,7 @@ type AskArgs struct {
 	Options        []string `json:"options" jsonschema:"the answers to offer as buttons, between 2 and 10; labels longer than 75 characters are shortened"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait for an answer, in seconds; defaults to 300 and is clamped to 5-1500"`
 	ThreadTS       string   `json:"thread_ts,omitempty" jsonschema:"ask inside this thread instead of the channel"`
+	Channel        string   `json:"channel,omitempty" jsonschema:"the channel to ask in; pass the channel of the conversation you are in, and leave it out for the home channel"`
 }
 
 // HistoryArgs is the argument set for slack_history.
@@ -74,12 +85,14 @@ type HistoryArgs struct {
 	Oldest   string `json:"oldest,omitempty" jsonschema:"only messages strictly after this Slack ts"`
 	Latest   string `json:"latest,omitempty" jsonschema:"only messages strictly before this Slack ts"`
 	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"read the replies in this thread instead of the channel itself"`
+	Channel  string `json:"channel,omitempty" jsonschema:"the channel to read; leave it out for the home channel"`
 }
 
 // ProgressArgs is the argument set for slack_progress.
 type ProgressArgs struct {
 	Text     string `json:"text" jsonschema:"a short line saying what you are working on or waiting for, e.g. 'release chain: waiting for CI'"`
 	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"where to start the indicator if none is running; ignored when one already is"`
+	Channel  string `json:"channel,omitempty" jsonschema:"the channel to start the indicator in if none is running; ignored when one already is, and defaults to the home channel"`
 }
 
 // StatusArgs is empty: slack_status takes no arguments.
@@ -131,11 +144,17 @@ func New(b *bridge.Bridge) *mcp.Server {
 		Description: "Send a message to the bridged Slack channel, optionally as a reply inside a thread.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args PostArgs) (*mcp.CallToolResult, PostResult, error) {
-		ts, err := b.Post(ctx, args.Text, args.ThreadTS)
+		ts, err := b.Post(ctx, bridge.PostRequest{Text: args.Text, ThreadTS: args.ThreadTS, Channel: args.Channel})
 		if err != nil {
 			return nil, PostResult{}, err
 		}
-		return nil, PostResult{TS: ts, Channel: b.Status().Channel}, nil
+		// Report where it actually landed, which is the home channel only when
+		// the call did not name one.
+		channel := args.Channel
+		if channel == "" {
+			channel = b.Status().Channel
+		}
+		return nil, PostResult{TS: ts, Channel: channel}, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -148,7 +167,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 		if emoji == "" {
 			emoji = "eyes"
 		}
-		if err := b.React(ctx, args.TS, emoji); err != nil {
+		if err := b.React(ctx, bridge.ReactRequest{TS: args.TS, Emoji: emoji, Channel: args.Channel}); err != nil {
 			return nil, AckResult{}, err
 		}
 		return nil, AckResult{OK: true, TS: args.TS, Emoji: emoji}, nil
@@ -160,7 +179,13 @@ func New(b *bridge.Bridge) *mcp.Server {
 		Description: "Post a multiple-choice question to the bridged Slack channel and block until the owner taps an answer, or the timeout expires. Returns the chosen option.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args AskArgs) (*mcp.CallToolResult, bridge.AskResult, error) {
-		result, err := b.Ask(ctx, args.Question, args.Options, bridge.ClampTimeout(args.TimeoutSeconds), args.ThreadTS)
+		result, err := b.Ask(ctx, bridge.AskRequest{
+			Question: args.Question,
+			Options:  args.Options,
+			Timeout:  bridge.ClampTimeout(args.TimeoutSeconds),
+			ThreadTS: args.ThreadTS,
+			Channel:  args.Channel,
+		})
 		if err != nil {
 			return nil, bridge.AskResult{}, err
 		}
@@ -178,6 +203,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 			Oldest:   args.Oldest,
 			Latest:   args.Latest,
 			ThreadTS: args.ThreadTS,
+			Channel:  args.Channel,
 		})
 		if err != nil {
 			return nil, bridge.HistoryResult{}, err
@@ -194,7 +220,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 		Description: "Put a short status line beside the elapsed time on the processing indicator, for when you start something long such as waiting for CI. The server keeps it updated and clears it when the turn ends; if no indicator is running, this starts one. An answer of ok false means the operator turned the indicator off, so the label had nowhere to go and nothing was posted; carry on with the work either way.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ProgressArgs) (*mcp.CallToolResult, bridge.ProgressResult, error) {
-		result, err := b.Progress(ctx, args.Text, args.ThreadTS)
+		result, err := b.Progress(ctx, bridge.ProgressRequest{Text: args.Text, ThreadTS: args.ThreadTS, Channel: args.Channel})
 		if err != nil {
 			return nil, bridge.ProgressResult{}, err
 		}

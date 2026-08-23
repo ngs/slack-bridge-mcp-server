@@ -58,8 +58,8 @@ const (
 // disagreed and the process exited mid-cleanup.
 const shutdownIndicatorWait = indicatorRequestTimeout + indicatorDeleteTimeout + 2*time.Second
 
-// Bridge owns the Slack connection and the message cursor. All six MCP tools
-// go through it.
+// Bridge owns the Slack connection and the message cursors. Every MCP tool
+// goes through it.
 type Bridge struct {
 	cfg       Config
 	connector Connector
@@ -79,9 +79,26 @@ type Bridge struct {
 	// the flag that makes sleep/wake safe: whatever the WebSocket missed is
 	// still in Slack's history, and the next wait goes and gets it.
 	needCatchUp bool
-	// pending holds messages read from the stream while merging, so nothing
-	// is lost if a later step fails.
+	// pending holds home-channel messages read from the stream while merging,
+	// so nothing is lost if a later step fails.
 	pending []Message
+	// pendingThreads is the same for messages in conversation threads outside
+	// the home channel. They are kept apart because the home channel's cursor
+	// does not apply to them: every thread has its own, and one queue would let
+	// a reply older than the home cursor be discarded as already seen.
+	pendingThreads []Message
+	// botUserID is this app's own user ID, which is what a mention looks like
+	// in message text. It is learned when the connection opens.
+	botUserID string
+	// threads are the conversations open outside the home channel, and
+	// threadCursors is how far each of them has been read. Both are restored
+	// from the state file on connect, so a restart resumes a conversation
+	// instead of waiting to be mentioned again.
+	threads       map[threadKey]bool
+	threadCursors map[threadKey]string
+	// mentionCursor is how far through time the search for missed mentions has
+	// looked.
+	mentionCursor string
 	// indicator is the live "⏳ Working…" message, if one is running. At most
 	// one exists at a time; see indicator.go.
 	indicator *indicator
@@ -137,7 +154,7 @@ func (b *Bridge) Status() Status {
 		Channel:             b.cfg.Channel,
 		Owner:               b.cfg.Owner,
 		LastTS:              b.lastTS,
-		PendingBacklogCount: len(b.pending),
+		PendingBacklogCount: len(b.pending) + len(b.pendingThreads),
 	}
 	if err := b.cfg.Validate(); err != nil {
 		status.ConfigError = err.Error()
@@ -215,6 +232,16 @@ func (b *Bridge) ensure() error {
 			return err
 		}
 		b.lastTS = lastTS
+
+		mentionCursor, err := b.store.MentionCursor()
+		if err != nil {
+			return err
+		}
+		b.mentionCursor = mentionCursor
+
+		if err := b.loadThreadsLocked(); err != nil {
+			return err
+		}
 	}
 
 	api, stream, err := b.connector.Connect(b.ctx, b.cfg)
@@ -223,6 +250,10 @@ func (b *Bridge) ensure() error {
 	}
 
 	b.api = api
+	// Its own user ID is how the bridge recognises a mention. Without it the
+	// home channel still works and nothing else opens, which is why this is
+	// read rather than required.
+	b.botUserID = api.BotUserID()
 	b.stream = stream
 	b.connected = true
 	// The first catch-up covers everything missed since the last session;
@@ -271,8 +302,8 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// From here the agent is working on these messages, which is the
 			// span the owner sees counted. It is counted where they are
 			// looking: the newest message is the one they just sent, so its
-			// thread is the conversation they are waiting on.
-			b.startIndicator(newestThreadTS(msgs))
+			// channel and thread are the conversation they are waiting on.
+			b.startIndicator(newestConversation(msgs))
 			b.autoAck(msgs)
 			return WaitResult{Messages: msgs}, nil
 		}
@@ -351,7 +382,18 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 
 	switch evt.Kind {
 	case StreamMessage:
-		b.pending = append(b.pending, evt.Message)
+		// The socket relays every owner message in every channel the bot is in,
+		// because which conversations are open changes while the session runs.
+		// This is where that is decided.
+		msg, ok := b.classifyLocked(evt.Message)
+		if !ok {
+			return nil
+		}
+		if msg.Channel == "" || msg.Channel == b.cfg.Channel {
+			b.pending = append(b.pending, msg)
+		} else {
+			b.pendingThreads = append(b.pendingThreads, msg)
+		}
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the
 		// authority, so go re-read the window after the cursor.
@@ -372,9 +414,10 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	api := b.api
 	lastTS := b.lastTS
 	channel := b.cfg.Channel
+	owner := b.cfg.Owner
 	b.mu.Unlock()
 
-	var fetched []Message
+	var fetched, conversations []Message
 	if needCatchUp {
 		if lastTS == "" {
 			// First run against this channel: seeding from the newest
@@ -387,10 +430,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 			lastTS = seeded
 		} else {
 			var err error
-			fetched, err = catchUp(ctx, api, channel, b.cfg.Owner, lastTS)
+			fetched, err = catchUp(ctx, api, channel, owner, lastTS)
 			if err != nil {
 				return nil, err
 			}
+		}
+
+		// Everywhere else: the conversations opened by a mention, and any
+		// mention that opened one while nobody was listening.
+		var err error
+		conversations, err = b.catchUpConversations(ctx, api, owner)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -406,23 +457,89 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 
 	// Live events and history overlap around a reconnect; merging deduplicates
 	// by timestamp and drops anything at or before the cursor.
-	merged := mergeMessages(b.lastTS, fetched, b.pending)
+	home := mergeMessages(b.lastTS, fetched, b.pending)
 	b.pending = nil
-	if len(merged) == 0 {
+
+	threads := b.mergeThreadMessagesLocked(conversations, b.pendingThreads)
+	b.pendingThreads = nil
+
+	if len(home) == 0 && len(threads) == 0 {
 		return nil, nil
 	}
 
-	newest := merged[len(merged)-1].TS
-	if b.store != nil {
-		if err := b.store.SetLastTS(channel, newest); err != nil {
-			// Keep the messages rather than dropping them: a stale cursor
-			// costs a duplicate after a restart, losing them costs the
-			// owner a reply.
-			log.Printf("could not persist the cursor: %v", err)
+	if len(home) > 0 {
+		newest := home[len(home)-1].TS
+		if b.store != nil {
+			if err := b.store.SetLastTS(channel, newest); err != nil {
+				// Keep the messages rather than dropping them: a stale cursor
+				// costs a duplicate after a restart, losing them costs the
+				// owner a reply.
+				log.Printf("could not persist the cursor: %v", err)
+			}
 		}
+		b.lastTS = newest
 	}
-	b.lastTS = newest
-	return merged, nil
+	for _, m := range threads {
+		b.noteThreadDeliveredLocked(m)
+	}
+
+	return mergeConversations(home, threads), nil
+}
+
+// mergeThreadMessagesLocked combines what the threads outside the home channel
+// have to offer, dropping anything already delivered and anything whose
+// conversation is no longer open. The caller must hold b.mu.
+//
+// Each thread carries its own cursor, so this cannot lean on the home
+// channel's: a reply in a conversation opened last week is older than the home
+// cursor and still perfectly new.
+func (b *Bridge) mergeThreadMessagesLocked(sources ...[]Message) []Message {
+	merged := mergeConversations(sources...)
+
+	kept := merged[:0]
+	for _, m := range merged {
+		key := threadKey{m.Channel, m.ThreadTS}
+		if !b.threads[key] {
+			// The conversation was closed while this message was in flight —
+			// the thread was deleted, or the bot was removed from the channel.
+			continue
+		}
+		if cursor := b.threadCursors[key]; cursor != "" && !tsLess(cursor, m.TS) {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return kept
+}
+
+// noteThreadDeliveredLocked advances a conversation's cursor to a message just
+// handed over. The caller must hold b.mu.
+//
+// The mention cursor is deliberately left alone here. It records how far the
+// search for missed mentions has *looked*, not what has been delivered, and
+// moving it forward on a live message would step over an older mention in
+// another channel that the search has not reached yet. A mention found twice
+// costs nothing: the second copy is behind its thread's cursor and is dropped.
+func (b *Bridge) noteThreadDeliveredLocked(m Message) {
+	if m.Channel == "" || m.ThreadTS == "" || m.TS == "" {
+		return
+	}
+
+	key := threadKey{m.Channel, m.ThreadTS}
+	if current := b.threadCursors[key]; current != "" && !tsLess(current, m.TS) {
+		return
+	}
+	if b.threadCursors == nil {
+		b.threadCursors = make(map[threadKey]string)
+	}
+	b.threadCursors[key] = m.TS
+
+	if b.store == nil {
+		return
+	}
+	if err := b.store.SetThread(m.Channel, m.ThreadTS, m.TS); err != nil {
+		log.Printf("could not persist a conversation cursor: %v", err)
+	}
 }
 
 // seedCursor records where the conversation already is, without returning any
@@ -667,9 +784,19 @@ func ClampTimeout(seconds int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// Post sends a message to the bound channel, connecting first if needed.
-func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error) {
-	if text == "" {
+// PostRequest is what slack_post sends, and where.
+type PostRequest struct {
+	Text string
+	// ThreadTS replies inside a thread instead of on the channel surface.
+	ThreadTS string
+	// Channel is the conversation to speak in. Empty means the home channel,
+	// which is what a session that never leaves it never has to think about.
+	Channel string
+}
+
+// Post sends a message to a channel, connecting first if needed.
+func (b *Bridge) Post(ctx context.Context, req PostRequest) (string, error) {
+	if req.Text == "" {
 		return "", errors.New("text is required")
 	}
 
@@ -677,13 +804,13 @@ func (b *Bridge) Post(ctx context.Context, text, threadTS string) (string, error
 	// before the reply lands rather than after.
 	retired := b.stopIndicator()
 
-	api, channel, err := b.apiForCall()
+	api, _, err := b.apiForCall()
 	if err != nil {
 		b.restoreIndicator(ctx, retired)
 		return "", err
 	}
 
-	ts, err := api.Post(ctx, channel, threadTS, text)
+	ts, err := api.Post(ctx, b.channelFor(req.Channel), req.ThreadTS, req.Text)
 	if err != nil {
 		// The answer never landed, so the agent is still on the hook for it
 		// and the channel should go back to saying so.
@@ -718,9 +845,19 @@ func (b *Bridge) restoreIndicator(ctx context.Context, retired retiredIndicator)
 	if b.indicatorGeneration != retired.generation {
 		return
 	}
-	// Back where it was, thread included: the turn has not moved, only the
-	// attempt to end it failed.
-	b.startIndicatorLocked(retired.startedAt, retired.threadTS)
+	// Back where it was, channel and thread included: the turn has not moved,
+	// only the attempt to end it failed.
+	b.startIndicatorLocked(retired.startedAt, retired.channel, retired.threadTS)
+}
+
+// ReactRequest is the message to mark and how.
+type ReactRequest struct {
+	TS    string
+	Emoji string
+	// Channel is where the message lives. Empty means the home channel: a ts
+	// identifies a message only within its channel, so a reaction sent to the
+	// wrong one lands on somebody else's message or on nothing at all.
+	Channel string
 }
 
 // React adds an emoji reaction, the cheap way for the agent to signal "seen"
@@ -728,18 +865,20 @@ func (b *Bridge) restoreIndicator(ctx context.Context, retired retiredIndicator)
 //
 // It deliberately leaves the processing indicator alone: an ack means "seen,
 // still working", which is exactly the situation the indicator is there for.
-func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
-	if ts == "" {
+func (b *Bridge) React(ctx context.Context, req ReactRequest) error {
+	if req.TS == "" {
 		return errors.New("ts is required")
 	}
+	emoji := req.Emoji
 	if emoji == "" {
-		emoji = "eyes"
+		emoji = DefaultAutoAckEmoji
 	}
 
-	api, channel, err := b.apiForCall()
+	api, _, err := b.apiForCall()
 	if err != nil {
 		return err
 	}
+	channel, ts := b.channelFor(req.Channel), req.TS
 	// The automatic receipt reaction may well have got there first with the
 	// same emoji. The message is marked either way, which is all slack_ack
 	// promises, so that is a success rather than something to report.
@@ -763,28 +902,29 @@ func (b *Bridge) React(ctx context.Context, ts, emoji string) error {
 // the call that starts it returns immediately, and a per-call context would be
 // cancelled before the first tick.
 //
-// threadTS says where the turn is happening; empty means the channel surface.
-func (b *Bridge) startIndicator(threadTS string) {
-	b.startIndicatorAt(time.Now(), threadTS)
+// channel and threadTS say where the turn is happening; an empty channel means
+// the home channel, and an empty thread means the channel surface.
+func (b *Bridge) startIndicator(channel, threadTS string) {
+	b.startIndicatorAt(time.Now(), channel, threadTS)
 }
 
 // startIndicatorAt is startIndicator with the clock set, so an indicator put
 // back after a failed reply carries on counting from when the agent actually
 // started rather than restarting at zero.
-func (b *Bridge) startIndicatorAt(startedAt time.Time, threadTS string) {
+func (b *Bridge) startIndicatorAt(startedAt time.Time, channel, threadTS string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.startIndicatorLocked(startedAt, threadTS)
+	b.startIndicatorLocked(startedAt, channel, threadTS)
 }
 
-func (b *Bridge) startIndicatorLocked(startedAt time.Time, threadTS string) {
+func (b *Bridge) startIndicatorLocked(startedAt time.Time, channel, threadTS string) {
 	b.stopIndicatorLocked()
 	if b.cfg.IndicatorDisabled || b.api == nil {
 		return
 	}
 
 	grace, interval := b.cfg.indicatorTimings()
-	b.indicator = newIndicator(b.ctx, b.api, b.cfg.Channel, threadTS, grace, interval, b.indicatorDone)
+	b.indicator = newIndicator(b.ctx, b.api, b.channelOr(channel), threadTS, grace, interval, b.indicatorDone)
 	b.indicator.startedAt = startedAt
 	b.indicatorDone = b.indicator.done
 	b.indicatorGeneration++
@@ -801,10 +941,11 @@ type retiredIndicator struct {
 	// startedAt is when the agent received the work, not when the indicator
 	// was created, so a restored one shows the true elapsed time.
 	startedAt time.Time
-	// threadTS is the surface the retired indicator was posting to. A restore
-	// is the same turn resuming, so it has to go back to the same place;
-	// re-deriving it from the messages is not possible here, since the call
-	// that failed may not be the one that started the turn.
+	// channel and threadTS are the surface the retired indicator was posting
+	// to. A restore is the same turn resuming, so it has to go back to the same
+	// place; re-deriving it from the messages is not possible here, since the
+	// call that failed may not be the one that started the turn.
+	channel  string
 	threadTS string
 	// generation is the bridge's indicator counter at the moment of this
 	// retirement. It is what makes a restore safe to attempt after a slow
@@ -837,24 +978,52 @@ func (b *Bridge) stopIndicatorLocked() retiredIndicator {
 	b.indicator.stop()
 	b.indicatorDone = b.indicator.done
 	startedAt := b.indicator.startedAt
+	channel := b.indicator.channel
 	threadTS := b.indicator.threadTS
 	b.indicator = nil
-	return retiredIndicator{wasRunning: true, startedAt: startedAt, threadTS: threadTS, generation: b.indicatorGeneration}
+	return retiredIndicator{
+		wasRunning: true,
+		startedAt:  startedAt,
+		channel:    channel,
+		threadTS:   threadTS,
+		generation: b.indicatorGeneration,
+	}
 }
 
-// newestThreadTS reports the thread the most recent of these messages belongs
-// to, which is the conversation the agent is now expected to answer in. An
-// empty result means that message was posted on the channel surface.
+// newestConversation reports where the most recent of these messages was sent,
+// which is the conversation the agent is now expected to answer in. An empty
+// thread means the message was posted on a channel surface.
 //
 // The messages arrive oldest-first, so the last one is the newest. Only that
 // one is consulted: a batch delivered after a reconnect can span several
-// threads, and the owner is waiting where they spoke last, not where the
-// backlog happens to start.
-func newestThreadTS(msgs []Message) string {
+// threads and several channels, and the owner is waiting where they spoke
+// last, not where the backlog happens to start.
+func newestConversation(msgs []Message) (channel, threadTS string) {
 	if len(msgs) == 0 {
-		return ""
+		return "", ""
 	}
-	return msgs[len(msgs)-1].ThreadTS
+	newest := msgs[len(msgs)-1]
+	return newest.Channel, newest.ThreadTS
+}
+
+// channelFor resolves a tool's optional channel argument, taking b.mu.
+func (b *Bridge) channelFor(channel string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.channelOr(channel)
+}
+
+// channelOr is channelFor for callers that already hold b.mu.
+//
+// An empty channel means the home channel throughout the bridge. That is what
+// keeps every tool's channel argument optional: a session that only ever talks
+// in the home channel — which is every session before mentions existed — never
+// has to name it.
+func (b *Bridge) channelOr(channel string) string {
+	if channel == "" {
+		return b.cfg.Channel
+	}
+	return channel
 }
 
 // apiForCall connects if necessary and returns the Web API handle.

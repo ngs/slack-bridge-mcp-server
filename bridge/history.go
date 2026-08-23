@@ -41,6 +41,8 @@ type ReadRequest struct {
 	Latest string
 	// ThreadTS reads that thread's replies instead of the channel surface.
 	ThreadTS string
+	// Channel is the conversation to read. Empty means the home channel.
+	Channel string
 }
 
 // HistoryMessage is one message as slack_history reports it. Unlike Message,
@@ -80,11 +82,12 @@ type HistoryResult struct {
 // or stop the indicator, and does not react to anything. Calling it changes
 // nothing about what the next slack_wait will deliver.
 func (b *Bridge) History(ctx context.Context, req ReadRequest) (HistoryResult, error) {
-	api, channel, err := b.apiForCall()
+	api, _, err := b.apiForCall()
 	if err != nil {
 		return HistoryResult{}, err
 	}
 
+	channel := b.channelFor(req.Channel)
 	limit := clampHistoryLimit(req.Limit)
 
 	var (

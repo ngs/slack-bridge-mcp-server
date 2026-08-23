@@ -19,6 +19,9 @@ type fakeAPI struct {
 
 	// history is every message in the channel, oldest first.
 	history []candidate
+	// channelHistory is history per channel, for the tests that span more than
+	// one. When it is set it replaces history entirely.
+	channelHistory map[string][]candidate
 	// historyErr, when set, fails the next History call.
 	historyErr error
 
@@ -58,6 +61,32 @@ type fakeAPI struct {
 	// deleteGate, when set, holds Delete open until the test closes it, which
 	// is how a slow chat.delete is simulated.
 	deleteGate chan struct{}
+
+	// botUserID is what auth.test told the client when it connected. Empty is a
+	// bridge that never learned its own ID, which is how it behaves when it
+	// cannot recognise a mention.
+	botUserID string
+	// joined is what users.conversations returns, and joinedErr fails it.
+	joined      []string
+	joinedErr   error
+	joinedCalls []int
+}
+
+func (f *fakeAPI) BotUserID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.botUserID
+}
+
+func (f *fakeAPI) JoinedChannels(_ context.Context, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.joinedCalls = append(f.joinedCalls, limit)
+	if f.joinedErr != nil {
+		return nil, f.joinedErr
+	}
+	return append([]string(nil), f.joined...), nil
 }
 
 type postCall struct{ Channel, ThreadTS, Text string }
@@ -70,6 +99,17 @@ type reactionCall struct{ Channel, TS, Emoji string }
 type updateCall struct{ Channel, TS, Text string }
 type deleteCall struct{ Channel, TS string }
 
+// historyForLocked serves a channel's messages. Most tests bridge one channel
+// and set history alone; the ones that span channels set channelHistory, and
+// then a channel with nothing in it really does have nothing in it. The caller
+// must hold f.mu.
+func (f *fakeAPI) historyForLocked(channel string) []candidate {
+	if f.channelHistory == nil {
+		return f.history
+	}
+	return f.channelHistory[channel]
+}
+
 func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -80,7 +120,7 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 	}
 
 	var matched []candidate
-	for _, c := range f.history {
+	for _, c := range f.historyForLocked(req.Channel) {
 		if req.Oldest != "" && !tsLess(req.Oldest, c.TS) {
 			continue
 		}
@@ -579,8 +619,8 @@ func TestToolsReportMissingConfigurationByName(t *testing.T) {
 	defer func() { _ = b.Close() }()
 
 	_, waitErr := b.Wait(ctx, MinWaitTimeout)
-	_, postErr := b.Post(ctx, "hello", "")
-	reactErr := b.React(ctx, "100.000100", "eyes")
+	_, postErr := b.Post(ctx, PostRequest{Text: "hello", ThreadTS: ""})
+	reactErr := b.React(ctx, ReactRequest{TS: "100.000100", Emoji: "eyes"})
 
 	for name, err := range map[string]error{"Wait": waitErr, "Post": postErr, "React": reactErr} {
 		if err == nil {
@@ -618,7 +658,7 @@ func TestPostAndReact(t *testing.T) {
 	b := New(context.Background(), cfg, &fakeConnector{api: api, stream: newFakeStream()})
 	defer func() { _ = b.Close() }()
 
-	ts, err := b.Post(context.Background(), "hello from the agent", "100.000100")
+	ts, err := b.Post(context.Background(), PostRequest{Text: "hello from the agent", ThreadTS: "100.000100"})
 	if err != nil {
 		t.Fatalf("Post() error = %v", err)
 	}
@@ -629,11 +669,11 @@ func TestPostAndReact(t *testing.T) {
 		t.Errorf("Post() sent %+v, want it addressed to the bound channel and thread", api.posts)
 	}
 
-	if _, err := b.Post(context.Background(), "", ""); err == nil {
+	if _, err := b.Post(context.Background(), PostRequest{Text: "", ThreadTS: ""}); err == nil {
 		t.Error("Post() with empty text = nil error, want a validation error")
 	}
 
-	if err := b.React(context.Background(), "100.000100", ""); err != nil {
+	if err := b.React(context.Background(), ReactRequest{TS: "100.000100", Emoji: ""}); err != nil {
 		t.Fatalf("React() error = %v", err)
 	}
 	// The default matters: slack_ack is meant to be callable with just a ts.
@@ -641,7 +681,7 @@ func TestPostAndReact(t *testing.T) {
 		t.Errorf("React() sent %+v, want eyes on the bound channel", api.reactions)
 	}
 
-	if err := b.React(context.Background(), "", "eyes"); err == nil {
+	if err := b.React(context.Background(), ReactRequest{TS: "", Emoji: "eyes"}); err == nil {
 		t.Error("React() with no ts = nil error, want a validation error")
 	}
 }

@@ -21,10 +21,33 @@ type ChannelState struct {
 	LastTS string `json:"last_ts"`
 }
 
-// State is the on-disk document. It is keyed by channel so a future version
-// can bridge more than one channel without a migration.
+// ThreadState is one conversation thread opened by a mention, and how far
+// through it the bridge has read.
+type ThreadState struct {
+	Channel  string `json:"channel"`
+	ThreadTS string `json:"thread_ts"`
+	// LastTS is the newest reply already handed to a caller, so a restart
+	// resumes the conversation instead of replaying it.
+	LastTS string `json:"last_ts,omitempty"`
+}
+
+// State is the on-disk document. Channels is keyed by channel, which is what
+// let the home channel be joined by the conversations in Threads without a
+// migration.
+//
+// The fields after Channels were added with mention-driven threads and are all
+// optional: a state file written by an older build loads unchanged, and the
+// bridge starts with no open threads and an unscanned mention cursor, which is
+// exactly the state a first run is in.
 type State struct {
 	Channels map[string]ChannelState `json:"channels"`
+	// Threads are the conversations open outside the home channel.
+	Threads []ThreadState `json:"threads,omitempty"`
+	// MentionCursor is how far through time the search for mentions the bridge
+	// slept through has looked. It is global rather than per channel because a
+	// Slack timestamp is a moment, comparable across channels, and the question
+	// it answers — "what have I not looked at yet?" — is about time.
+	MentionCursor string `json:"mention_cursor,omitempty"`
 }
 
 // Store reads and writes the state file. It is safe for concurrent use within
@@ -101,6 +124,79 @@ func (s *Store) SetLastTS(channel, ts string) error {
 		return nil
 	}
 	state.Channels[channel] = ChannelState{LastTS: ts}
+	return s.saveLocked(state)
+}
+
+// Threads returns the conversation threads open outside the home channel.
+func (s *Store) Threads() ([]ThreadState, error) {
+	state, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	return state.Threads, nil
+}
+
+// SetThread records a thread and its cursor, adding it if it is new. Like the
+// channel cursor, a thread's only ever moves forward: a stale value is ignored
+// rather than rewinding the bridge into replaying replies it already handed
+// over.
+func (s *Store) SetThread(channel, threadTS, lastTS string) error {
+	if channel == "" || threadTS == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+
+	for i, t := range state.Threads {
+		if t.Channel != channel || t.ThreadTS != threadTS {
+			continue
+		}
+		if lastTS == "" || (t.LastTS != "" && !tsLess(t.LastTS, lastTS)) {
+			return nil
+		}
+		state.Threads[i].LastTS = lastTS
+		return s.saveLocked(state)
+	}
+
+	state.Threads = append(state.Threads, ThreadState{Channel: channel, ThreadTS: threadTS, LastTS: lastTS})
+	return s.saveLocked(state)
+}
+
+// MentionCursor returns how far the search for missed mentions has looked, or
+// "" when it never has.
+func (s *Store) MentionCursor() (string, error) {
+	state, err := s.Load()
+	if err != nil {
+		return "", err
+	}
+	return state.MentionCursor, nil
+}
+
+// SetMentionCursor moves the mention cursor forward. Backwards is refused for
+// the same reason as everywhere else here: it would mean looking again at
+// messages already answered.
+func (s *Store) SetMentionCursor(ts string) error {
+	if ts == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	if state.MentionCursor != "" && !tsLess(state.MentionCursor, ts) {
+		return nil
+	}
+	state.MentionCursor = ts
 	return s.saveLocked(state)
 }
 
