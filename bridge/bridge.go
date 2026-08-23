@@ -275,6 +275,16 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return WaitResult{Messages: msgs}, nil
 		}
 
+		// A pending question owns the click channel. Reading it here as well
+		// would mean a click could be taken by this goroutine and handed
+		// across to the question, and the question's own deadline cannot see
+		// a click that is still in transit. A nil channel blocks forever,
+		// which is exactly "leave those to the asker".
+		clicks := stream.Interactions()
+		if b.askPending() {
+			clicks = nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return WaitResult{}, ctx.Err()
@@ -282,11 +292,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		case <-deadline.C:
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
 
-		case in, ok := <-stream.Interactions():
+		case in, ok := <-clicks:
 			if !ok {
-				b.mu.Lock()
-				b.connected = false
-				b.mu.Unlock()
+				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
 			// A click arriving while nobody is asking anything is answered by
@@ -296,9 +304,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 		case evt, ok := <-stream.Events():
 			if !ok {
-				b.mu.Lock()
-				b.connected = false
-				b.mu.Unlock()
+				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
 			if err := b.absorb(evt); err != nil {
@@ -306,6 +312,30 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			}
 		}
 	}
+}
+
+// noteStreamClosed records that the live connection is gone, but only if the
+// stream that closed is the one the bridge is still using.
+//
+// Two calls can be reading the same stream when it closes. The first reports
+// the disconnection, and a tool call after it opens a replacement; if the
+// second then cleared the flag unconditionally, the next call would open a
+// third connection while the replacement was still consuming events, and the
+// owner's messages would arrive on a socket nobody reads.
+func (b *Bridge) noteStreamClosed(stream Stream) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stream == stream {
+		b.connected = false
+	}
+}
+
+// askPending reports whether a slack_ask question is waiting for a click.
+func (b *Bridge) askPending() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ask != nil
 }
 
 // absorb folds one stream event into the bridge's pending state.

@@ -45,6 +45,15 @@ const askResolveTimeout = 5 * time.Second
 // open past its own timeout.
 const askPostTimeout = 10 * time.Second
 
+// deadlineSettleWindow is how long the expiry waits for a click that another
+// goroutine may be part-way through delivering. It is short enough that the
+// timeout is still a timeout and long enough to cover a hand-off between two
+// goroutines on the same machine.
+const (
+	deadlineSettleWindow = 250 * time.Millisecond
+	deadlineSettleStep   = 10 * time.Millisecond
+)
+
 // maxEarlyClicks caps the clicks held while the question is being posted. The
 // window is one HTTP round trip and only the owner's clicks can matter, so a
 // handful is generous.
@@ -158,11 +167,7 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 		case <-deadline.C:
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
-			// select picks at random between a ready timer and a ready click,
-			// so anything already queued has to be taken in before the
-			// question can be called unanswered.
-			b.drainInteractions(stream)
-			if choice, ok := b.lastChance(ask); ok {
+			if choice, ok := b.settleDeadline(ask, stream); ok {
 				b.resolve(api, channel, ts, fmt.Sprintf("%s\n\n✅ %s", q.Text, labels[choice]))
 				b.startIndicator()
 				return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
@@ -182,9 +187,7 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 
 		case in, ok := <-stream.Interactions():
 			if !ok {
-				b.mu.Lock()
-				b.connected = false
-				b.mu.Unlock()
+				b.noteStreamClosed(stream)
 				// The click channel closes with the socket, and a closed
 				// channel is permanently ready — so this has to be handled
 				// here or the loop spins on it. No answer can arrive now.
@@ -195,9 +198,7 @@ func (b *Bridge) Ask(ctx context.Context, question string, options []string, tim
 
 		case evt, ok := <-stream.Events():
 			if !ok {
-				b.mu.Lock()
-				b.connected = false
-				b.mu.Unlock()
+				b.noteStreamClosed(stream)
 				// The socket is gone, so no click can reach this call any
 				// more. The buttons have to go with it.
 				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
@@ -262,6 +263,34 @@ func (b *Bridge) drainInteractions(stream Stream) {
 		default:
 			return
 		}
+	}
+}
+
+// settleDeadline decides whether the question was answered after all.
+//
+// Three things can be true at the moment the timer fires: the answer is
+// already waiting, a click is still sitting on the channel, or another
+// goroutine has taken a click off the channel and is on its way to delivering
+// it. select picks at random between a ready timer and a ready click, so the
+// first two need looking at rather than assuming; the third is why this waits
+// a moment and looks again, taking the mutex each time so that anything
+// mid-delivery has landed by the time it does.
+//
+// A single dispatcher owning the click channel would remove the third case
+// outright. It is not worth the machinery here: slack_wait already leaves the
+// channel alone while a question is pending, so a competing reader only exists
+// for the instant between the two.
+func (b *Bridge) settleDeadline(ask *pendingAsk, stream Stream) (int, bool) {
+	deadline := time.Now().Add(deadlineSettleWindow)
+	for {
+		b.drainInteractions(stream)
+		if choice, ok := b.lastChance(ask); ok {
+			return choice, true
+		}
+		if time.Now().After(deadline) {
+			return 0, false
+		}
+		time.Sleep(deadlineSettleStep)
 	}
 }
 

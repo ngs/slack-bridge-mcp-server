@@ -734,6 +734,44 @@ func TestWaitFailsWhenTheClickChannelCloses(t *testing.T) {
 	}
 }
 
+// Two calls can watch the same stream close. The first reports it and a later
+// call reconnects; the second must not then mark the replacement dead, or the
+// call after that opens a third socket while the second one is still reading.
+func TestAStaleStreamClosingDoesNotInvalidateTheReplacement(t *testing.T) {
+	cfg := testConfig(t)
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	old := newFakeStream()
+	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: old})
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.Wait(context.Background(), 10*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A replacement connection is installed, as a reconnect would.
+	replacement := newFakeStream()
+	b.mu.Lock()
+	b.stream = replacement
+	b.connected = true
+	b.mu.Unlock()
+
+	// The straggler now notices the old stream closing.
+	b.noteStreamClosed(old)
+
+	if !b.Status().Connected {
+		t.Error("Status() reports disconnected after a stale stream closed, which would open a second socket alongside the live one")
+	}
+
+	// The live one closing is a different matter.
+	b.noteStreamClosed(replacement)
+	if b.Status().Connected {
+		t.Error("Status() still reports connected after the current stream closed")
+	}
+}
+
 func TestWaitFailsWhenTheStreamClosesForGood(t *testing.T) {
 	cfg := testConfig(t)
 	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {

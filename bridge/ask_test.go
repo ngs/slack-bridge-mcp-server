@@ -490,6 +490,34 @@ func TestAskChecksWhoAndWhereBeforeBufferingAClick(t *testing.T) {
 	}
 }
 
+// A click can be taken off the channel by another goroutine and be part-way
+// to the question when the deadline fires. Expiring on the spot would throw
+// away an answer the owner had already given.
+func TestAskWaitsForAClickThatIsAlreadyOnItsWay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := askBridge(ctx, t)
+
+	go func() {
+		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
+		// Delivered directly, the way a concurrent reader that had already
+		// taken the click off the channel would: it is in neither queue when
+		// the timer fires. The sleep puts it just past the deadline, inside
+		// the settling window.
+		time.Sleep(60 * time.Millisecond)
+		b.routeInteraction(click(testOwner, askTS, 1))
+	}()
+
+	result, err := b.Ask(ctx, "Deploy now?", []string{"Yes", "No"}, 40*time.Millisecond, "")
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the in-flight click honoured at the deadline", result)
+	}
+}
+
 // A dead socket cannot deliver a click, so the buttons must not outlive it.
 func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
