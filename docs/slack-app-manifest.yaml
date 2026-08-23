@@ -47,6 +47,9 @@ oauth_config:
       # users.info, which turns the user IDs in slack_history results into
       # names. Optional in practice: without it the tool falls back to IDs.
       - users:read
+      # Required by the app_mention subscription below: Slack rejects a
+      # manifest that subscribes to the event without this scope.
+      - app_mentions:read
       # Downloading an attachment from the url_private link on a message.
       # Optional, and only for the download: Slack reports a message's files
       # with or without this scope, so an upload is delivered either way, but

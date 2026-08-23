@@ -51,6 +51,7 @@ at [Generate the two tokens](#generate-the-two-tokens).
    | `channels:read`, `groups:read` | `users.conversations`, which is how the search for [mentions](../README.md#talking-to-the-agent-in-other-channels) sent while you were away knows which channels to look in |
    | `reactions:write` | `reactions.add`, for the automatic 👀 receipt and for `slack_ack` |
    | `users:read` | `users.info`, which turns user IDs into names in [`slack_history`](../README.md#reading-the-channel) results. Optional: without it the tool falls back to raw IDs |
+   | `app_mentions:read` | Required by the `app_mention` event subscription — Slack rejects a manifest, and the event subscription screen refuses the event, without it |
    | `files:read` | Downloading an [attachment](../README.md#attachments) from its `url_private`. Optional, and only for the download: Slack reports a message's files either way, so uploads are delivered with their names, sizes and links whether or not you add it — without it, fetching the file itself gets a login page instead |
 
    Nothing else is called. There is no user token, and the server never reads a
