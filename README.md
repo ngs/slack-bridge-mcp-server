@@ -145,7 +145,7 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 | `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel", "files"?}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `{"ts", "channel"}` — where the message landed |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
-| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. When a message arrives instead of a click, `{"choice_index": -1, "interrupted": true, "messages": [...]}`. |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. When a message ends the question instead of a click, `{"choice_index": -1, "interrupted": true}`. Every settled outcome also carries `messages`: whatever the owner said while the question was up, delivered as `slack_wait` would have. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts`, `channel` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?, "files"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
 | `slack_progress` | `text` (required), `thread_ts` and `channel` (optional — where the status belongs; they start the indicator, or move a running one) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the label had nowhere to go: the indicator is turned off, or the turn ended before it could be applied. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
@@ -311,24 +311,34 @@ when the timeout runs out and returns `timed_out: true`. Only the owner's clicks
 count, and only one question can be outstanding at a time — a second `slack_ask`
 while one is pending is refused rather than queued.
 
-**Answering with a message instead** (changed in v0.4.0). If you type something
-rather than tapping a button, the question comes down — rewritten as `⌛
-superseded` — and the call returns `interrupted: true` with what you said in
-`messages`, so the agent acts on the message instead of the question it asked.
-That is nearly always what you meant: typing rather than tapping is you
-redirecting it, and the alternative is the agent blocked on a click that is
-never coming while your message waits for the next `slack_wait`.
+**Anything you say while the question is up comes back with it** (new in
+v0.4.0). A question blocks the loop that would otherwise be collecting your
+messages, so before this they sat in the queue until the next `slack_wait` —
+which, if the answer sent the agent off to work, could be a long time. Now every
+settled question carries them in `messages`, whether it ended in a tap or in a
+timeout.
 
-Those messages are delivered there and nowhere else. The cursor moves and the
-receipt reaction goes on exactly as `slack_wait` would have done it, so no later
-call repeats them. `interrupted` is kept separate from `timed_out` because the
-two mean opposite things: a timeout is nobody answering, an interruption is you
-answering with something the buttons could not express.
+They are delivered there and nowhere else: the cursor moves and the receipt
+reaction goes on exactly as `slack_wait` would have done it, so no later call
+repeats them.
+
+**And a message can end the question outright** (changed in v0.4.0). If you type
+something rather than tapping, the question comes down — rewritten as `⌛
+superseded` — and the call returns `interrupted: true` alongside those messages,
+so the agent acts on what you said instead of the question it asked. That is
+nearly always what you meant: typing rather than tapping is you redirecting it,
+and the alternative is the agent blocked on a click that is never coming.
+
+So `messages` is always the backlog, and `interrupted` says only that a message
+is *why* the question ended rather than something that arrived alongside the
+answer. `interrupted` is separate from `timed_out` because the two mean opposite
+things: a timeout is nobody answering, an interruption is you answering with
+something the buttons could not express.
 
 Pass `interrupt_on_message: false` for a question that genuinely has to be
-answered before anything else can happen; it waits for the click regardless, and
-the message stays queued for the next `slack_wait`, which is how every question
-behaved before v0.4.0.
+answered before anything else can happen. It then waits for the click regardless
+— which is how every question behaved before v0.4.0 — though the backlog still
+comes back with the answer, since that is owed to the agent either way.
 
 The elapsed-time indicator below stops while the question is up, since the agent
 is not the one working, and starts again on your answer — including on an

@@ -87,19 +87,30 @@ type AskRequest struct {
 // the shortened form would stop the caller from matching the answer against
 // the list it passed in.
 // Interrupted is the third way a question can end, alongside an answer and a
-// timeout: the owner said something instead of clicking, and Messages carries
-// what they said. It is kept apart from TimedOut because the two call for
-// opposite things — a timeout means nobody answered, an interruption means they
-// answered with something the buttons could not express.
+// timeout: the owner said something instead of clicking. It is kept apart from
+// TimedOut because the two call for opposite things — a timeout means nobody
+// answered, an interruption means they answered with something the buttons
+// could not express.
 type AskResult struct {
 	ChoiceIndex int    `json:"choice_index"`
 	ChoiceLabel string `json:"choice_label,omitempty"`
 	TS          string `json:"ts,omitempty"`
 	TimedOut    bool   `json:"timed_out"`
 	Interrupted bool   `json:"interrupted,omitempty"`
-	// Messages are what the owner sent instead of answering. They are delivered
-	// here exactly as slack_wait would have delivered them — the same cursor
-	// moves, the same receipt reactions — so they are not owed to a later call.
+	// Messages are what the owner said while the question was on the channel.
+	// A question blocks the loop that would otherwise have collected them, so
+	// without this they would sit in the queue unseen until the next
+	// slack_wait — which, if the answer sends the agent off to work, is a
+	// while.
+	//
+	// Every settled outcome carries them, not just an interruption: a click and
+	// an expiry leave the same backlog behind. Interrupted says only that a
+	// message is why the question ended rather than something that happened
+	// alongside it.
+	//
+	// They are delivered here exactly as slack_wait would have delivered them —
+	// the same cursor moves, the same receipt reactions — so they are not owed
+	// to a later call.
 	Messages []Message `json:"messages,omitempty"`
 }
 
@@ -204,28 +215,25 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			if req.InterruptDisabled {
 				continue
 			}
-			// Best effort: a drain that fails leaves the messages queued and the
-			// cursor where it was, so the next slack_wait finds them. Losing the
-			// question over it would be the worse trade.
-			msgs, err := b.drainCatchUp(ctx)
-			if err != nil {
-				log.Printf("could not collect the message that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
-				continue
-			}
+			msgs := b.backlogWhileAsking(ctx)
 			if len(msgs) == 0 {
-				// A reconnect rather than a message: the queue was poked but
-				// there is nothing in it. The question stands.
+				// A reconnect rather than a message, or a drain that failed and
+				// left the queue where it was. Either way there is nothing to
+				// act on, so the question stands.
 				continue
 			}
 			// The owner answered with words instead of a button. The question is
 			// no longer the thing being answered, so its buttons go — otherwise
 			// they sit there inviting a click nobody is waiting for any more.
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ superseded")
+			// The message is the new work, so the clock restarts where the owner
+			// sent it rather than where the question was asked.
+			b.startIndicator(newestConversation(msgs))
 			return AskResult{
 				ChoiceIndex: -1,
 				Interrupted: true,
 				TS:          ts,
-				Messages:    b.deliver(msgs).Messages,
+				Messages:    msgs,
 			}, nil
 
 		case choice := <-ask.answered:
@@ -235,7 +243,12 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// and in the thread the question was asked in, which is where the
 			// owner just clicked and where they are watching for what follows.
 			b.startIndicator(channel, threadTS)
-			return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
+			return AskResult{
+				ChoiceIndex: choice,
+				ChoiceLabel: options[choice],
+				TS:          ts,
+				Messages:    b.backlogWhileAsking(ctx),
+			}, nil
 
 		case <-deadline.C:
 			// A click landing in the same instant as the deadline is still an
@@ -243,10 +256,18 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			if choice, ok := b.settleDeadline(ask, stream); ok {
 				b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 				b.startIndicator(channel, threadTS)
-				return AskResult{ChoiceIndex: choice, ChoiceLabel: options[choice], TS: ts}, nil
+				return AskResult{
+					ChoiceIndex: choice,
+					ChoiceLabel: options[choice],
+					TS:          ts,
+					Messages:    b.backlogWhileAsking(ctx),
+				}, nil
 			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
-			return AskResult{ChoiceIndex: -1, TimedOut: true}, nil
+			// A question nobody answered leaves the agent with nothing to act
+			// on, which is exactly when a message waiting behind it matters
+			// most.
+			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx)}, nil
 
 		case <-ctx.Done():
 			// The client gave up on the call. Nobody is left to receive an
@@ -284,6 +305,34 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			}
 		}
 	}
+}
+
+// backlogWhileAsking hands over whatever the owner said while the question was
+// waiting, exactly the way slack_wait would have: the same drain, so the cursor
+// moves and is persisted, and the same receipt reactions.
+//
+// A question is the one time the agent is listening and deliberately not
+// collecting. Messages that arrive meanwhile are absorbed into the pending
+// queue, and until this they stayed there — the owner asked something, got a
+// question back, answered it, and their message went unanswered while the agent
+// acted on the click. Returning them with the answer closes that window.
+//
+// It is best effort on purpose. A failed drain leaves the bridge ready to fetch
+// the same window again — drainCatchUp only moves the cursor once the messages
+// are in hand — so the next slack_wait finds them, and the answer the agent
+// already has must not be lost to a history call that failed.
+//
+// It is called only once a question has settled. A call abandoned or a socket
+// that closed has no session left to hand a backlog to, and moving the cursor
+// there would consume messages nobody ever received.
+func (b *Bridge) backlogWhileAsking(ctx context.Context) []Message {
+	msgs, err := b.drainCatchUp(ctx)
+	if err != nil {
+		log.Printf("could not collect the messages that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
+		return nil
+	}
+	b.autoAck(msgs)
+	return msgs
 }
 
 // postQuestion posts on a detached context with a deadline of its own.

@@ -173,19 +173,30 @@ func TestAskIsInterruptedByAMessage(t *testing.T) {
 	}
 }
 
-// Opting out puts the old behaviour back: the question waits for its click, and
-// the message stays queued for whoever asks next.
+// Opting out puts the question's claim on the loop back: it waits for its click
+// regardless. The message still comes back with the answer, because the backlog
+// is owed to the agent either way — what the flag decides is whether a message
+// ends the question, not whether it is delivered.
 func TestAskWithoutInterruptionWaitsForTheClick(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, _, stream := askBridge(ctx, t)
+	b, api, stream := askBridge(ctx, t)
 
 	stream.events <- StreamEvent{
 		Kind:    StreamMessage,
 		Message: Message{TS: "100.000200", User: testOwner, Text: "one more thing"},
 	}
-	stream.interactions <- click(testOwner, askTS, 1)
+	// The click has to land after the message has been absorbed, not merely
+	// after it was queued. Both are ready at once otherwise, and a select that
+	// takes the click first answers the question while the message is still
+	// sitting unread on the stream — a backlog that legitimately is empty.
+	go func() {
+		for b.Status().PendingBacklogCount == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		stream.interactions <- click(testOwner, askTS, 1)
+	}()
 
 	result, err := b.Ask(ctx, AskRequest{
 		Question:          "Deploy now?",
@@ -200,15 +211,116 @@ func TestAskWithoutInterruptionWaitsForTheClick(t *testing.T) {
 		t.Errorf("Ask() interrupted = true with interruption turned off, want the click awaited")
 	}
 	if result.ChoiceIndex != 1 {
-		t.Errorf("Ask() choice_index = %d, want the click at 1", result.ChoiceIndex)
+		t.Fatalf("Ask() choice_index = %d, want the click at 1", result.ChoiceIndex)
+	}
+	if want := []string{"one more thing"}; !reflect.DeepEqual(texts(result.Messages), want) {
+		t.Errorf("Ask() messages = %v, want the backlog handed over with the answer", texts(result.Messages))
 	}
 
-	next, err := b.Wait(ctx, MaxWaitTimeout)
+	// Handed over means handed over: the cursor moved with it, so the next
+	// slack_wait must not deliver it a second time.
+	if got := b.Status().LastTS; got != "100.000200" {
+		t.Errorf("last_ts = %q, want it advanced to the delivered message", got)
+	}
+	next, err := b.Wait(ctx, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
-	if want := []string{"one more thing"}; !reflect.DeepEqual(texts(next.Messages), want) {
-		t.Errorf("Wait() messages = %v, want the message kept for the next wait", texts(next.Messages))
+	if !next.TimedOut || len(next.Messages) != 0 {
+		t.Errorf("Wait() = %+v, want a timeout; the message came back with the answer", next)
+	}
+
+	// Delivery marks receipt, the same as it does through slack_wait.
+	eventually(t, "the message to be marked as received", func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		for _, r := range api.reactions {
+			if r.TS == "100.000200" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// A question nobody answers leaves the agent with nothing to act on, which is
+// exactly when a message waiting behind it matters most.
+func TestAskReturnsTheBacklogOnTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := askBridge(ctx, t)
+
+	stream.events <- StreamEvent{
+		Kind:    StreamMessage,
+		Message: Message{TS: "100.000200", User: testOwner, Text: "never mind the question"},
+	}
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question:          "Deploy now?",
+		Options:           []string{"Yes", "No"},
+		Timeout:           60 * time.Millisecond,
+		InterruptDisabled: true,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if !result.TimedOut {
+		t.Fatalf("Ask() = %+v, want a timeout", result)
+	}
+	if result.Interrupted {
+		t.Errorf("Ask() interrupted = true, want a timeout told apart from an interruption")
+	}
+	if want := []string{"never mind the question"}; !reflect.DeepEqual(texts(result.Messages), want) {
+		t.Errorf("Ask() messages = %v, want the message that arrived while the question was up", texts(result.Messages))
+	}
+}
+
+// The drain is for a question that settled. When the socket dies there is no
+// answer and no session left to hand a backlog to, and moving the cursor there
+// would consume messages nobody ever received.
+func TestAskDoesNotDrainWhenTheConnectionCloses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	stream.events <- StreamEvent{
+		Kind:    StreamMessage,
+		Message: Message{TS: "100.000200", User: testOwner, Text: "still unanswered"},
+	}
+
+	go func() {
+		// Closing only once the question is up keeps this about the socket
+		// dying under a live question rather than a failure to post one.
+		for b.pendingAskTS() == "" {
+			time.Sleep(2 * time.Millisecond)
+		}
+		close(stream.events)
+	}()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question:          "Deploy now?",
+		Options:           []string{"Yes", "No"},
+		Timeout:           MaxWaitTimeout,
+		InterruptDisabled: true,
+	})
+	if err == nil {
+		t.Fatal("Ask() = nil error after the connection closed, want the disconnection reported")
+	}
+	if len(result.Messages) != 0 {
+		t.Errorf("Ask() messages = %v on a failed call, want none", texts(result.Messages))
+	}
+	if got := b.Status().PendingBacklogCount; got != 1 {
+		t.Errorf("pending_backlog_count = %d, want the message left queued for the next slack_wait", got)
+	}
+	if got := b.Status().LastTS; got != "100.000100" {
+		t.Errorf("last_ts = %q, want it unmoved at 100.000100", got)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.reactions) != 0 {
+		t.Errorf("reacted %+v to a message that was never handed over", api.reactions)
 	}
 }
 
