@@ -68,6 +68,15 @@ type AskRequest struct {
 	ThreadTS string
 	// Channel is the conversation to ask in. Empty means the home channel.
 	Channel string
+	// InterruptDisabled keeps the question waiting for a click even when the
+	// owner says something instead of answering it.
+	//
+	// It is off by default — a message wins — because the owner typing rather
+	// than tapping is nearly always them redirecting the agent, and the
+	// alternative is the question blocking on a click that is never coming.
+	// Turn it on for a question that genuinely has to be answered before
+	// anything else can happen.
+	InterruptDisabled bool
 }
 
 // AskResult is what slack_ask returns. ChoiceIndex is -1 when no choice was
@@ -77,11 +86,21 @@ type AskRequest struct {
 // it: a label too long for Slack is shortened on the button, and handing back
 // the shortened form would stop the caller from matching the answer against
 // the list it passed in.
+// Interrupted is the third way a question can end, alongside an answer and a
+// timeout: the owner said something instead of clicking, and Messages carries
+// what they said. It is kept apart from TimedOut because the two call for
+// opposite things — a timeout means nobody answered, an interruption means they
+// answered with something the buttons could not express.
 type AskResult struct {
 	ChoiceIndex int    `json:"choice_index"`
 	ChoiceLabel string `json:"choice_label,omitempty"`
 	TS          string `json:"ts,omitempty"`
 	TimedOut    bool   `json:"timed_out"`
+	Interrupted bool   `json:"interrupted,omitempty"`
+	// Messages are what the owner sent instead of answering. They are delivered
+	// here exactly as slack_wait would have delivered them — the same cursor
+	// moves, the same receipt reactions — so they are not owed to a later call.
+	Messages []Message `json:"messages,omitempty"`
 }
 
 // pendingAsk is the one question currently on the channel waiting for a click.
@@ -170,11 +189,45 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		return AskResult{}, err
 	}
 
+	// Subscribed even when interruption is off, because the subscription is
+	// also how this call learns about a message it absorbed itself; the flag
+	// only decides what it does about it.
+	sub := b.subscribePending()
+	defer b.unsubscribePending(sub)
+
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
 	for {
 		select {
+		case <-sub:
+			if req.InterruptDisabled {
+				continue
+			}
+			// Best effort: a drain that fails leaves the messages queued and the
+			// cursor where it was, so the next slack_wait finds them. Losing the
+			// question over it would be the worse trade.
+			msgs, err := b.drainCatchUp(ctx)
+			if err != nil {
+				log.Printf("could not collect the message that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
+				continue
+			}
+			if len(msgs) == 0 {
+				// A reconnect rather than a message: the queue was poked but
+				// there is nothing in it. The question stands.
+				continue
+			}
+			// The owner answered with words instead of a button. The question is
+			// no longer the thing being answered, so its buttons go — otherwise
+			// they sit there inviting a click nobody is waiting for any more.
+			b.resolve(api, channel, ts, q.Text+"\n\n⌛ superseded")
+			return AskResult{
+				ChoiceIndex: -1,
+				Interrupted: true,
+				TS:          ts,
+				Messages:    b.deliver(msgs).Messages,
+			}, nil
+
 		case choice := <-ask.answered:
 			b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 			// The answer is new work handed to the agent, exactly like the
