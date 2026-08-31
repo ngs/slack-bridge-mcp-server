@@ -115,6 +115,12 @@ type pendingAsk struct {
 // rewritten with the choice, the expired case says so — so the owner never
 // faces buttons that no longer lead anywhere.
 func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
+	// A question is the agent listening too, so it counts towards presence for
+	// as long as it is up — including the moments before the buttons exist and
+	// after they are taken away.
+	b.enterAsk()
+	defer b.exitAsk()
+
 	question, options := req.Question, req.Options
 	threadTS, timeout := req.ThreadTS, req.Timeout
 
