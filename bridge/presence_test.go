@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"testing"
 	"time"
@@ -230,12 +231,17 @@ func TestPresenceLeavesNoTemporaryFiles(t *testing.T) {
 		}
 	}
 
-	info, err := os.Stat(WaitingFilePath(dir, testChannel))
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("presence file mode = %o, want 0600; it names the owner's channel", perm)
+	// The file names the owner's channel, so it should not be world-readable.
+	// Windows has no Unix permission bits (Go reports 0666 regardless), so the
+	// check only means something on Unix.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(WaitingFilePath(dir, testChannel))
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("presence file mode = %v, want no group or other access", perm)
+		}
 	}
 }
 
