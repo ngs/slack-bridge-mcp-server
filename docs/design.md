@@ -270,7 +270,7 @@ dropped.
 | `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}, …], "timed_out": false}`, oldest first, across every conversation. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `chat.postMessage`, to the home channel unless `channel` names another. Returns `{"ts", "channel"}`. |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
-| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts` and `channel` (optional) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`. The message is rewritten without its buttons either way. |
+| `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`, or `{"choice_index": -1, "interrupted": true, "messages": [...]}` when the owner sends a message instead of clicking. The message is rewritten without its buttons in every case. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts`, `channel` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
 | `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, starts one when none is running, and moves a running one when the call names a different conversation. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
@@ -348,6 +348,35 @@ ignored it.
 Clicks therefore have a queue of their own, small and read by both the wait and
 the ask loops. A backlog of messages, which is the one situation where the
 event queue fills, cannot take the space a click needs.
+
+### Whoever is blocked hears about the message
+
+Both loops read the same stream, so the call that takes a message off it is not
+necessarily the call that wants it. A wait drains the shared pending queue at
+the top of its loop and then blocks; a message a concurrent question absorbs
+after that lands in the queue with nothing left watching it, and the wait sits
+out its whole timeout with the message already in hand.
+
+So a blocked call subscribes, and whatever grows the queue wakes every
+subscriber. Every subscriber, not one of them: a wakeup delivered to a single
+shared channel goes to whichever reader takes it first and leaves the other
+blocked on a queue it has been told nothing about. Subscription happens before
+the first drain, and each subscriber's channel is buffered, so the window
+between draining and blocking holds a notification rather than losing a message.
+
+The same reasoning gives the deadline one last drain before it reports a
+timeout. `timed_out: true` is an instruction to call again, so returning it
+alongside messages would be telling the agent to go back for what it has just
+been given; a wait that finds something at the bell reports a delivery instead.
+
+For a question, being woken is a decision rather than a signal to loop. The
+owner typing instead of tapping is them redirecting the agent, and a question
+that kept waiting would block on a click that is never coming. The question is
+therefore retired — marked superseded, buttons removed — and the messages come
+back in its place, delivered through the same path a wait uses so the cursor
+moves and the receipts go out exactly once. `interrupt_on_message: false` opts
+a question out, for the rare one that must be answered before anything else can
+happen.
 
 ### The receipt reaction
 
