@@ -472,6 +472,50 @@ messages and silently ignore others. Failing loudly is much better than that.
 The lock is held by the operating system and released when the process exits,
 including on a crash, so a stale lock file never blocks the next session.
 
+### Publishing who is listening
+
+A resident session is resident only while a call is actually blocked on the
+owner. If a turn ends without one, the attendant is gone and the channel goes
+quiet with nobody inside the session to notice — the loop that would have
+noticed is the thing that stopped.
+
+Catching that has to happen from outside the process, at the moment a turn ends,
+which is a moment the bridge knows nothing about. So the bridge publishes what
+it does know into `waiting-<channel>.json`: the number of waits and asks in
+flight, its pid, and when the counts last changed. A `Stop` hook reads it and
+can refuse to let a turn end with nothing listening.
+
+Counting rather than a flag, because the counts are the honest answer and a
+reader can collapse them; separate fields for waits and asks, because a wait is
+the attendant listening and an ask is the agent blocked on the owner, and only
+the first is the loop that keeps the conversation alive. The counters are moved
+by an `enter`/`defer exit` pair at the top of each blocking call, so an error
+path cannot leave one behind, and `Close` zeroes them outright — the process is
+about to exit, and a file still reading "one wait" would say the attendant is
+fine when it is gone.
+
+Writing is atomic through a temporary file and a rename. The reader arrives at
+an arbitrary moment by definition, so a torn read is not theoretical here.
+
+Two properties are deliberate and easy to get wrong when reading it:
+
+- **`updated` is not a heartbeat.** It moves when a call starts or ends and
+  stays put in between, so a `slack_wait` blocked for its full 1500 seconds
+  leaves a timestamp that old while being perfectly healthy. A stale timestamp
+  with a non-zero count means the process may have died — check `pid` — not that
+  the wait is dead. Making it a real heartbeat would mean a goroutine writing to
+  disk on a timer for the entire life of every wait, which is a lot of machinery
+  to buy a liveness signal that `pid` already gives more cheaply.
+- **The shape is a contract.** An outside reader parses these field names and
+  this timestamp format, and a hook of that kind is normally written to fail
+  open, so a rename here does not break it loudly — it silently turns the guard
+  back into a no-op. The field names and the RFC 3339 format are therefore
+  covered by a test, not left to whoever edits the struct next.
+
+Failing to write is never allowed to reach the caller, and is logged once
+rather than on every call: the file is a courtesy to something outside the
+process, and losing it must not cost the owner a message.
+
 ## MCP SDK choice
 
 The official Go SDK, `github.com/modelcontextprotocol/go-sdk`, at v1.7.0.

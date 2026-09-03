@@ -110,6 +110,38 @@ State lives in `~/.config/slack-bridge/` (honouring `XDG_CONFIG_HOME`):
 - `bridge.lock` — an exclusive lock taken by the first tool call that connects
   to Slack, whichever that is. A second concurrent bridge fails immediately
   rather than splitting your messages between two listeners.
+- `waiting-<channel>.json` — how many calls are listening right now, created
+  `0600`, one file per home channel. See below.
+
+### The presence file
+
+A resident session is only resident while something is actually blocked in
+`slack_wait`. If a turn ends without one, the attendant is gone and the channel
+goes quiet with nobody to notice — so it helps to be able to check that from
+outside the process, which is what this file is for:
+
+```json
+{"waits": 1, "asks": 0, "pid": 41234, "updated": "2026-08-31T23:19:28Z"}
+```
+
+`waits` and `asks` count the calls currently listening; they are separate
+because they mean different things — a wait is the attendant listening, an ask
+is the agent blocked on you — and a reader that just wants "is anyone there"
+adds them. `pid` tells a live bridge from a file left by one that was killed.
+
+The intended reader is a `Stop` hook on the session, which fires as a turn ends
+and can refuse to let it end with the counts at zero. Because that makes the
+shape a cross-process contract, the field names and the RFC 3339 timestamp are
+covered by a test rather than left to whoever edits the struct next.
+
+`updated` is **not** a heartbeat. It moves when a call starts or ends and stays
+put in between, so a `slack_wait` blocked for its full 25 minutes leaves it 25
+minutes old while being perfectly healthy. Treat a stale timestamp with a
+non-zero count as "this process may have died", not as "this wait is dead", and
+confirm with `pid`.
+
+The file is best effort: if it cannot be written the tool call still runs and
+the failure is logged once. Losing it must not cost you a message.
 
 ## Wiring it into Claude Code
 

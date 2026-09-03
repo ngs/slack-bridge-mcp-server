@@ -17,14 +17,20 @@ func (b *Bridge) pendingSubscribers() int {
 	return len(b.pendingSubs)
 }
 
-// caughtUp reports that the first catch-up has finished. It flips inside the
-// same locked section that merges the pending queue, which makes it the point
-// after which a message queued by a test cannot be picked up by the drain at
-// the top of the wait's loop.
+// caughtUp reports that the first catch-up has finished. needCatchUp is cleared
+// inside the same locked section that merges the pending queue, which makes this
+// the point after which a message queued by a test cannot be picked up by the
+// drain at the top of the wait's loop.
+//
+// Both halves are needed. needCatchUp is also false on a bridge that has not
+// connected yet — it is set by ensure, which runs inside the call being waited
+// on — so testing it alone reports "caught up" before the wait has so much as
+// started, and the message a test then queues is found by the very drain it was
+// trying to get past. connected is set by that same ensure, under the same lock.
 func (b *Bridge) caughtUp() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return !b.needCatchUp
+	return b.connected && !b.needCatchUp
 }
 
 // queueWithoutWaking puts a message on the pending queue the way absorb does,

@@ -136,6 +136,14 @@ type Bridge struct {
 	// on a shared channel goes to whichever reader happens to take it, and the
 	// other one carries on blocked. Every subscriber has to hear it.
 	pendingSubs map[chan struct{}]struct{}
+	// activeWaits and activeAsks count the calls currently listening for the
+	// owner. They are what the presence file publishes, and what a Stop hook
+	// outside this process reads to decide whether the session left anybody
+	// attending before it ended. See presence.go.
+	activeWaits int
+	activeAsks  int
+	// presenceWarned keeps a failing presence file to one log line.
+	presenceWarned bool
 }
 
 // subscribePending registers for notice that the pending queue has grown, and
@@ -243,7 +251,15 @@ func (b *Bridge) Close() error {
 	done := b.indicatorDone
 	lock := b.lock
 	b.lock = nil
+	// Whatever the counts said, nobody is listening once this returns. Saying so
+	// explicitly matters because the process is about to exit: a file left
+	// reading "one wait" would tell the Stop hook the attendant is fine when it
+	// is gone.
+	b.activeWaits, b.activeAsks = 0, 0
+	presence := b.presenceLocked()
 	b.mu.Unlock()
+
+	b.writePresence(presence)
 
 	if done != nil {
 		timeout := time.NewTimer(shutdownIndicatorWait)
@@ -340,6 +356,12 @@ type WaitResult struct {
 // trickling in. After that it waits on the live stream, running catch-up again
 // on every reconnect.
 func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, error) {
+	// Before anything that can fail: the point of the presence file is that
+	// somebody is listening, and a wait that ends in an error was still a wait
+	// while it lasted.
+	b.enterWait()
+	defer b.exitWait()
+
 	// Waiting again means the agent is done with whatever it was given last
 	// time, even if it never posted a reply.
 	b.stopIndicator()
