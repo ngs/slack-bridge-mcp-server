@@ -127,6 +127,15 @@ type Bridge struct {
 	// nameCache holds display names resolved for slack_history. It has its own
 	// lock, so a users.info call never happens under b.mu.
 	nameCache *nameCache
+	// pendingSubs are the calls currently blocked waiting for the queue above
+	// to grow. Both slack_wait and slack_ask read the same stream, so the call
+	// that takes a message off it is not necessarily the one that wants it;
+	// this is how the one that does finds out.
+	//
+	// It is a set of channels rather than one shared channel because a wakeup
+	// on a shared channel goes to whichever reader happens to take it, and the
+	// other one carries on blocked. Every subscriber has to hear it.
+	pendingSubs map[chan struct{}]struct{}
 	// activeWaits and activeAsks count the calls currently listening for the
 	// owner. They are what the presence file publishes, and what a Stop hook
 	// outside this process reads to decide whether the session left anybody
@@ -135,6 +144,46 @@ type Bridge struct {
 	activeAsks  int
 	// presenceWarned keeps a failing presence file to one log line.
 	presenceWarned bool
+}
+
+// subscribePending registers for notice that the pending queue has grown, and
+// returns the channel that notice arrives on.
+//
+// The channel is buffered so a notification sent between the caller's drain and
+// its select is kept rather than dropped, which is the race the subscription
+// exists to close in the first place.
+func (b *Bridge) subscribePending() chan struct{} {
+	ch := make(chan struct{}, 1)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.pendingSubs == nil {
+		b.pendingSubs = make(map[chan struct{}]struct{})
+	}
+	b.pendingSubs[ch] = struct{}{}
+	return ch
+}
+
+func (b *Bridge) unsubscribePending(ch chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.pendingSubs, ch)
+}
+
+// notifyPendingLocked tells every waiting call that there may be something for
+// it now. The caller must hold b.mu.
+//
+// The send is non-blocking against a buffered channel, so a subscriber that has
+// not consumed its last notification simply keeps it: one wakeup and two are
+// the same instruction, which is to go and drain.
+func (b *Bridge) notifyPendingLocked() {
+	for ch := range b.pendingSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // New returns a Bridge that connects on first use. cfg may be incomplete; the
@@ -325,6 +374,12 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	stream := b.stream
 	b.mu.Unlock()
 
+	// Subscribed before the first drain, so a message absorbed by another call
+	// between the drain and the select is a wakeup rather than a message this
+	// call blocks straight through.
+	sub := b.subscribePending()
+	defer b.unsubscribePending(sub)
+
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
@@ -336,13 +391,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return WaitResult{}, err
 		}
 		if len(msgs) > 0 {
-			// From here the agent is working on these messages, which is the
-			// span the owner sees counted. It is counted where they are
-			// looking: the newest message is the one they just sent, so its
-			// channel and thread are the conversation they are waiting on.
-			b.startIndicator(newestConversation(msgs))
-			b.autoAck(msgs)
-			return WaitResult{Messages: msgs}, nil
+			return b.deliver(msgs), nil
 		}
 
 		// A pending question owns the click channel. Reading it here as well
@@ -360,7 +409,26 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return WaitResult{}, ctx.Err()
 
 		case <-deadline.C:
+			// One last look before giving up. A message can reach the queue at
+			// any point during the poll, including the instant the timer fires
+			// and including from another call entirely, and reporting an empty
+			// timeout on top of one would hold it back for another full poll
+			// while the owner waits on a reply.
+			msgs, err := b.drainCatchUp(ctx)
+			if err != nil {
+				return WaitResult{}, err
+			}
+			if len(msgs) > 0 {
+				// Delivered is delivered, however close to the bell it was. A
+				// timed_out of true alongside messages would be read as "call
+				// again", which is the one thing that must not happen to
+				// messages already handed over.
+				return b.deliver(msgs), nil
+			}
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
+
+		case <-sub:
+			// Something reached the queue. Round the loop to drain it.
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -382,6 +450,22 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			}
 		}
 	}
+}
+
+// deliver hands a drained batch to the agent: the clock starts, the owner sees
+// their messages marked as received, and the batch goes back as a delivery.
+//
+// It is shared by the two places a wait can hand messages over — the drain at
+// the top of the loop and the one guarding the deadline — because they are the
+// same event and the owner should not be able to tell which one it came from.
+//
+// The indicator is started where the owner is looking: the newest message is
+// the one they just sent, so its channel and thread are the conversation they
+// are waiting on.
+func (b *Bridge) deliver(msgs []Message) WaitResult {
+	b.startIndicator(newestConversation(msgs))
+	b.autoAck(msgs)
+	return WaitResult{Messages: msgs}
 }
 
 // noteStreamClosed records that the live connection is gone, but only if the
@@ -431,10 +515,14 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 		} else {
 			b.pendingThreads = append(b.pendingThreads, msg)
 		}
+		b.notifyPendingLocked()
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the
 		// authority, so go re-read the window after the cursor.
 		b.needCatchUp = true
+		// A hole is a reason to go and look as much as a message is: what
+		// history has to offer is exactly what a blocked call is waiting for.
+		b.notifyPendingLocked()
 	}
 	return nil
 }

@@ -275,34 +275,6 @@ func TestAskLeavesTheIndicatorStoppedOnTimeout(t *testing.T) {
 	}
 }
 
-// Messages arriving while the owner is being asked something must not be eaten
-// by the ask; they are still owner input, and the next slack_wait owes them to
-// the agent.
-func TestAskKeepsMessagesForTheNextWait(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	b, _, stream := askBridge(ctx, t)
-
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000300", User: testOwner, Text: "one more thing"}}
-		stream.interactions <- click(testOwner, askTS, 0)
-	}()
-
-	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err != nil {
-		t.Fatalf("Ask() error = %v", err)
-	}
-
-	result, err := b.Wait(ctx, MaxWaitTimeout)
-	if err != nil {
-		t.Fatalf("Wait() error = %v", err)
-	}
-	if len(result.Messages) != 1 || result.Messages[0].Text != "one more thing" {
-		t.Errorf("Wait() messages = %+v, want the message that arrived during the question", result.Messages)
-	}
-}
-
 // Slack refuses a button label over 75 characters. A model writing a long
 // option is a wording problem, not a reason to fail the owner's question.
 func TestAskShortensLabelsToSlacksLimit(t *testing.T) {

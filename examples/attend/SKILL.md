@@ -86,6 +86,16 @@ If it returns `timed_out: true`, the owner did not answer. Do not pick for
 them on anything irreversible — leave the work where it is, say what you are
 waiting on, and go back to the loop.
 
+Whatever the owner said while the question was up comes back in `messages`,
+however it ended. Treat those as you would `slack_wait`'s: they have been marked
+as received and no later call will hand them to you again, so answer them as
+well as acting on the choice.
+
+If it returns `interrupted: true`, a message is why the question ended — they
+answered with words rather than a button. Drop the question, it is already off
+the channel, and act on what they said; they are usually redirecting you, so do
+not assume the original question still matters.
+
 ## Reading the channel
 
 `slack_wait` relays only the owner's messages. When they ask you to catch up on

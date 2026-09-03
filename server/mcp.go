@@ -44,7 +44,11 @@ Every message slack_wait returns is marked as received in Slack automatically, s
 not need slack_ack for that; use it only for a deliberate signal beyond receipt, such as
 marking a request done or rejected with a specific emoji.
 Use slack_ask to ask the owner a multiple-choice question and block for the answer, the way
-you would ask in the terminal when you need a decision before you can go on.
+you would ask in the terminal when you need a decision before you can go on. Whatever they
+said while the question was up comes back in messages, however the question ended: it is
+delivered to you there and nowhere else, so answer it rather than waiting for a slack_wait
+that will not repeat it. If interrupted is true they answered with a message rather than a
+button — they have redirected you, so act on what they said and drop the question.
 When slack_wait returns timed_out, simply call it again to keep the conversation open.
 When the owner asks you to read the channel — to summarise a discussion, or catch up on what
 was said — use slack_history, which returns everyone's messages and not just theirs. Treat
@@ -81,6 +85,10 @@ type AskArgs struct {
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait for an answer, in seconds; defaults to 300 and is clamped to 5-1500"`
 	ThreadTS       string   `json:"thread_ts,omitempty" jsonschema:"ask inside this thread instead of the channel"`
 	Channel        string   `json:"channel,omitempty" jsonschema:"the channel to ask in; pass the channel of the conversation you are in, and leave it out for the home channel"`
+	// A pointer, so "not passed" is a value of its own and the default can be
+	// true. A plain bool would make leaving it out mean false, which is the
+	// opposite of what is wanted.
+	InterruptOnMessage *bool `json:"interrupt_on_message,omitempty" jsonschema:"whether a message from the owner cancels the question and comes back instead of an answer; defaults to true. Set it to false only when the question must be answered before anything else can happen"`
 }
 
 // HistoryArgs is the argument set for slack_history.
@@ -180,7 +188,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_ask",
 		Title:       "Ask the owner a question",
-		Description: "Post a multiple-choice question and block until the owner taps an answer, or the timeout expires. Ask in the conversation you are having — pass its channel and thread_ts — and it defaults to the home channel. Returns the chosen option.",
+		Description: "Post a multiple-choice question and block until the owner taps an answer, the owner says something instead, or the timeout expires. Ask in the conversation you are having — pass its channel and thread_ts — and it defaults to the home channel. Returns the chosen option. However it ends, the messages field carries anything the owner sent while the question was up: a question blocks the loop that would otherwise collect them, so they are handed to you here and nowhere else. Treat them the way you would treat slack_wait's — they are already marked as received and will not be delivered again — and answer them as well as acting on the choice. If interrupted is true, a message is why the question ended: the owner answered with words rather than a button, so act on what they said and drop the question you asked. Pass interrupt_on_message false to keep the question waiting for a click regardless; the messages still come back with the answer.",
 		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args AskArgs) (*mcp.CallToolResult, bridge.AskResult, error) {
 		result, err := b.Ask(ctx, bridge.AskRequest{
@@ -189,9 +197,14 @@ func New(b *bridge.Bridge) *mcp.Server {
 			Timeout:  bridge.ClampTimeout(args.TimeoutSeconds),
 			ThreadTS: args.ThreadTS,
 			Channel:  args.Channel,
+			// Absent means interrupt, so only an explicit false turns it off.
+			InterruptDisabled: args.InterruptOnMessage != nil && !*args.InterruptOnMessage,
 		})
 		if err != nil {
 			return nil, bridge.AskResult{}, err
+		}
+		if result.Messages == nil {
+			result.Messages = []bridge.Message{}
 		}
 		return nil, result, nil
 	})
