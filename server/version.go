@@ -1,4 +1,4 @@
 package server
 
 // VERSION is the current version of the slack-bridge-mcp-server
-const VERSION = "0.3.0"
+const VERSION = "0.4.0"
