@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"log"
+	"sort"
 	"time"
 )
 
@@ -60,6 +61,14 @@ func (b *Bridge) recordStateWriteLocked(w stateWrite) {
 	if b.store == nil {
 		return
 	}
+	if b.stateClosed {
+		// The writer has flushed and stopped, and this is a call that was
+		// still running when the session ended. Starting another writer would
+		// outlive the shutdown that was waited for; saying so is the honest
+		// end of it, and what is lost is work repeated after a restart.
+		log.Printf("the state file is closed; a cursor recorded during shutdown will not survive a restart")
+		return
+	}
 	if b.stateDirty == nil {
 		b.stateDirty = make(map[stateKey]stateWrite)
 		b.stateWake = make(chan struct{}, 1)
@@ -90,6 +99,15 @@ func (b *Bridge) takeStateWrites() []stateWrite {
 		writes = append(writes, w)
 	}
 	b.stateDirty = make(map[stateKey]stateWrite)
+
+	// Conversations before cursors. A mention opens a conversation and moves
+	// the mention cursor past itself, and in that order the two survive a crash
+	// between them: the conversation is restored and the mention is read again
+	// at worst. The other way round, a restart skips the mention and never
+	// learns the conversation was open.
+	sort.SliceStable(writes, func(i, j int) bool {
+		return writes[i].kind == writeThread && writes[j].kind != writeThread
+	})
 	return writes
 }
 
@@ -146,6 +164,7 @@ func (b *Bridge) stopStateWriter() {
 	b.mu.Lock()
 	stop, done := b.stopStateWrites, b.stateWritesDone
 	b.stopStateWrites = nil
+	b.stateClosed = true
 	b.mu.Unlock()
 
 	if stop == nil {

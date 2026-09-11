@@ -143,24 +143,25 @@ func TestADisconnectDuringCatchUpStillDeliversWhatWasInHand(t *testing.T) {
 	}
 }
 
-// The ordering rule itself: applying a reaction applies whatever messages are
-// already on the wire ahead of it, so the mention that brings a channel into
+// The ordering rule itself: the messages waiting on the wire are applied before
+// a reaction the pump is carrying, so the mention that brings a channel into
 // scope is registered before the vote on it is judged.
 //
-// That the two are one step, and not merely adjacent, comes from the single
-// lock they share — a call draining the queues waits for both or arrives before
-// either, and cannot land between them.
+// Each step is one lock, and a reaction is carried until a sweep finds the
+// events channel empty — so a call draining the queues cannot see a reaction
+// that a message ahead of it has not had its say in.
 func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, _, stream := mentionBridge(ctx, t)
+	b, _, _ := mentionBridge(ctx, t)
 
 	// Open the connection, so the bridge knows its own user ID and can
 	// recognise the mention below.
 	if result := waitOnce(ctx, t, b); !result.TimedOut {
 		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
 	}
+	generation := b.currentGeneration()
 
 	// A channel of its own, so what is read here is only what this test put
 	// there: the pump has the connection's.
@@ -169,9 +170,12 @@ func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 		TS: "200.000100", Channel: otherChannel, User: testOwner, Text: mention("ship it?"),
 	}}
 
-	b.applyReaction(stream, events, Reaction{
+	// The pump's two steps, in the order it does them: the messages waiting,
+	// then the reaction it was carrying.
+	b.applyReadyEvents(generation, events, nil)
+	b.applyCarriedReactions(generation, []Reaction{{
 		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "white_check_mark", Added: true,
-	})
+	}})
 
 	if kept := b.drainReactions(); len(kept) != 1 {
 		t.Fatalf("drainReactions() = %+v, want the vote: the mention ahead of it opens the conversation it is in", kept)
@@ -527,4 +531,42 @@ func (c *reconnectingConnector) Connect(context.Context, Config) (API, Stream, e
 	}
 	c.calls++
 	return c.api, stream, nil
+}
+
+// currentGeneration reports which connection the bridge is on, for tests that
+// drive the pump's helpers directly.
+func (b *Bridge) currentGeneration() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.connGeneration
+}
+
+// A click from a connection that has been replaced is an answer to a question
+// that is over. Letting it through could answer the next one instead.
+func TestAClickFromAReplacedConnectionIsIgnored(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := askBridge(ctx, t)
+
+	done := make(chan AskResult, 1)
+	go func() {
+		result, err := b.Ask(ctx, AskRequest{
+			Question: "Deploy now?", Options: []string{"Yes", "No"},
+			Timeout: 300 * time.Millisecond, InterruptDisabled: true,
+		})
+		if err != nil {
+			t.Errorf("Ask() error = %v", err)
+		}
+		done <- result
+	}()
+	waitForQuestion(b)
+
+	// A click arriving from the connection before this one.
+	b.applyClick(b.currentGeneration()-1, click(testOwner, askTS, 0))
+
+	result := <-done
+	if !result.TimedOut {
+		t.Errorf("Ask() = %+v, want the question to time out: the click belonged to a connection that is over", result)
+	}
 }

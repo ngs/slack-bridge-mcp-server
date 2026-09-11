@@ -205,8 +205,15 @@ func (b *Bridge) drainReactions() []Reaction {
 // It reads the live stream's marker and the bridge's own together: a loss on a
 // connection that has since died is still a loss the agent has to hear about,
 // and the stream it happened on is gone.
-func (b *Bridge) takeReactionsDropped(stream Stream) bool {
-	dropped := streamDroppedReactions(stream)
+func (b *Bridge) takeReactionsDropped(generation uint64) bool {
+	b.mu.Lock()
+	stream := b.stream
+	current := !b.stale(generation)
+	b.mu.Unlock()
+
+	// Outside the lock, because it is a question for somebody else's
+	// implementation of the stream and not for the bridge.
+	dropped := current && streamDroppedReactions(stream)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()

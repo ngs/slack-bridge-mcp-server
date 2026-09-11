@@ -131,7 +131,10 @@ type Bridge struct {
 	// stops the only reader the connection has. stateWake tells the writer
 	// there is something to take, stopStateWrites tells it to flush and stop,
 	// and stateWritesDone closes once it has.
-	stateDirty      map[stateKey]stateWrite
+	stateDirty map[stateKey]stateWrite
+	// stateClosed marks the writer as flushed and stopped, so a call still
+	// running at shutdown does not start another one behind it.
+	stateClosed     bool
 	stateWake       chan struct{}
 	stopStateWrites chan struct{}
 	stateWritesDone chan struct{}
@@ -439,6 +442,14 @@ func (b *Bridge) ensure() error {
 	b.botUserID = api.BotUserID()
 	b.stream = stream
 	b.connected = true
+	// A fresh connection is the one moment the scopes can have changed, so the
+	// catch-up outside the home channel is offered another go — and anything the
+	// old connection is still doing no longer speaks for this one. The count is
+	// also what every part of this connection is identified by, so it moves
+	// before anything is started on it.
+	b.connGeneration++
+	generation := b.connGeneration
+
 	// One goroutine owns the socket from here. It runs on the connection's
 	// context rather than a call's, so a wait that is cancelled does not take
 	// the connection down with it — and it stops when the connection does, so
@@ -447,12 +458,8 @@ func (b *Bridge) ensure() error {
 	b.pumpDone = pumpDone
 	go func() {
 		defer close(pumpDone)
-		b.pump(connCtx, stream)
+		b.pump(connCtx, generation, stream)
 	}()
-	// A fresh connection is the one moment the scopes can have changed, so the
-	// catch-up outside the home channel is offered another go — and anything the
-	// old connection is still doing no longer speaks for this one.
-	b.connGeneration++
 	// The first catch-up covers everything missed since the last session;
 	// StreamConnected events later cover reconnects.
 	b.requestCatchUpLocked()
@@ -511,7 +518,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		b.mu.Unlock()
 		return WaitResult{}, err
 	}
-	stream := b.stream
+	generation := b.connGeneration
 	b.mu.Unlock()
 
 	// Subscribed before the first drain, so a message absorbed by another call
@@ -534,14 +541,14 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		}
 		drained := b.drainReactions()
 		if len(msgs) > 0 || len(drained) > 0 {
-			return b.deliver(ctx, stream, msgs, drained), nil
+			return b.deliver(ctx, generation, msgs, drained), nil
 		}
 
 		// Only once there is nothing to hand over. Anything the dying
 		// connection had already delivered is in the queues above, and
 		// reporting the disconnection before taking it would throw away what
 		// the owner actually sent.
-		if b.streamGone(stream) {
+		if b.streamGone(generation) {
 			return WaitResult{}, errors.New("the Slack connection closed")
 		}
 
@@ -565,12 +572,12 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				// timed_out of true alongside messages would be read as "call
 				// again", which is the one thing that must not happen to
 				// messages already handed over.
-				return b.deliver(ctx, stream, msgs, drained), nil
+				return b.deliver(ctx, generation, msgs, drained), nil
 			}
 			// A connection that ended while the last history request was in
 			// flight is news, and a quiet timeout would leave it for whoever
 			// called next.
-			if b.streamGone(stream) {
+			if b.streamGone(generation) {
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
 			return WaitResult{
@@ -578,7 +585,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				// A wait with nothing to hand over still has to say a
 				// reaction was lost: that is precisely when the agent's count
 				// is wrong and nothing else would tell it.
-				ReactionsDropped: b.takeReactionsDropped(stream),
+				ReactionsDropped: b.takeReactionsDropped(generation),
 				TimedOut:         true,
 			}, nil
 
@@ -599,7 +606,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 // The indicator is started where the owner is looking: the newest message is
 // the one they just sent, so its channel and thread are the conversation they
 // are waiting on.
-func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, reactions []Reaction) WaitResult {
+func (b *Bridge) deliver(ctx context.Context, generation uint64, msgs []Message, reactions []Reaction) WaitResult {
 	// Only messages start the clock. A reaction is not something the owner is
 	// waiting on an answer to, and marking one as received would put a receipt
 	// emoji on a message for every emoji anybody else put on it.
@@ -616,7 +623,7 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 	return WaitResult{
 		Messages:         msgs,
 		Reactions:        b.nameReactions(ctx, reactions),
-		ReactionsDropped: b.takeReactionsDropped(stream),
+		ReactionsDropped: b.takeReactionsDropped(generation),
 	}
 }
 
@@ -628,14 +635,21 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 // second then cleared the flag unconditionally, the next call would open a
 // third connection while the replacement was still consuming events, and the
 // owner's messages would arrive on a socket nobody reads.
-func (b *Bridge) noteStreamClosed(stream Stream) {
+func (b *Bridge) noteStreamClosed(generation uint64) {
 	// Whatever this connection lost is still the agent's to hear about, and the
 	// stream that recorded it is going away. It is taken here rather than in
 	// any one caller because the socket closes its channels together and a call
 	// can notice any of them first: this is the one place every disconnect
 	// passes through. It is taken even when the stream has already been
 	// replaced — the loss happened either way.
-	dropped := streamDroppedReactions(stream)
+	b.mu.Lock()
+	stream := b.stream
+	current := !b.stale(generation)
+	b.mu.Unlock()
+
+	// Asked outside the lock: it is a question for the stream, and the stream
+	// is somebody else's implementation.
+	dropped := current && streamDroppedReactions(stream)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -643,7 +657,7 @@ func (b *Bridge) noteStreamClosed(stream Stream) {
 	if dropped {
 		b.reactionsDropped = true
 	}
-	if b.stream == stream {
+	if !b.stale(generation) {
 		b.connected = false
 	}
 	// A blocked call is waiting for something to happen, and this is something:
@@ -773,14 +787,21 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	// it was, and the new connection has its own catch-up to run — the one that
 	// finds what a reinstall has just made readable. The messages it did read
 	// are still handed over; only the flag is left alone.
-	// Only if nothing has asked again since this one started. A reconnect or a
-	// refused message that arrived while history was in flight is a request
-	// this catch-up never saw, and clearing the flag would answer it with a
-	// window that did not include it.
-	if needCatchUp && generation == b.connGeneration && epoch == b.catchUpEpoch {
-		b.needCatchUp = false
+	if needCatchUp && generation == b.connGeneration {
+		// The cursor first, and whatever else has been asked for since. A seed
+		// is a fact about the channel — where it was when this session found
+		// it — and dropping it because something asked for another catch-up
+		// meanwhile would leave the cursor unset, to be seeded again against a
+		// channel that has moved on.
 		if b.lastTS == "" {
 			b.lastTS = lastTS
+		}
+		// The flag, only if nothing has asked again since this one started. A
+		// reconnect or a refused message that arrived while history was in
+		// flight is a request this catch-up never saw, and clearing it would
+		// answer that request with a window that did not include it.
+		if epoch == b.catchUpEpoch {
+			b.needCatchUp = false
 		}
 	}
 

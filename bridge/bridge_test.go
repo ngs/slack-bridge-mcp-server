@@ -896,21 +896,23 @@ func TestAStaleStreamClosingDoesNotInvalidateTheReplacement(t *testing.T) {
 	}
 
 	// A replacement connection is installed, as a reconnect would.
-	replacement := newFakeStream()
 	b.mu.Lock()
-	b.stream = replacement
+	stale := b.connGeneration
+	b.stream = newFakeStream()
+	b.connGeneration++
+	live := b.connGeneration
 	b.connected = true
 	b.mu.Unlock()
 
-	// The straggler now notices the old stream closing.
-	b.noteStreamClosed(old)
+	// The straggler now notices the old connection closing.
+	b.noteStreamClosed(stale)
 
 	if !b.Status().Connected {
-		t.Error("Status() reports disconnected after a stale stream closed, which would open a second socket alongside the live one")
+		t.Error("Status() reports disconnected after a stale connection closed, which would open a second socket alongside the live one")
 	}
 
 	// The live one closing is a different matter.
-	b.noteStreamClosed(replacement)
+	b.noteStreamClosed(live)
 	if b.Status().Connected {
 		t.Error("Status() still reports connected after the current stream closed")
 	}

@@ -171,7 +171,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	channel := b.channelOr(req.Channel)
 	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel}
 	b.ask = ask
-	api, stream := b.api, b.stream
+	api, generation := b.api, b.connGeneration
 	b.mu.Unlock()
 
 	defer b.clearAsk(ask)
@@ -225,7 +225,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		// No click can reach this question once the socket is gone, so the
 		// buttons go with it rather than standing there inviting an answer
 		// nothing could carry.
-		if b.streamGone(stream) {
+		if b.streamGone(generation) {
 			// The connection hands over what it had before it says it is
 			// gone, so the owner's click can already be waiting here. It is an
 			// answer whatever happened to the socket afterwards.
@@ -274,6 +274,13 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 				}), nil
 			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			// The deadline and the end of the connection can be ready at the
+			// same moment, and a timeout would be the wrong answer to the
+			// second: it says "ask again", which is not what a call does with
+			// a socket that has gone.
+			if b.streamGone(generation) {
+				return AskResult{}, errors.New("the Slack connection closed")
+			}
 			// A question nobody answered leaves the agent with nothing to act
 			// on, which is exactly when a message waiting behind it matters
 			// most.
