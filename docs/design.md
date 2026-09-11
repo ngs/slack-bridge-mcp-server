@@ -368,7 +368,7 @@ while the session was down reaches nobody. That is why `slack_reactions` exists:
 `reactions.get` reports the standing tally, which is what an agent counting
 answers actually needs after a restart.
 
-### Clicks travel apart from messages
+### Reactions and clicks travel apart from messages
 
 A message that cannot be queued live is not lost: the overflow becomes a
 reconnect-shaped event and the bridge re-reads the window from
@@ -380,6 +380,19 @@ ignored it.
 Clicks therefore have a queue of their own, small and read by both the wait and
 the ask loops. A backlog of messages, which is the one situation where the
 event queue fills, cannot take the space a click needs.
+
+Reactions are in the same position and get the same treatment: no history call
+returns one, so a vote that could not be queued is a vote nobody ever counts.
+Their queue is larger, because a decision post collects a burst rather than a
+single answer, and an overflow is logged pointing at `slack_reactions` — the
+one recovery a dropped reaction has, and the reason its loss is recoverable
+where a click's is not.
+
+Both channels are optional halves of the `Stream` interface, reached by type
+assertion. `Stream`, `API` and `Connector` are exported, so requiring a new
+method on them would break anything outside this repository that implements
+one; an implementation without the reaction half simply delivers no reactions,
+and `slack_reactions` says so rather than failing obscurely.
 
 ### Whoever is blocked hears about the message
 

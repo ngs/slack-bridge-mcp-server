@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"sort"
 )
 
@@ -86,6 +87,23 @@ func (b *Bridge) channelHasConversationLocked(channel string) bool {
 		}
 	}
 	return false
+}
+
+// absorbReaction folds one emoji from the stream into the pending queue.
+//
+// It is the reaction half of absorb, and separate for the same reason the
+// channel is: what arrives here is never merged with history and never
+// compared against a cursor.
+func (b *Bridge) absorbReaction(r Reaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	reaction, ok := b.classifyReactionLocked(r)
+	if !ok {
+		return
+	}
+	b.pendingReactions = append(b.pendingReactions, reaction)
+	b.notifyPendingLocked()
 }
 
 // drainReactions takes everything queued for the next delivery.
@@ -186,12 +204,23 @@ type ReactionsResult struct {
 // Like slack_history it changes nothing — it moves no cursor and consumes
 // nothing a wait would deliver.
 func (b *Bridge) Reactions(ctx context.Context, req ReactionsRequest) (ReactionsResult, error) {
+	// Before connecting: a ts is the whole of what identifies the message, and
+	// answering an empty one with a deterministic error beats opening a socket
+	// to have Slack reject the reference.
+	if req.TS == "" {
+		return ReactionsResult{}, errors.New("ts is required")
+	}
+
 	api, _, err := b.apiForCall()
 	if err != nil {
 		return ReactionsResult{}, err
 	}
+	reader, ok := api.(ReactionReader)
+	if !ok {
+		return ReactionsResult{}, errors.New("this Slack connection cannot read reactions")
+	}
 
-	summaries, err := api.MessageReactions(ctx, b.channelFor(req.Channel), req.TS)
+	summaries, err := reader.MessageReactions(ctx, b.channelFor(req.Channel), req.TS)
 	if err != nil {
 		return ReactionsResult{}, err
 	}

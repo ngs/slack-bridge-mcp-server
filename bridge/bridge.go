@@ -384,6 +384,11 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	stream := b.stream
 	b.mu.Unlock()
 
+	// Reactions arrive on a channel of their own, so a backlog of messages
+	// cannot fill the queue a vote lands in. A stream that predates them has
+	// none, and a nil channel simply never fires.
+	reactions := reactionsOf(stream)
+
 	// Subscribed before the first drain, so a message absorbed by another call
 	// between the drain and the select is a wakeup rather than a message this
 	// call blocks straight through.
@@ -400,9 +405,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		if err != nil {
 			return WaitResult{}, err
 		}
-		reactions := b.drainReactions()
-		if len(msgs) > 0 || len(reactions) > 0 {
-			return b.deliver(ctx, msgs, reactions), nil
+		drained := b.drainReactions()
+		if len(msgs) > 0 || len(drained) > 0 {
+			return b.deliver(ctx, msgs, drained), nil
 		}
 
 		// A pending question owns the click channel. Reading it here as well
@@ -429,18 +434,28 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if err != nil {
 				return WaitResult{}, err
 			}
-			reactions := b.drainReactions()
-			if len(msgs) > 0 || len(reactions) > 0 {
+			drained := b.drainReactions()
+			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
 				// timed_out of true alongside messages would be read as "call
 				// again", which is the one thing that must not happen to
 				// messages already handed over.
-				return b.deliver(ctx, msgs, reactions), nil
+				return b.deliver(ctx, msgs, drained), nil
 			}
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
 
 		case <-sub:
 			// Something reached the queue. Round the loop to drain it.
+
+		case r, ok := <-reactions:
+			if !ok {
+				// The socket is gone. The events channel closing is what
+				// reports that; this one simply stops firing, so the select
+				// does not spin on a closed channel.
+				reactions = nil
+				continue
+			}
+			b.absorbReaction(r)
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -532,15 +547,6 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 		} else {
 			b.pendingThreads = append(b.pendingThreads, msg)
 		}
-		b.notifyPendingLocked()
-	case StreamReaction:
-		// Reactions come from everybody, so the filter is about where the
-		// message is rather than who reacted to it.
-		reaction, ok := b.classifyReactionLocked(evt.Reaction)
-		if !ok {
-			return nil
-		}
-		b.pendingReactions = append(b.pendingReactions, reaction)
 		b.notifyPendingLocked()
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the

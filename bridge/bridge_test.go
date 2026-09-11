@@ -365,18 +365,22 @@ func (f *fakeAPI) calls() []HistoryRequest {
 type fakeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
+	reactions    chan Reaction
 }
 
 func newFakeStream() *fakeStream {
 	return &fakeStream{
 		events:       make(chan StreamEvent, 16),
 		interactions: make(chan Interaction, 16),
+		reactions:    make(chan Reaction, 16),
 	}
 }
 
 func (s *fakeStream) Events() <-chan StreamEvent { return s.events }
 
 func (s *fakeStream) Interactions() <-chan Interaction { return s.interactions }
+
+func (s *fakeStream) Reactions() <-chan Reaction { return s.reactions }
 
 // fakeConnector hands out a fixed API and stream, and records how often it was
 // asked to connect.

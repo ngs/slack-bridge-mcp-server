@@ -110,10 +110,6 @@ type API interface {
 	PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error)
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, channel, ts, emoji string) error
-	// MessageReactions reports the emoji already on a message, and who put
-	// them there. It is the standing tally the live reaction events cannot
-	// give, since those exist only for as long as the connection does.
-	MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error)
 	// Update rewrites the text of a message the bridge posted.
 	Update(ctx context.Context, channel, ts, text string) error
 	// ResolveQuestion rewrites an answered or expired question and removes
@@ -123,6 +119,18 @@ type API interface {
 	ResolveQuestion(ctx context.Context, channel, ts, text string) error
 	// Delete removes a message the bridge posted.
 	Delete(ctx context.Context, channel, ts string) error
+}
+
+// ReactionReader reports the emoji standing on a message, and who put them
+// there. It is the tally the live reaction events cannot give, since those
+// exist only for as long as the connection does.
+//
+// It is separate from API, and reached by type assertion, so that adding it
+// breaks nothing: API and Connector are exported, and anything outside this
+// repository that implements them keeps compiling and keeps working. What it
+// loses is slack_reactions, which says so rather than failing obscurely.
+type ReactionReader interface {
+	MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error)
 }
 
 // StreamEventKind distinguishes the things that can happen on the Socket Mode
@@ -140,19 +148,12 @@ const (
 	// Nothing is lost: the bridge treats it exactly like a reconnect and
 	// re-reads the window from history.
 	StreamDropped
-	// StreamReaction carries one emoji added to or removed from a message.
-	// Unlike a message it is relayed whoever reacted, because a reaction is
-	// how somebody other than the owner answers a question put to a channel.
-	StreamReaction
 )
 
 // StreamEvent is one item from the live event stream.
 type StreamEvent struct {
 	Kind    StreamEventKind
 	Message Message
-	// Reaction is set on StreamReaction events, and is the raw event: which
-	// conversations it belongs to, if any, is the bridge's decision.
-	Reaction Reaction
 }
 
 // Interaction is one button click on a message the bridge posted. It is
@@ -190,6 +191,31 @@ type Stream interface {
 	// Interactions delivers button clicks, on a separate channel because they
 	// cannot be recovered from history if they are dropped.
 	Interactions() <-chan Interaction
+}
+
+// ReactionStream is the optional half of Stream that delivers emoji.
+//
+// Reactions travel on a channel of their own for the reason clicks do: a
+// message that cannot be queued is recovered from conversations.history, and a
+// reaction is in no history at all. A backlog of messages must therefore not be
+// able to fill the queue a vote arrives on. It is reached by type assertion so
+// that a Stream written before reactions existed still satisfies the interface;
+// such a stream simply delivers none.
+type ReactionStream interface {
+	// Reactions delivers emoji added to and removed from messages until the
+	// stream's context is done, at which point the channel is closed.
+	Reactions() <-chan Reaction
+}
+
+// reactionsOf returns a stream's reaction channel, or nil if it has none. A nil
+// channel blocks for ever in a select, which is exactly "this stream never
+// delivers reactions".
+func reactionsOf(stream Stream) <-chan Reaction {
+	rs, ok := stream.(ReactionStream)
+	if !ok {
+		return nil
+	}
+	return rs.Reactions()
 }
 
 // Connector opens both halves of the Slack connection. Connect is called

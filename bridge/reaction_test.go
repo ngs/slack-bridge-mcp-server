@@ -14,9 +14,9 @@ import (
 // filtering applied: deciding whether it belongs to a conversation is the
 // bridge's job, not the socket's.
 func react(stream *fakeStream, channel, ts, user, emoji string, added bool) {
-	stream.events <- StreamEvent{Kind: StreamReaction, Reaction: Reaction{
+	stream.reactions <- Reaction{
 		TS: ts, Channel: channel, User: user, Reaction: emoji, Added: added, EventTS: ts + "9",
-	}}
+	}
 }
 
 // waitOnce collects one delivery, reactions included.
@@ -203,25 +203,28 @@ func TestReactionEnvelopesAreTranslatedAndAcknowledged(t *testing.T) {
 	if acked != 2 {
 		t.Errorf("acked %d reaction envelopes, want 2; Slack redelivers the rest", acked)
 	}
-	if len(stream.events) != 2 {
-		t.Fatalf("queued %d events, want both reactions", len(stream.events))
+	if len(stream.events) != 0 {
+		t.Errorf("queued %d stream events, want 0: a reaction belongs on its own channel, where a message backlog cannot swallow it", len(stream.events))
+	}
+	if len(stream.reactions) != 2 {
+		t.Fatalf("queued %d reactions, want both", len(stream.reactions))
 	}
 
-	added := <-stream.events
-	removed := <-stream.events
-	want := StreamEvent{Kind: StreamReaction, Reaction: Reaction{
+	added := <-stream.reactions
+	removed := <-stream.reactions
+	want := Reaction{
 		TS:       "100.000500",
 		Channel:  testChannel,
 		User:     colleague,
 		Reaction: "white_check_mark",
 		Added:    true,
 		EventTS:  "100.000600",
-	}}
+	}
 	if !reflect.DeepEqual(added, want) {
 		t.Errorf("reaction_added = %+v, want %+v", added, want)
 	}
-	if removed.Kind != StreamReaction || removed.Reaction.Added {
-		t.Errorf("reaction_removed = %+v, want a StreamReaction with added false", removed)
+	if removed.Added {
+		t.Errorf("reaction_removed = %+v, want added false", removed)
 	}
 }
 
@@ -242,8 +245,8 @@ func TestAReactionOnAFileIsNotTranslated(t *testing.T) {
 		}
 	}`))
 
-	if len(stream.events) != 0 {
-		t.Errorf("queued %d events, want none for a reaction on a file", len(stream.events))
+	if len(stream.events) != 0 || len(stream.reactions) != 0 {
+		t.Errorf("queued %d events and %d reactions, want none for a reaction on a file", len(stream.events), len(stream.reactions))
 	}
 }
 
@@ -310,4 +313,100 @@ func reactionEnvelope(t *testing.T, eventType, user, emoji string) socketmode.Ev
 		t.Fatalf("building the reaction payload: %v", err)
 	}
 	return eventsAPIEnvelope(t, string(payload))
+}
+
+// A ts is the whole of what identifies a message, so an empty one is answered
+// here rather than by Slack: the deterministic error is the one the caller can
+// act on, and it costs no connection.
+func TestReactionsRequiresATimestamp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := mentionBridge(ctx, t)
+
+	if _, err := b.Reactions(ctx, ReactionsRequest{}); err == nil {
+		t.Fatal("Reactions() = nil error for an empty ts, want it refused")
+	}
+
+	api.mu.Lock()
+	reads := len(api.reactionReads)
+	api.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("made %d reactions.get calls, want none: the request never reaches Slack", reads)
+	}
+}
+
+// A reaction is in no history, so one that cannot be queued is a vote nobody
+// ever counts. A backlog of messages — the one thing that fills the event
+// queue — must therefore not be able to take the space a reaction needs.
+func TestAFullMessageQueueCannotSwallowAReaction(t *testing.T) {
+	stream := newTestStream(2)
+	stream.emit(StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000100"}})
+	stream.emit(StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000200"}})
+	if !stream.dropped.Load() {
+		// Guard the premise: the message queue has to be full for this to
+		// mean anything.
+		stream.emit(StreamEvent{Kind: StreamMessage, Message: Message{TS: "100.000300"}})
+	}
+
+	stream.handle(func(socketmode.Request) {}, reactionEnvelope(t, "reaction_added", colleague, "white_check_mark"))
+
+	select {
+	case got := <-stream.reactions:
+		if got.TS != "100.000500" {
+			t.Errorf("reaction = %+v, want the one on 100.000500", got)
+		}
+	default:
+		t.Fatal("the reaction was dropped because the message queue was full; no history call brings it back")
+	}
+}
+
+// Stream and API are exported, so a connector written before reactions existed
+// has neither half. It has to keep working — delivering no reactions, and
+// saying plainly that the tally cannot be read.
+func TestAConnectorWithoutTheReactionHalvesStillWorks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	b := New(ctx, cfg, olderConnector{api: &olderAPI{fakeAPI: &fakeAPI{}}, stream: &olderStream{fakeStream: newFakeStream()}})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a plain timeout from a stream with no reactions", result)
+	}
+
+	_, err := b.Reactions(ctx, ReactionsRequest{TS: "100.000500"})
+	if err == nil {
+		t.Fatal("Reactions() = nil error on a connection that cannot read them, want it said plainly")
+	}
+}
+
+// olderAPI and olderStream are an API and a Stream as they were before
+// reactions. Each shadows the optional method with one of a different shape, so
+// the embedded fake's version cannot satisfy the interface through them — which
+// is what a type written against the old interfaces looks like from here.
+type olderAPI struct{ *fakeAPI }
+
+func (a *olderAPI) MessageReactions() {}
+
+type olderStream struct{ *fakeStream }
+
+func (s *olderStream) Reactions() {}
+
+// olderConnector hands out that pair, which fakeConnector cannot: its fields
+// are the concrete fakes.
+type olderConnector struct {
+	api    API
+	stream Stream
+}
+
+func (c olderConnector) Connect(context.Context, Config) (API, Stream, error) {
+	return c.api, c.stream, nil
 }

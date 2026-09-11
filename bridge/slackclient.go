@@ -18,6 +18,15 @@ import (
 // and the bridge recovers the messages from conversations.history.
 const liveEventBuffer = 64
 
+// liveReactionBuffer is the emoji queue. Reactions get their own, away from the
+// messages, because a message that does not fit is recovered from
+// conversations.history and a reaction is in no history: a backlog of messages
+// must not be able to swallow a vote. It is larger than the click queue because
+// a decision post can collect a burst of them, and an overflow here is a
+// reaction the agent never sees — recoverable with slack_reactions, but only if
+// it thinks to ask.
+const liveReactionBuffer = 256
+
 // liveInteractionBuffer is the click queue. It is small because clicks are
 // rare — at most one question is outstanding at a time — and separate because
 // a click that does not fit is simply lost: unlike a message, there is no
@@ -54,6 +63,7 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 	stream := &socketModeStream{
 		events:       make(chan StreamEvent, liveEventBuffer),
 		interactions: make(chan Interaction, liveInteractionBuffer),
+		reactions:    make(chan Reaction, liveReactionBuffer),
 		owner:        cfg.Owner,
 	}
 
@@ -428,6 +438,7 @@ var permanentThreadErrors = map[string]bool{
 type socketModeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
+	reactions    chan Reaction
 	owner        string
 	// dropped is set when an event could not be queued. It is sticky rather
 	// than an event of its own because the queue being full is exactly when
@@ -440,9 +451,12 @@ func (s *socketModeStream) Events() <-chan StreamEvent { return s.events }
 
 func (s *socketModeStream) Interactions() <-chan Interaction { return s.interactions }
 
+func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
+
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
 	defer close(s.events)
 	defer close(s.interactions)
+	defer close(s.reactions)
 
 	ack := func(req socketmode.Request) { _ = client.Ack(req) }
 
@@ -497,7 +511,7 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 		}
 
 		if reaction, ok := toReaction(api.InnerEvent.Data); ok {
-			s.emit(StreamEvent{Kind: StreamReaction, Reaction: reaction})
+			s.emitReaction(reaction)
 			return
 		}
 
@@ -628,7 +642,11 @@ func toReaction(data any) (Reaction, bool) {
 }
 
 func reactionFromItem(user, emoji, eventTS string, item slackevents.Item, added bool) (Reaction, bool) {
-	if item.Timestamp == "" {
+	// Both halves matter. The type is what says this is a message rather than a
+	// file or a file comment, and the timestamp is what makes it addressable:
+	// without one there is nothing for the agent to answer, and an item with no
+	// channel would otherwise be taken for a home-channel reaction.
+	if item.Type != "message" || item.Timestamp == "" {
 		return Reaction{}, false
 	}
 	return Reaction{
@@ -677,6 +695,18 @@ func (s *socketModeStream) emitInteraction(in Interaction) {
 	case s.interactions <- in:
 	default:
 		log.Printf("dropped a button click because nothing was reading them; the question it answered will time out")
+	}
+}
+
+// emitReaction queues an emoji on its own channel. Like a click it has no
+// history to be recovered from, so an overflow is logged plainly — and unlike a
+// click it can still be recovered deliberately, by asking reactions.get for the
+// tally, which is what the message says to do.
+func (s *socketModeStream) emitReaction(r Reaction) {
+	select {
+	case s.reactions <- r:
+	default:
+		log.Printf("dropped a reaction because nothing was reading them; read the tally with slack_reactions if you are counting")
 	}
 }
 

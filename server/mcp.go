@@ -145,8 +145,8 @@ func New(b *bridge.Bridge) *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_wait",
-		Title:       "Wait for a Slack message",
-		Description: "Block until the owner sends a message, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. A message the owner attached something to carries a files array describing it — the metadata, not the bytes, which you fetch from url_private with the bot token if you need them. Returns any messages missed while the session was down. Marks what it delivers as received, and starts the progress indicator, so it is not a read-only call.",
+		Title:       "Wait for a Slack message or reaction",
+		Description: "Block until the owner sends a message or somebody reacts to one, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. A message the owner attached something to carries a files array describing it — the metadata, not the bytes, which you fetch from url_private with the bot token if you need them. Emoji come back in a reactions array beside the messages, from anybody and not only the owner, so a post you asked people to answer with a reaction tells you the answers; either kind on its own ends the wait. Returns any messages missed while the session was down; reactions are live only, and slack_reactions reads back the ones that were missed. Marks messages it delivers as received, and starts the progress indicator, so it is not a read-only call.",
 		// Not ReadOnlyHint: delivering messages reacts to them and starts the
 		// elapsed-time indicator, both of which write to the channel. A client
 		// may use that hint to decide what to allow without asking.

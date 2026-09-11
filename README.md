@@ -167,8 +167,8 @@ the failure is logged once. Losing it must not cost you a message.
 
 `slack_status` answers `"connected": false` until the first tool call that
 needs Slack — `slack_wait`, `slack_post`, `slack_ack`, `slack_ask`,
-`slack_history`, or `slack_progress` when it has to start an indicator,
-whichever comes first — which is the lazy connect working as
+`slack_history`, `slack_reactions`, or `slack_progress` when it has to start an
+indicator, whichever comes first — which is the lazy connect working as
 intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
