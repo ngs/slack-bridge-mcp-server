@@ -235,9 +235,8 @@ func (b *Bridge) drainStream(stream Stream, reactions <-chan Reaction) {
 		// The buffer is emptied first and the closure recorded after, so what
 		// the connection delivered before it died is kept and the next call
 		// opens a new one instead of listening to a dead socket. Anything the
-		// dying stream lost is kept too: the marker is the agent's only sign
-		// that its count is wrong, and it must not die with the socket.
-		b.keepStreamDroppedMark(stream)
+		// stream lost on the way is kept by noteStreamClosed, which every
+		// disconnect path goes through.
 		b.noteStreamClosed(stream)
 	}
 }
@@ -287,17 +286,6 @@ func (b *Bridge) takeReactionsDropped(stream Stream) bool {
 	dropped = dropped || b.reactionsDropped
 	b.reactionsDropped = false
 	return dropped
-}
-
-// keepStreamDroppedMark moves a dying stream's record of a lost reaction onto
-// the bridge, so it outlives the connection it happened on.
-func (b *Bridge) keepStreamDroppedMark(stream Stream) {
-	if !streamDroppedReactions(stream) {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.reactionsDropped = true
 }
 
 // nameReactions fills in the display name on each reaction, leaving the ID in

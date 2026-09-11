@@ -733,3 +733,27 @@ func TestAReactionWithNoChannelIsNotTranslated(t *testing.T) {
 		t.Errorf("queued %d reactions, want none for an item with no channel", len(stream.reactions))
 	}
 }
+
+// The socket closes its channels together and a call can notice any of them
+// first. Whichever it is, the record of a lost reaction has to come off the
+// dying stream: it is the agent's only sign that the count it is keeping is
+// wrong, and there is no history to recover it from.
+func TestADroppedReactionIsRescuedWhicheverChannelClosesFirst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	// The click channel goes first, which is what the close order actually
+	// does: the events channel is the one a disconnection is reported from,
+	// and it is closed last.
+	stream.reactionsDropped.Store(true)
+	close(stream.interactions)
+
+	if _, err := b.Wait(ctx, 5*time.Second); err == nil {
+		t.Fatal("Wait() = nil error after the click channel closed, want the disconnection reported")
+	}
+	if !b.droppedReactionMark() {
+		t.Error("the loss died with the connection because a different channel closed first")
+	}
+}

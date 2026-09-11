@@ -451,7 +451,11 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// any point during the poll, including the instant the timer fires
 			// and including from another call entirely, and reporting an empty
 			// timeout on top of one would hold it back for another full poll
-			// while the owner waits on a reply.
+			// while the owner waits on a reply. The wire is swept here for the
+			// same reason it is swept at the top of the loop: a reaction ready
+			// at the same instant as the timer is one the agent can have now.
+			b.drainStream(stream, reactions)
+
 			msgs, err := b.drainCatchUp(ctx)
 			if err != nil {
 				return WaitResult{}, err
@@ -550,9 +554,20 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 // third connection while the replacement was still consuming events, and the
 // owner's messages would arrive on a socket nobody reads.
 func (b *Bridge) noteStreamClosed(stream Stream) {
+	// Whatever this connection lost is still the agent's to hear about, and the
+	// stream that recorded it is going away. It is taken here rather than in
+	// any one caller because the socket closes its channels together and a call
+	// can notice any of them first: this is the one place every disconnect
+	// passes through. It is taken even when the stream has already been
+	// replaced — the loss happened either way.
+	dropped := streamDroppedReactions(stream)
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if dropped {
+		b.reactionsDropped = true
+	}
 	if b.stream == stream {
 		b.connected = false
 	}

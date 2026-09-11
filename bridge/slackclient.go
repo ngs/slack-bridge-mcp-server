@@ -471,6 +471,10 @@ func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
 func (s *socketModeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
+	// Deferred calls run in reverse, so this closes reactions, then
+	// interactions, then events. The events channel is the one the bridge
+	// reports a disconnection from, and closing it last means the other two
+	// are already closed and drained by the time anybody acts on it.
 	defer close(s.events)
 	defer close(s.interactions)
 	defer close(s.reactions)
