@@ -267,11 +267,12 @@ dropped.
 
 | Tool | Arguments | Behaviour |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}, …], "timed_out": false}`, oldest first, across every conversation. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message or reaction is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}, …], "timed_out": false}`, oldest first, across every conversation, plus `reactions` when emoji arrived: `[{"ts", "channel", "user", "user_name", "reaction", "added", "event_ts"}, …]`, from any user. Either kind on its own ends the wait. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `chat.postMessage`, to the home channel unless `channel` names another. Returns `{"ts", "channel"}`. |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`, or `{"choice_index": -1, "interrupted": true}` when a message ends the question instead of a click. Every settled outcome also carries `messages`, the backlog that built up while the question was on the channel. The message is rewritten without its buttons in every case. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive, as Slack treats them), `thread_ts`, `channel` (all optional) | `conversations.history`, or `conversations.replies` when `thread_ts` is given. Returns every author, oldest first, with names resolved through `users.info`, keeping the newest `limit` of the window in both modes. Read-only: no cursor movement, no reactions, no indicator. |
+| `slack_reactions` | `ts` (required), `channel` (optional) | `reactions.get` on that message, returning `{"reactions": [{"name", "count", "users": [{"id", "user_name"}, …]}, …]}`. Read-only, and the only way to see reactions sent while the session was down. |
 | `slack_progress` | `text` (required), `thread_ts`, `channel` (optional) | Sets the status label on the processing indicator and returns `{"ok", "ts"?}`. Posts the indicator immediately rather than sitting out the grace period, starts one when none is running, and moves a running one when the call names a different conversation. `ts` names the indicator's message once it has one, and is left out until then. Connects only when it has to start an indicator; with the indicator turned off it answers `{"ok": false}` without touching Slack. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}`. Never connects. |
 
@@ -336,7 +337,38 @@ Being read-only is what keeps the two apart. The tool cannot move the cursor,
 consume a pending message, react, or touch the indicator, so no amount of
 reading changes what the relay will deliver next.
 
-### Clicks travel apart from messages
+### Reactions are relayed, and from everybody
+
+Emoji are the cheapest thing a person can say, which makes them the natural way
+to answer a post that asks a channel to decide something. `slack_wait`
+therefore delivers `reaction_added` and `reaction_removed` alongside messages,
+in a `reactions` array of its own; either one on its own ends a wait.
+
+Two rules differ from the owner filter of decision 5, deliberately:
+
+- **Anybody's reaction counts.** An approval is other people answering, so
+  relaying only the owner's emoji would leave the feature with nothing to
+  report. The one exception is the bridge's own: the automatic 👀 receipt goes
+  on every delivered message, and relaying it would answer each message with an
+  event about itself.
+- **The channel decides, not the thread.** A reaction event carries the reacted
+  message's `ts` and its channel, and nothing else — whether that message sits
+  inside an open conversation cannot be known without another API call on the
+  socket's path. So the home channel is relayed, and so is any channel with a
+  conversation open in it; everywhere else is dropped. It errs towards
+  delivering within a channel the owner has already brought the agent into, and
+  never outside one.
+
+A reaction is not a message and is not treated as one. It gets no receipt
+reaction, it does not start the processing indicator, and it moves no cursor.
+
+Reactions are also the one thing the bridge cannot catch up on. They are not in
+`conversations.history` and there is no cursor for them, so a reaction added
+while the session was down reaches nobody. That is why `slack_reactions` exists:
+`reactions.get` reports the standing tally, which is what an agent counting
+answers actually needs after a restart.
+
+### Reactions and clicks travel apart from messages
 
 A message that cannot be queued live is not lost: the overflow becomes a
 reconnect-shaped event and the bridge re-reads the window from
@@ -348,6 +380,64 @@ ignored it.
 Clicks therefore have a queue of their own, small and read by both the wait and
 the ask loops. A backlog of messages, which is the one situation where the
 event queue fills, cannot take the space a click needs.
+
+Reactions are in the same position and get the same treatment: no history call
+returns one, so a vote that could not be queued is a vote nobody ever counts.
+Their queue is larger, because a decision post collects a burst rather than a
+single answer, and an overflow is logged pointing at `slack_reactions` — the
+one recovery a dropped reaction has, and the reason its loss is recoverable
+where a click's is not.
+
+A reaction that still does not fit is reported rather than swallowed:
+`slack_wait` answers `reactions_dropped: true`, once, on the first result after
+the loss — on a timeout as well as on a delivery, since a wait with nothing else
+to hand over is exactly when it would go unmentioned. A silently wrong count is
+worse than a count the agent knows to go and check, and `slack_reactions` is how
+it checks. The marker outlives the connection the loss happened on, because the
+stream it was recorded on does not.
+
+The bridge also remembers the reactions it has queued, because Slack redelivers
+any envelope it is not acknowledged for and an acknowledgement can fail: a
+message survives that through the history merge, and a reaction, having no
+history, would be counted twice. The window is on the bridge rather than on the
+stream because a reconnect replaces the stream, and the redelivery can arrive on
+the replacement.
+
+### A reaction is judged when it is handed over
+
+Which conversations are open changes while the session runs, so a reaction is
+classified at delivery rather than on arrival: queued as it comes, and judged
+against the scope as it stands when the batch goes out.
+
+The alternative — judging on arrival — loses votes to timing that has nothing to
+do with the vote. The mention that brings the agent into a channel may still be
+on the socket behind the reaction, may have been taken by a concurrent
+`slack_ask`, or may not be on the socket at all: a mention sent while the
+session was down is recovered from history by catch-up, which runs inside the
+same call that delivers. Judging on arrival drops the reaction in all three
+cases, for a conversation that was open by the time anybody looked.
+
+So the rule is the one that can be stated without reference to ordering: a
+reaction is delivered when the message it is on belongs to a conversation the
+session is in at the moment the batch is handed over. Draining messages before
+reactions is kept anyway, since a batch that carries both should carry them
+whole, but nothing depends on it any more.
+
+One instant is still too small for that rule to catch on its own. Two calls read
+the same stream, and receiving a mention and absorbing it are not one step: for
+as long as it takes the receiving call to reach `absorb`, the thread that
+mention opens does not exist yet, and another call judging a reaction against
+the scope right then would find nothing. So a reaction that matches nothing is
+held for a couple of seconds rather than dropped where it lands, and judged
+again on the next drain. The window being covered is sub-millisecond; the hold
+is generous because the cost of holding is one entry in a bounded list, and the
+cost of not holding is a vote.
+
+Both channels are optional halves of the `Stream` interface, reached by type
+assertion. `Stream`, `API` and `Connector` are exported, so requiring a new
+method on them would break anything outside this repository that implements
+one; an implementation without the reaction half simply delivers no reactions,
+and `slack_reactions` says so rather than failing obscurely.
 
 ### Whoever is blocked hears about the message
 
@@ -554,3 +644,6 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
   button click.
 - **Editing and deletion.** `message_changed` and `message_deleted` are ignored;
   an edited message is not re-delivered.
+- **Catch-up for reactions.** Live only: an emoji added or removed while the
+  session was down is delivered to nobody, and `slack_reactions` is how the
+  tally is recovered.

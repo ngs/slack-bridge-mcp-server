@@ -74,7 +74,8 @@ brew install ngs/tap/slack-bridge-mcp-server   # or: go install go.ngs.io/slack-
 
 Create a Slack app with Socket Mode and interactivity on, an app-level token
 with `connections:write`, the bot scopes `chat:write`, `groups:history`,
-`reactions:write` and `users:read`, and the `message.groups` bot event. Install
+`reactions:write`, `reactions:read` and `users:read`, and the `message.groups`
+and `reaction_added` / `reaction_removed` bot events. Install
 it, invite it to a private channel, and set the four variables below.
 
 ## Configuration
@@ -166,19 +167,20 @@ the failure is logged once. Losing it must not cost you a message.
 
 `slack_status` answers `"connected": false` until the first tool call that
 needs Slack — `slack_wait`, `slack_post`, `slack_ack`, `slack_ask`,
-`slack_history`, or `slack_progress` when it has to start an indicator,
-whichever comes first — which is the lazy connect working as
+`slack_history`, `slack_reactions`, or `slack_progress` when it has to start an
+indicator, whichever comes first — which is the lazy connect working as
 intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest of the first run.
 
 ## Tools
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel", "files"?}…], "timed_out": false}`, oldest first. On timeout, `{"messages": [], "timed_out": true}`. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel", "files"?}…], "timed_out": false}`, oldest first, plus `reactions` when any emoji arrived: `[{"ts", "channel", "user", "user_name", "reaction", "added", "event_ts"}…]`, plus `reactions_dropped: true` when some were lost. On timeout, `{"messages": [], "timed_out": true}`. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `{"ts", "channel"}` — where the message landed |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. When a message ends the question instead of a click, `{"choice_index": -1, "interrupted": true}`. Every settled outcome also carries `messages`: whatever the owner said while the question was up, delivered as `slack_wait` would have. |
 | `slack_history` | `limit` (optional, default 50, clamped to 1–200), `oldest`, `latest` (exclusive bounds), `thread_ts`, `channel` (all optional) | `{"messages": [{"ts", "user"?, "user_name", "text", "thread_ts"?, "bot", "reply_count"?, "files"?}…], "has_more"}`, oldest first, every author. A limit keeps the newest end of the window. |
+| `slack_reactions` | `ts` (required), `channel` (optional) | `{"reactions": [{"name", "count", "users": [{"id", "user_name"}…]}…]}` — the emoji on that message right now |
 | `slack_progress` | `text` (required), `thread_ts` and `channel` (optional — where the status belongs; they start the indicator, or move a running one) | `{"ok": true, "ts"}` — the indicator message the label went on. `ts` is left out while the indicator has yet to post, and `ok` is false when the label had nowhere to go: the indicator is turned off, or the turn ended before it could be applied. |
 | `slack_status` | — | `{connected, channel, owner, last_ts, pending_backlog_count, config_error?, state_file}` |
 
@@ -328,6 +330,51 @@ picks a different emoji (bare name, no colons). `slack_ack` stays for the
 deliberate signals — done, rejected, picked up by hand — with whatever emoji
 the moment calls for.
 
+### Reactions come back too
+
+Emoji are how a channel answers without typing, so `slack_wait` delivers them
+as well as messages, in a `reactions` array beside them:
+
+```json
+{"reactions": [{"ts": "1726000000.000100", "channel": "C0BRIDGE",
+                "user": "U0COLLEAGUE", "user_name": "Sam Okada",
+                "reaction": "white_check_mark", "added": true,
+                "event_ts": "1726000042.000200"}]}
+```
+
+Post the options, ask people to react, and the votes arrive as they are cast.
+`added` is false when somebody takes their emoji off again. Either a message or
+a reaction ends a wait, and a wait that has both hands over both.
+
+**Reactions come from everybody**, not only you. That is the point of them: an
+approval is the other parties answering, and a relay that reported only your own
+emoji would have nothing to say. It is also the one place somebody else's
+activity reaches the session, so the scope is kept to where you have already
+brought the agent — your home channel, and any channel with a conversation open
+in it. Emoji anywhere else are ignored, as are the bridge's own 👀 receipts. A
+reaction never starts the indicator and is never acknowledged with a receipt of
+its own.
+
+**Reactions are live only.** They are in no history and have no cursor, so one
+added while the session was down is delivered to nobody — unlike a message,
+which catch-up recovers. The same is true of a burst too large for the queue,
+and that case says so: `reactions_dropped: true` on a result means some emoji
+were received and lost, and any count kept from the stream alone is now wrong.
+
+When the standing count is what matters, ask for it:
+
+```json
+{"reactions": [{"name": "white_check_mark", "count": 2,
+                "users": [{"id": "U0COLLEAGUE", "user_name": "Sam Okada"},
+                          {"id": "U0OWNER", "user_name": "you"}]}]}
+```
+
+That is `slack_reactions`, which reads `reactions.get` for one message and
+changes nothing. It needs the `reactions:read` scope and the two reaction events
+in the app manifest; an app installed from an older manifest has neither, and
+reinstalling from [docs/slack-app-manifest.yaml](docs/slack-app-manifest.yaml)
+is what turns the feature on.
+
 ## Asking the owner a question
 
 `slack_ask` is the bridge's version of stopping to ask. The agent posts a
@@ -459,15 +506,30 @@ do not stop:
    the reply in the conversation it answers rather than in my home channel.
    Receipt is already marked for you, so reach for slack_ack only to say
    something an emoji says well — done, rejected, picked up by hand.
-4. If you need a decision from me before you can go on, call slack_ask with the
+4. If it returns reactions, they are emoji people put on messages — from
+   anybody, not only me. Ignore them unless you are collecting answers on a
+   post of your own; then match them by ts and count, remembering that
+   added: false is somebody taking their answer back.
+5. If you need a decision from me before you can go on, call slack_ask with the
    question and the answers to choose from, in the same channel and thread, and
    act on what I tap. If it comes back interrupted, I answered with a message
    instead of a button: drop the question and act on the messages it returned,
-   the same way you would treat slack_wait's.
-5. If something is going to take a while — CI, a release, a long build — call
+   the same way you would treat slack_wait's. When the decision needs other
+   people instead, post it and say which emoji means what — their reactions
+   come back to you in step 4.
+6. If something is going to take a while — CI, a release, a long build — call
    slack_progress once with what you are waiting on, so I can see it from the
    channel.
-6. Go back to step 1.
+7. Go back to step 1.
+
+Reactions are live only: nothing replays the ones sent while you were down. On
+your first slack_wait, and after any wait that failed with the connection
+closing, take that wait's reactions first — a disconnect keeps whatever had
+already arrived — and only then call slack_reactions with the ts of anything you
+are still collecting on. What it reports is the count as it stands, including
+everything you just took, so make it your new baseline and apply later
+reactions to it. Rebuilding first and then applying that batch counts the same
+emoji twice.
 
 Keep replies short — I am reading them on a phone.
 ```
@@ -481,14 +543,16 @@ For a session you start this way often, the loop is better kept as a Claude
 Code skill than pasted in each time.
 [examples/attend/SKILL.md](examples/attend/SKILL.md) is a generic one: the same
 loop, plus when to reach for each of the other tools and how to treat what
-comes back. Copy it to `.claude/skills/attend/SKILL.md` in a project, or to
-`~/.claude/skills/attend/SKILL.md` for every project, and start the session
-with `/attend`.
+comes back — including a worked example of collecting approvals on a decision
+post from the `reactions` array, and reading the tally back with
+`slack_reactions` after a gap. Copy it to `.claude/skills/attend/SKILL.md` in a
+project, or to `~/.claude/skills/attend/SKILL.md` for every project, and start
+the session with `/attend`.
 
 ## Manual smoke test
 
 With the binary built, this drives the MCP handshake by hand and should list
-the seven tools. It needs no Slack credentials: listing the tools calls none of
+the eight tools. It needs no Slack credentials: listing the tools calls none of
 them, and it is the calls that connect.
 
 ```sh

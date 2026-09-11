@@ -18,6 +18,15 @@ import (
 // and the bridge recovers the messages from conversations.history.
 const liveEventBuffer = 64
 
+// liveReactionBuffer is the emoji queue. Reactions get their own, away from the
+// messages, because a message that does not fit is recovered from
+// conversations.history and a reaction is in no history: a backlog of messages
+// must not be able to swallow a vote. It is larger than the click queue because
+// a decision post can collect a burst of them, and an overflow here is a
+// reaction the agent never sees — recoverable with slack_reactions, but only if
+// it thinks to ask.
+const liveReactionBuffer = 256
+
 // liveInteractionBuffer is the click queue. It is small because clicks are
 // rare — at most one question is outstanding at a time — and separate because
 // a click that does not fit is simply lost: unlike a message, there is no
@@ -54,7 +63,9 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 	stream := &socketModeStream{
 		events:       make(chan StreamEvent, liveEventBuffer),
 		interactions: make(chan Interaction, liveInteractionBuffer),
+		reactions:    make(chan Reaction, liveReactionBuffer),
 		owner:        cfg.Owner,
+		botUserID:    auth.UserID,
 	}
 
 	go stream.consume(ctx, client)
@@ -345,6 +356,26 @@ func (w *webAPI) updateBlocks(ctx context.Context, channel, ts, text string, blo
 	return nil
 }
 
+// MessageReactions reads the emoji on one message. Full is asked for so the
+// answer names everybody who reacted rather than the first few: the point of
+// the call is counting who has answered.
+func (w *webAPI) MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error) {
+	item, err := w.client.GetReactionsContext(ctx, slack.NewRefToMessage(channel, ts), slack.GetReactionsParameters{Full: true})
+	if err != nil {
+		return nil, apiError("reactions.get", err)
+	}
+
+	out := make([]ReactionSummary, 0, len(item.Reactions))
+	for _, r := range item.Reactions {
+		users := make([]ReactionUser, 0, len(r.Users))
+		for _, id := range r.Users {
+			users = append(users, ReactionUser{ID: id})
+		}
+		out = append(out, ReactionSummary{Name: r.Name, Count: r.Count, Users: users})
+	}
+	return out, nil
+}
+
 func (w *webAPI) Update(ctx context.Context, channel, ts, text string) error {
 	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts, slack.MsgOptionText(text, false)); err != nil {
 		return fmt.Errorf("chat.update: %w", err)
@@ -408,7 +439,19 @@ var permanentThreadErrors = map[string]bool{
 type socketModeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
+	reactions    chan Reaction
 	owner        string
+	// reactionsDropped records that a reaction did not fit in the queue. It is
+	// sticky and read by the wait, which passes it to the agent: a lost vote
+	// that nobody is told about is a count quietly wrong, where one that is
+	// reported is a slack_reactions call away from being right.
+	reactionsDropped atomic.Bool
+	// botUserID is this app's own user ID, learned when the connection opened.
+	// It is here, rather than only on the bridge, so the receipt reactions the
+	// bridge itself adds are discarded before they take space in the queue: a
+	// catch-up can auto-ack hundreds of messages at once, and a colleague's
+	// vote arriving behind that backlog would be the one that did not fit.
+	botUserID string
 	// dropped is set when an event could not be queued. It is sticky rather
 	// than an event of its own because the queue being full is exactly when
 	// a StreamDropped event would not fit either; the flag is converted into
@@ -420,9 +463,21 @@ func (s *socketModeStream) Events() <-chan StreamEvent { return s.events }
 
 func (s *socketModeStream) Interactions() <-chan Interaction { return s.interactions }
 
+func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
+
+// ReactionsDropped reports whether any reaction was lost since the last time it
+// was asked, and clears the record. It is a question the wait asks on its way
+// to handing a batch over.
+func (s *socketModeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
+
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
+	// Deferred calls run in reverse, so this closes reactions, then
+	// interactions, then events. The events channel is the one the bridge
+	// reports a disconnection from, and closing it last means the other two
+	// are already closed and drained by the time anybody acts on it.
 	defer close(s.events)
 	defer close(s.interactions)
+	defer close(s.reactions)
 
 	ack := func(req socketmode.Request) { _ = client.Ack(req) }
 
@@ -474,6 +529,16 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 		// discards, so unrelated channel traffic is not redelivered.
 		if evt.Request != nil {
 			ack(*evt.Request)
+		}
+
+		if reaction, ok := toReaction(api.InnerEvent.Data); ok {
+			// The bridge's own receipts are its own echo, and dropping them
+			// here keeps them out of the queue entirely rather than only out
+			// of the delivery.
+			if reaction.User == "" || reaction.User != s.botUserID {
+				s.emitReaction(reaction)
+			}
+			return
 		}
 
 		c, ok := toEventCandidate(api.InnerEvent.Data)
@@ -581,6 +646,47 @@ func toEventCandidate(data any) (candidate, bool) {
 	}
 }
 
+// toReaction normalises the two reaction events into the bridge's own shape.
+//
+// No filtering happens here, for the same reason none happens for messages:
+// which channels have a conversation open in them changes while the session
+// runs, and the socket has no business knowing. It reports what Slack said and
+// lets the bridge decide whether it is wanted.
+//
+// Only reactions on messages are translated. Slack puts emoji on files and
+// file comments too, and those carry no channel and no message to answer, so
+// there is nothing for an agent to do with one.
+func toReaction(data any) (Reaction, bool) {
+	switch evt := data.(type) {
+	case *slackevents.ReactionAddedEvent:
+		return reactionFromItem(evt.User, evt.Reaction, evt.EventTimestamp, evt.Item, true)
+	case *slackevents.ReactionRemovedEvent:
+		return reactionFromItem(evt.User, evt.Reaction, evt.EventTimestamp, evt.Item, false)
+	default:
+		return Reaction{}, false
+	}
+}
+
+func reactionFromItem(user, emoji, eventTS string, item slackevents.Item, added bool) (Reaction, bool) {
+	// All three matter. The type is what says this is a message rather than a
+	// file or a file comment; the timestamp and the channel together are what
+	// make it addressable, since a timestamp identifies a message only within
+	// its channel. An item missing either is not something the agent can answer —
+	// and one missing only the channel would be taken for the home channel,
+	// which is a reaction reported in the wrong place.
+	if item.Type != "message" || item.Timestamp == "" || item.Channel == "" {
+		return Reaction{}, false
+	}
+	return Reaction{
+		TS:       item.Timestamp,
+		Channel:  item.Channel,
+		User:     user,
+		Reaction: emoji,
+		Added:    added,
+		EventTS:  eventTS,
+	}, true
+}
+
 // filesFromEnvelope recovers a message's attachments from the raw Socket Mode
 // envelope.
 //
@@ -617,6 +723,24 @@ func (s *socketModeStream) emitInteraction(in Interaction) {
 	case s.interactions <- in:
 	default:
 		log.Printf("dropped a button click because nothing was reading them; the question it answered will time out")
+	}
+}
+
+// emitReaction queues an emoji on its own channel. Like a click it has no
+// history to be recovered from, so an overflow is logged plainly — and unlike a
+// click it can still be recovered deliberately, by asking reactions.get for the
+// tally, which is what the message says to do.
+func (s *socketModeStream) emitReaction(r Reaction) {
+	select {
+	case s.reactions <- r:
+	default:
+		// Once per outstanding marker, not once per lost reaction: the queue
+		// fills under a burst, and a line of synchronous stderr for every event
+		// in it would slow the socket down at exactly the wrong moment. Swap
+		// reports whether this is the first loss since the agent was last told.
+		if !s.reactionsDropped.Swap(true) {
+			log.Printf("dropped a reaction because nothing was reading them; read the tally with slack_reactions if you are counting")
+		}
 	}
 }
 

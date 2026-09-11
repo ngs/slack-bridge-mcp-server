@@ -50,6 +50,7 @@ at [Generate the two tokens](#generate-the-two-tokens).
    | `channels:history` | The same in public channels. Needed if your home channel is public, and for any public channel you add the app to |
    | `channels:read`, `groups:read` | `users.conversations`, which is how the search for [mentions](../README.md#talking-to-the-agent-in-other-channels) sent while you were away knows which channels to look in |
    | `reactions:write` | `reactions.add`, for the automatic 👀 receipt and for `slack_ack` |
+   | `reactions:read` | `reactions.get` for [`slack_reactions`](../README.md#reactions-come-back-too), and required by the `reaction_added` / `reaction_removed` subscriptions below |
    | `users:read` | `users.info`, which turns user IDs into names in [`slack_history`](../README.md#reading-the-channel) results. Optional: without it the tool falls back to raw IDs |
    | `app_mentions:read` | Required by the `app_mention` event subscription — Slack rejects a manifest, and the event subscription screen refuses the event, without it |
    | `files:read` | Downloading an [attachment](../README.md#attachments) from its `url_private`. Optional, and only for the download: Slack reports a message's files either way, so uploads are delivered with their names, sizes and links whether or not you add it — without it, fetching the file itself gets a login page instead |
@@ -58,9 +59,11 @@ at [Generate the two tokens](#generate-the-two-tokens).
    channel it is not bound to.
 3. **Event Subscriptions** → turn it **on** and subscribe to the bot events
    `message.groups` and `message.channels` — the live half, for the home
-   channel — and `app_mention`, which is how the app hears the mention that
-   opens a conversation in any other channel. History covers what the socket
-   misses.
+   channel — `app_mention`, which is how the app hears the mention that
+   opens a conversation in any other channel, and `reaction_added` /
+   `reaction_removed`, which carry the emoji people put on your posts. History
+   covers what the socket misses for messages; reactions have no history, so
+   ones sent while you are away are read back with `slack_reactions` instead.
 4. **Interactivity & Shortcuts** → turn it **on**. Leave the request URL empty:
    with Socket Mode the button clicks come down the same WebSocket as the
    messages, and Slack does not ask for a URL. This is what
@@ -203,8 +206,9 @@ via direnv or your shell profile.
 Restart the CLI and ask it to call `slack_status`. On a fresh session it
 answers `"connected": false`, and **that is the expected answer**: the server
 does not open a socket until the first tool call that actually needs Slack —
-`slack_wait`, `slack_post`, `slack_ack`, `slack_ask`, `slack_history`, or
-`slack_progress` when it has to start an indicator, whichever you reach first — so that it can sit in every project's `.mcp.json`
+`slack_wait`, `slack_post`, `slack_ack`, `slack_ask`, `slack_history`,
+`slack_reactions`, or `slack_progress` when it has to start an indicator,
+whichever you reach first — so that it can sit in every project's `.mcp.json`
 without connecting in
 sessions that never use it. `slack_status` itself never connects, which is what
 makes it useful when something is misconfigured. What matters at this point is

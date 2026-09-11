@@ -87,6 +87,25 @@ type Bridge struct {
 	// does not apply to them: every thread has its own, and one queue would let
 	// a reply older than the home cursor be discarded as already seen.
 	pendingThreads []Message
+	// pendingReactions holds the emoji events read from the stream but not yet
+	// handed over. They are a queue of their own because they are not
+	// messages: no cursor applies to them, they are never merged with history,
+	// and a reaction older than the home cursor is still news.
+	pendingReactions []Reaction
+	// deferredReactions are reactions that matched no open conversation when
+	// they were judged, held briefly in case the mention that opens one is a
+	// moment behind them. See drainReactions.
+	deferredReactions []heldReaction
+	// seenReactions and seenReactionOrder are the window of reactions already
+	// queued, against Slack redelivering an envelope it was not acknowledged
+	// for. They live here rather than on the stream because a reconnect
+	// replaces the stream, and the redelivery can arrive on the replacement.
+	seenReactions     map[string]struct{}
+	seenReactionOrder []string
+	// reactionsDropped records a loss the agent has not been told about yet. A
+	// stream carries its own marker only as long as it lives, so a loss on a
+	// connection that then died would otherwise go unreported.
+	reactionsDropped bool
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -345,16 +364,29 @@ func (b *Bridge) ensure() error {
 // WaitResult is what slack_wait returns.
 type WaitResult struct {
 	Messages []Message `json:"messages"`
-	TimedOut bool      `json:"timed_out"`
+	// Reactions are the emoji put on or taken off messages the session can
+	// see, since the last delivery. The field is absent when there are none,
+	// so a caller that only knows about messages reads the same result it
+	// always did.
+	Reactions []Reaction `json:"reactions,omitempty"`
+	// ReactionsDropped reports that at least one reaction was received and
+	// could not be queued, so the emoji delivered here are not the whole story.
+	// There is no way to recover which: read the tally of anything you are
+	// counting with slack_reactions. Absent means nothing was lost.
+	ReactionsDropped bool `json:"reactions_dropped,omitempty"`
+	TimedOut         bool `json:"timed_out"`
 }
 
-// Wait blocks until at least one owner message is available or the timeout
-// expires.
+// Wait blocks until at least one owner message or one reaction is available, or
+// the timeout expires. Either kind on its own ends it, and a wait that has both
+// hands over both.
 //
 // The first call connects and runs catch-up, so a backlog that accumulated
 // while the session was down comes back immediately as an array rather than
 // trickling in. After that it waits on the live stream, running catch-up again
-// on every reconnect.
+// on every reconnect. Catch-up is for messages: reactions live only on the
+// connection, and the ones missed while it was down are read back with
+// Reactions instead.
 func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, error) {
 	// Before anything that can fail: the point of the presence file is that
 	// somebody is listening, and a wait that ends in an error was still a wait
@@ -374,6 +406,11 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	stream := b.stream
 	b.mu.Unlock()
 
+	// Reactions arrive on a channel of their own, so a backlog of messages
+	// cannot fill the queue a vote lands in. A stream that predates them has
+	// none, and a nil channel simply never fires.
+	reactions := reactionsOf(stream)
+
 	// Subscribed before the first drain, so a message absorbed by another call
 	// between the drain and the select is a wakeup rather than a message this
 	// call blocks straight through.
@@ -384,14 +421,25 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	defer deadline.Stop()
 
 	for {
+		// Sweep what is already on the wire before deciding what this batch
+		// contains. Messages and reactions arrive on channels of their own, and
+		// without this a message ready at the same instant as a reaction would
+		// go back alone — leaving the agent counting a vote it had already been
+		// sent, one call later.
+		b.drainStream(stream, reactions)
+
 		// Catch-up first: a pending backlog outranks waiting for something
 		// new, and on a reconnect it is the only place missed messages are.
 		msgs, err := b.drainCatchUp(ctx)
 		if err != nil {
 			return WaitResult{}, err
 		}
-		if len(msgs) > 0 {
-			return b.deliver(msgs), nil
+		// Again, because catch-up goes to Slack and back: emoji that arrived
+		// while it was fetching history belong in the batch it produced.
+		b.drainStream(stream, reactions)
+		drained := b.drainReactions()
+		if len(msgs) > 0 || len(drained) > 0 {
+			return b.deliver(ctx, stream, msgs, drained), nil
 		}
 
 		// A pending question owns the click channel. Reading it here as well
@@ -413,25 +461,49 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// any point during the poll, including the instant the timer fires
 			// and including from another call entirely, and reporting an empty
 			// timeout on top of one would hold it back for another full poll
-			// while the owner waits on a reply.
+			// while the owner waits on a reply. The wire is swept here for the
+			// same reason it is swept at the top of the loop: a reaction ready
+			// at the same instant as the timer is one the agent can have now.
+			b.drainStream(stream, reactions)
+
 			msgs, err := b.drainCatchUp(ctx)
 			if err != nil {
 				return WaitResult{}, err
 			}
-			if len(msgs) > 0 {
+			b.drainStream(stream, reactions)
+			drained := b.drainReactions()
+			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
 				// timed_out of true alongside messages would be read as "call
 				// again", which is the one thing that must not happen to
 				// messages already handed over.
-				return b.deliver(msgs), nil
+				return b.deliver(ctx, stream, msgs, drained), nil
 			}
-			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
+			return WaitResult{
+				Messages: []Message{},
+				// A wait with nothing to hand over still has to say a
+				// reaction was lost: that is precisely when the agent's count
+				// is wrong and nothing else would tell it.
+				ReactionsDropped: b.takeReactionsDropped(stream),
+				TimedOut:         true,
+			}, nil
 
 		case <-sub:
 			// Something reached the queue. Round the loop to drain it.
 
+		case r, ok := <-reactions:
+			if !ok {
+				// The socket is gone. The events channel closing is what
+				// reports that; this one simply stops firing, so the select
+				// does not spin on a closed channel.
+				reactions = nil
+				continue
+			}
+			b.absorbReaction(r)
+
 		case in, ok := <-clicks:
 			if !ok {
+				b.drainStream(stream, reactions)
 				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
@@ -442,6 +514,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 		case evt, ok := <-stream.Events():
 			if !ok {
+				// Whatever emoji are still buffered were received before the
+				// socket died, so they are kept for the next call rather than
+				// dying with the connection. The events channel is drained
+				// first even though it is the one that just closed: what is
+				// still in its buffer can be the mention a buffered reaction
+				// has to be judged against.
+				b.drainStream(stream, reactions)
 				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
@@ -462,10 +541,25 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 // The indicator is started where the owner is looking: the newest message is
 // the one they just sent, so its channel and thread are the conversation they
 // are waiting on.
-func (b *Bridge) deliver(msgs []Message) WaitResult {
-	b.startIndicator(newestConversation(msgs))
-	b.autoAck(msgs)
-	return WaitResult{Messages: msgs}
+func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, reactions []Reaction) WaitResult {
+	// Only messages start the clock. A reaction is not something the owner is
+	// waiting on an answer to, and marking one as received would put a receipt
+	// emoji on a message for every emoji anybody else put on it.
+	if len(msgs) > 0 {
+		b.startIndicator(newestConversation(msgs))
+		b.autoAck(msgs)
+	}
+	if msgs == nil {
+		// Never null. A reaction-only delivery has no messages, and a caller
+		// reading the bridge directly gets the empty array every other result
+		// has always carried.
+		msgs = []Message{}
+	}
+	return WaitResult{
+		Messages:         msgs,
+		Reactions:        b.nameReactions(ctx, reactions),
+		ReactionsDropped: b.takeReactionsDropped(stream),
+	}
 }
 
 // noteStreamClosed records that the live connection is gone, but only if the
@@ -477,9 +571,20 @@ func (b *Bridge) deliver(msgs []Message) WaitResult {
 // third connection while the replacement was still consuming events, and the
 // owner's messages would arrive on a socket nobody reads.
 func (b *Bridge) noteStreamClosed(stream Stream) {
+	// Whatever this connection lost is still the agent's to hear about, and the
+	// stream that recorded it is going away. It is taken here rather than in
+	// any one caller because the socket closes its channels together and a call
+	// can notice any of them first: this is the one place every disconnect
+	// passes through. It is taken even when the stream has already been
+	// replaced — the loss happened either way.
+	dropped := streamDroppedReactions(stream)
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if dropped {
+		b.reactionsDropped = true
+	}
 	if b.stream == stream {
 		b.connected = false
 	}

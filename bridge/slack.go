@@ -121,6 +121,18 @@ type API interface {
 	Delete(ctx context.Context, channel, ts string) error
 }
 
+// ReactionReader reports the emoji standing on a message, and who put them
+// there. It is the tally the live reaction events cannot give, since those
+// exist only for as long as the connection does.
+//
+// It is separate from API, and reached by type assertion, so that adding it
+// breaks nothing: API and Connector are exported, and anything outside this
+// repository that implements them keeps compiling and keeps working. What it
+// loses is slack_reactions, which says so rather than failing obscurely.
+type ReactionReader interface {
+	MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error)
+}
+
 // StreamEventKind distinguishes the things that can happen on the Socket Mode
 // connection that the bridge cares about.
 type StreamEventKind int
@@ -179,6 +191,46 @@ type Stream interface {
 	// Interactions delivers button clicks, on a separate channel because they
 	// cannot be recovered from history if they are dropped.
 	Interactions() <-chan Interaction
+}
+
+// ReactionStream is the optional half of Stream that delivers emoji.
+//
+// Reactions travel on a channel of their own for the reason clicks do: a
+// message that cannot be queued is recovered from conversations.history, and a
+// reaction is in no history at all. A backlog of messages must therefore not be
+// able to fill the queue a vote arrives on. It is reached by type assertion so
+// that a Stream written before reactions existed still satisfies the interface;
+// such a stream simply delivers none.
+type ReactionStream interface {
+	// Reactions delivers emoji added to and removed from messages until the
+	// stream's context is done, at which point the channel is closed.
+	Reactions() <-chan Reaction
+	// ReactionsDropped reports whether any reaction was lost since it was last
+	// asked, and clears the record. A lost reaction is in no history, so the
+	// only honest thing to do with one is say so: the wait passes the answer
+	// on, and the agent reads the tally back with slack_reactions.
+	ReactionsDropped() bool
+}
+
+// reactionsOf returns a stream's reaction channel, or nil if it has none. A nil
+// channel blocks for ever in a select, which is exactly "this stream never
+// delivers reactions".
+func reactionsOf(stream Stream) <-chan Reaction {
+	rs, ok := stream.(ReactionStream)
+	if !ok {
+		return nil
+	}
+	return rs.Reactions()
+}
+
+// streamDroppedReactions asks a stream whether it lost any emoji since it was
+// last asked. A stream with no reaction half never loses one.
+func streamDroppedReactions(stream Stream) bool {
+	rs, ok := stream.(ReactionStream)
+	if !ok {
+		return false
+	}
+	return rs.ReactionsDropped()
 }
 
 // Connector opens both halves of the Slack connection. Connect is called

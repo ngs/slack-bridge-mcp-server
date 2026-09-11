@@ -287,6 +287,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 		case in, ok := <-stream.Interactions():
 			if !ok {
+				b.drainStream(stream, reactionsOf(stream))
 				b.noteStreamClosed(stream)
 				// The click channel closes with the socket, and a closed
 				// channel is permanently ready — so this has to be handled
@@ -298,6 +299,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 		case evt, ok := <-stream.Events():
 			if !ok {
+				b.drainStream(stream, reactionsOf(stream))
 				b.noteStreamClosed(stream)
 				// The socket is gone, so no click can reach this call any
 				// more. The buttons have to go with it.

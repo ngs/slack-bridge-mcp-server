@@ -6,6 +6,7 @@ func newTestStream(size int) *socketModeStream {
 	return &socketModeStream{
 		events:       make(chan StreamEvent, size),
 		interactions: make(chan Interaction, size),
+		reactions:    make(chan Reaction, size),
 		owner:        testOwner,
 	}
 }

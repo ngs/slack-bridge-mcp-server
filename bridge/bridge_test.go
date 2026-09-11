@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -44,14 +45,19 @@ type fakeAPI struct {
 	nameLookups int
 	// nameDelay makes each users.info call take time, so a test can tell
 	// parallel resolution from serial.
-	nameDelay   time.Duration
-	posts       []postCall
-	questions   []questionCall
-	reactions   []reactionCall
-	updates     []updateCall
-	resolutions []updateCall
-	deletes     []deleteCall
-	postTS      string
+	nameDelay time.Duration
+	posts     []postCall
+	questions []questionCall
+	reactions []reactionCall
+	// messageReactions is what reactions.get reports, and reactionReads
+	// records who asked for it.
+	messageReactions    []ReactionSummary
+	messageReactionsErr error
+	reactionReads       []reactionCall
+	updates             []updateCall
+	resolutions         []updateCall
+	deletes             []deleteCall
+	postTS              string
 	// postCount is how many messages the fake has handed a timestamp to, which
 	// is what makes each one distinct.
 	postCount  int
@@ -317,6 +323,17 @@ func (f *fakeAPI) React(_ context.Context, channel, ts, emoji string) error {
 	return f.reactErr
 }
 
+func (f *fakeAPI) MessageReactions(_ context.Context, channel, ts string) ([]ReactionSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.reactionReads = append(f.reactionReads, reactionCall{Channel: channel, TS: ts})
+	if f.messageReactionsErr != nil {
+		return nil, f.messageReactionsErr
+	}
+	return append([]ReactionSummary(nil), f.messageReactions...), nil
+}
+
 func (f *fakeAPI) Update(_ context.Context, channel, ts, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -349,18 +366,26 @@ func (f *fakeAPI) calls() []HistoryRequest {
 type fakeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
+	reactions    chan Reaction
+	// reactionsDropped stands in for a queue that overflowed.
+	reactionsDropped atomic.Bool
 }
 
 func newFakeStream() *fakeStream {
 	return &fakeStream{
 		events:       make(chan StreamEvent, 16),
 		interactions: make(chan Interaction, 16),
+		reactions:    make(chan Reaction, 16),
 	}
 }
 
 func (s *fakeStream) Events() <-chan StreamEvent { return s.events }
 
 func (s *fakeStream) Interactions() <-chan Interaction { return s.interactions }
+
+func (s *fakeStream) Reactions() <-chan Reaction { return s.reactions }
+
+func (s *fakeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
 // fakeConnector hands out a fixed API and stream, and records how often it was
 // asked to connect.
