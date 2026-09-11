@@ -306,13 +306,19 @@ func (b *Bridge) drainReactions() []Reaction {
 	now := time.Now()
 	kept := make([]Reaction, 0, len(held)+len(queued))
 	for _, h := range held {
+		// Expiry first. A hold covers the instant between a mention being
+		// received and the thread it opens being registered, and nothing
+		// longer: a reaction whose hold ran out while no drain happened is
+		// let go, rather than revived by a conversation that opened minutes
+		// later.
+		if !now.Before(h.expires) {
+			continue
+		}
 		if reaction, ok := b.classifyReactionLocked(h.reaction); ok {
 			kept = append(kept, reaction)
 			continue
 		}
-		if now.Before(h.expires) {
-			b.deferredReactions = append(b.deferredReactions, h)
-		}
+		b.deferredReactions = append(b.deferredReactions, h)
 	}
 	for _, r := range queued {
 		if reaction, ok := b.classifyReactionLocked(r); ok {

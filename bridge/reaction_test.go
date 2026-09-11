@@ -881,3 +881,93 @@ func TestAnUnheldableReactionIsReportedAsDropped(t *testing.T) {
 		t.Error("a reaction was discarded for want of room with nothing said; the agent would never know to re-read the tally")
 	}
 }
+
+// A hold covers one instant, not an open-ended wait for a conversation that
+// might turn up. One that has run out is let go even if the channel opens
+// later, or the grace period would be bypassed by a slow mention.
+func TestAnExpiredHoldIsNotRevivedByALaterMention(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
+	b.drainStreamReactions(stream.reactions)
+	if kept := b.drainReactions(); len(kept) != 0 {
+		t.Fatalf("drainReactions() = %+v, want nothing while no conversation is open", kept)
+	}
+	b.expireHeldReactions()
+
+	// The conversation opens, but too late for that reaction.
+	send(stream, otherChannel, "200.000100", "", mention("ship it?"))
+	result := waitOnce(ctx, t, b)
+	if len(result.Messages) != 1 {
+		t.Fatalf("Wait() returned %v, want the mention", texts(result.Messages))
+	}
+	if len(result.Reactions) != 0 {
+		t.Errorf("Wait() returned %+v, want the expired hold let go rather than revived", result.Reactions)
+	}
+}
+
+// A blocked wait is woken when a conversation opens, because what is in scope
+// has just changed and a held reaction may have been waiting for exactly that.
+// Without it the call sits out its whole timeout with a vote in hand.
+func TestOpeningAConversationWakesABlockedWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	// Connect and leave a reaction held, with no conversation open for it.
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
+	b.drainStreamReactions(stream.reactions)
+	b.drainReactions()
+	if b.deferredReactionCount() != 1 {
+		t.Fatal("the reaction was not held, so there is nothing for the wakeup to deliver")
+	}
+
+	woken := make(chan WaitResult, 1)
+	go func() {
+		// Long enough that only a wakeup can end it early.
+		result, err := b.Wait(ctx, 20*time.Second)
+		if err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+		woken <- result
+	}()
+
+	// The wait has to be blocked before the scope changes, or it would find the
+	// reaction in scope on its own first drain and prove nothing.
+	eventually(t, "the wait to start", func() bool { return b.activeWaitCount() > 0 })
+	time.Sleep(100 * time.Millisecond)
+
+	b.openThread(otherChannel, "200.000100")
+
+	select {
+	case result := <-woken:
+		if len(result.Reactions) != 1 {
+			t.Errorf("Wait() returned %+v, want the held reaction once its conversation opened", result.Reactions)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait was never woken; it would have sat out its whole timeout with the vote in hand")
+	}
+}
+
+// activeWaitCount reports how many calls are listening, so a test can tell that
+// a wait has started before changing what it is waiting for.
+func (b *Bridge) activeWaitCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.activeWaits
+}
+
+// openThread registers a conversation the way a mention does, for tests that
+// need the scope to change while a call is blocked.
+func (b *Bridge) openThread(channel, threadTS string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.openThreadLocked(channel, threadTS)
+}
