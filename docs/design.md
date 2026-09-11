@@ -468,11 +468,26 @@ interface.
 Every write wakes the subscribers, so a call blocked on an empty queue hears
 about what another call's connection just received.
 
-**Ordering.** The pump takes messages before reactions: when a reaction is ready
-and events are too, the ready events are applied first. That rule already
-existed, but it could not be relied upon while another goroutine might receive a
-message in the middle of it. In the pump it holds absolutely — a caller cannot
-see a reaction applied while a message that arrived before it has not been.
+**Ordering.** The pump applies a message and a reaction that are ready together
+as one step, under one lock, messages first. Both directions matter: whichever
+channel the select happens to pick, the other is already there, so a delivery
+that has both hands over both instead of splitting them across two calls on a
+coin toss. The ordering rule already existed, but it could not be relied upon
+while another goroutine might receive a message in the middle of it. In the pump
+it holds absolutely — a caller cannot see a reaction applied while a message that
+arrived before it has not been.
+
+**Backlog.** The socket's own buffer used to bound what was waiting, because
+nothing moved a message off it until a call asked. The pump moves every one, so
+the bound lives on the queue instead: past it, the in-memory backlog is dropped
+and catch-up asked for. No cursor has moved, so history returns exactly what was
+discarded — the same recovery the socket's overflow has always used.
+
+**Writes off the lock.** Registering a conversation persists it to the state
+file, and that write no longer happens under `b.mu`. It is recorded in memory
+and written once the lock is released, because the lock the pump holds is the
+one every tool call shares: a slow disk under it would stall the connection
+itself.
 
 **Bounds and backpressure.** The pump never blocks on anything slow. Applying an
 event takes the bridge lock for the length of a slice append; catch-up, which

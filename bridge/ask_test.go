@@ -32,6 +32,16 @@ func askBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fakeStrea
 	return b, api, stream
 }
 
+// waitForQuestion blocks until a question is up. It polls rather than using
+// eventually because it runs in a goroutine, and the test's own Fatalf belongs
+// to the test's goroutine; a question that never appears is caught by the test
+// timeout instead.
+func waitForQuestion(b *Bridge) {
+	for b.pendingAskTS() == "" {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // click is the interaction Slack sends when the owner taps the option at index.
 func click(user, messageTS string, index int) Interaction {
 	return Interaction{
@@ -65,7 +75,11 @@ func TestAskReturnsTheClickedOption(t *testing.T) {
 	b, api, stream := askBridge(ctx, t)
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		// Once the question exists, not merely once some time has passed: a
+		// click with no question pending is answering nothing, and the pump
+		// that owns the socket says so straight away rather than leaving it on
+		// the channel for whoever asks next.
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 
@@ -114,7 +128,7 @@ func TestAskIgnoresClicksThatAreNotTheOwnerAnsweringThisQuestion(t *testing.T) {
 	b, api, stream := askBridge(ctx, t)
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		waitForQuestion(b)
 		// Someone else in the channel, then a click on a different message —
 		// a question from an earlier session, say, whose buttons are stale.
 		stream.interactions <- click("U0INTRUDER", askTS, 0)
@@ -192,7 +206,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 
 	// Once the first question is answered the slot is free again.
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 	if _, err := b.Ask(ctx, AskRequest{Question: "And now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err != nil {
@@ -244,7 +258,7 @@ func TestAskInAThreadRestartsTheIndicatorInThatThread(t *testing.T) {
 	b, api, stream := askBridge(ctx, t)
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
@@ -435,7 +449,7 @@ func TestAskTakesAQueuedClickOverTheDeadline(t *testing.T) {
 	// Queue the click first, then give the question a deadline that has
 	// effectively already passed: both cases are ready at once.
 	go func() {
-		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 

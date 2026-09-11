@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -174,4 +175,84 @@ func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 	if kept := b.drainReactions(); len(kept) != 1 {
 		t.Fatalf("drainReactions() = %+v, want the vote: the mention ahead of it opens the conversation it is in", kept)
 	}
+}
+
+// The pump applies what the socket delivers as it arrives, which can be before
+// a question has subscribed to hear about it. A message already queued has to
+// interrupt the question anyway, or the notification it would have arrived on
+// is one nobody was listening for and the question waits out its whole timeout.
+func TestAQuestionIsInterruptedByAMessageQueuedBeforeItSubscribed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := askBridge(ctx, t)
+
+	// Connect first, so the pump is already running, and then wait for it to
+	// have taken the message. Its notification is spent by the time Ask
+	// subscribes, which is the interleaving this is about — leaving the
+	// question with nothing left to wake it.
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	stream.events <- StreamEvent{
+		Kind:    StreamMessage,
+		Message: Message{TS: "100.000200", User: testOwner, Text: "never mind, do this instead"},
+	}
+	eventually(t, "the pump to take the message", func() bool { return b.Status().PendingBacklogCount > 0 })
+
+	done := make(chan AskResult, 1)
+	go func() {
+		result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout})
+		if err != nil {
+			t.Errorf("Ask() error = %v", err)
+		}
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		if !result.Interrupted {
+			t.Errorf("Ask() interrupted = false, want the queued message to have ended the question")
+		}
+		if len(result.Messages) != 1 {
+			t.Errorf("Ask() returned %v, want the message it was interrupted by", texts(result.Messages))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ask() never returned; the message was applied before anything was listening for it")
+	}
+}
+
+// The queue the pump fills has an end. Before it, the socket's own buffer was
+// the limit, because nothing moved a message off it until a call asked; the
+// pump moves every one, so a session left working while a channel is busy would
+// otherwise grow the heap without bound.
+func TestTheMessageQueueFallsBackToHistoryWhenItFills(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	for i := 0; i <= maxPendingMessages; i++ {
+		b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: fmt.Sprintf("100.%06d", i+1000), Channel: testChannel, User: testOwner, Text: "noise",
+		}})
+	}
+
+	if got := b.Status().PendingBacklogCount; got > maxPendingMessages {
+		t.Errorf("pending backlog = %d, want it bounded at %d", got, maxPendingMessages)
+	}
+	if !b.catchUpDue() {
+		t.Error("the queue was emptied without asking for a catch-up; those messages would be lost rather than re-read")
+	}
+}
+
+// catchUpDue reports whether the next call will re-read the window from
+// history, which is how a dropped in-memory backlog is recovered.
+func (b *Bridge) catchUpDue() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.needCatchUp
 }

@@ -109,7 +109,11 @@ type Bridge struct {
 	// threadCursors is how far each of them has been read. Both are restored
 	// from the state file on connect, so a restart resumes a conversation
 	// instead of waiting to be mentioned again.
-	threads       map[threadKey]bool
+	threads map[threadKey]bool
+	// threadOpens are conversations registered in memory and not yet written to
+	// the state file. The write happens off b.mu, because the pump holds it and
+	// a slow disk under it would stall the connection.
+	threadOpens   []threadKey
 	threadCursors map[threadKey]string
 	// mentionCursor is how far through time the search for missed mentions has
 	// looked.
@@ -361,6 +365,12 @@ func (b *Bridge) ensure() error {
 	return nil
 }
 
+// maxPendingMessages bounds the messages waiting to be handed over. It is far
+// past any conversation and well into a machine writing into the channel, and
+// what it protects against is a session left working for hours while a busy
+// channel fills the heap behind it.
+const maxPendingMessages = 1024
+
 // WaitResult is what slack_wait returns.
 type WaitResult struct {
 	Messages []Message `json:"messages"`
@@ -459,6 +469,12 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				// messages already handed over.
 				return b.deliver(ctx, stream, msgs, drained), nil
 			}
+			// A connection that ended while the last history request was in
+			// flight is news, and a quiet timeout would leave it for whoever
+			// called next.
+			if b.streamGone(stream) {
+				return WaitResult{}, errors.New("the Slack connection closed")
+			}
 			return WaitResult{
 				Messages: []Message{},
 				// A wait with nothing to hand over still has to say a
@@ -540,14 +556,16 @@ func (b *Bridge) noteStreamClosed(stream Stream) {
 
 // absorb folds one stream event into the bridge's pending state.
 //
-// Both slack_wait and slack_ask read the stream, so a message goes to the same
-// place whichever of them happened to pick it up: the queue the next
-// slack_wait drains.
+// The pump is the only caller: it applies what the socket delivers, and the
+// queues it writes are what slack_wait and slack_ask read. Nothing here decides
+// who receives a message — only where it waits until somebody does.
 func (b *Bridge) absorb(evt StreamEvent) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	b.absorbLocked(evt)
+	opens := b.takeThreadOpensLocked()
+	b.mu.Unlock()
+
+	b.persistThreadOpens(opens)
 }
 
 // absorbLocked is absorb for a caller that already holds b.mu, which is how a
@@ -561,6 +579,17 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		msg, ok := b.classifyLocked(evt.Message)
 		if !ok {
 			return
+		}
+		if len(b.pending)+len(b.pendingThreads) >= maxPendingMessages {
+			// The socket's buffer used to be the limit, because nothing moved
+			// a message off it until a call asked. The pump moves every one,
+			// so the limit has to be here instead — and it is the same
+			// recovery the socket's own overflow uses: history is the
+			// authority, no cursor has moved, so what is queued can be let go
+			// and fetched again.
+			b.pending, b.pendingThreads = nil, nil
+			b.needCatchUp = true
+			log.Printf("the pending message queue is full; re-reading the window from history")
 		}
 		if msg.Channel == "" || msg.Channel == b.cfg.Channel {
 			b.pending = append(b.pending, msg)

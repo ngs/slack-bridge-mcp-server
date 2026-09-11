@@ -110,10 +110,47 @@ func (b *Bridge) openThreadLocked(channel, threadTS string) {
 	if b.store == nil {
 		return
 	}
-	if err := b.store.SetThread(channel, threadTS, ""); err != nil {
-		// The thread still works for this session; only surviving a restart is
-		// at risk, and the owner can reopen it with another mention.
-		log.Printf("could not persist an open conversation thread: %v", err)
+	// Recorded, not written. This runs under b.mu, and on the pump's path b.mu
+	// is what every tool call and the socket reader share: a slow disk here
+	// would stall the connection itself. The caller writes it once the lock is
+	// released — see persistThreadOpens.
+	b.threadOpens = append(b.threadOpens, key)
+}
+
+// takeThreadOpensLocked hands back the conversations opened since it was last
+// called, for a caller about to release b.mu and write them. The caller must
+// hold b.mu.
+func (b *Bridge) takeThreadOpensLocked() []threadKey {
+	if len(b.threadOpens) == 0 {
+		return nil
+	}
+	opens := b.threadOpens
+	b.threadOpens = nil
+	return opens
+}
+
+// persistThreadOpens writes the conversations to the state file, so a restart
+// resumes them rather than waiting to be mentioned again. It must be called
+// without b.mu held.
+//
+// A failure costs only surviving a restart: the thread works for this session
+// either way, and the owner can reopen it with another mention.
+func (b *Bridge) persistThreadOpens(opens []threadKey) {
+	if len(opens) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	store := b.store
+	b.mu.Unlock()
+	if store == nil {
+		return
+	}
+
+	for _, key := range opens {
+		if err := store.SetThread(key.channel, key.threadTS, ""); err != nil {
+			log.Printf("could not persist an open conversation thread: %v", err)
+		}
 	}
 }
 
@@ -196,7 +233,10 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 		// filter out the very message that opened the conversation.
 		starts[threadKey{m.Channel, m.ThreadTS}] = m.TS
 	}
+	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()
+
+	b.persistThreadOpens(opens)
 
 	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts)
 	if err != nil {

@@ -216,14 +216,26 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	defer deadline.Stop()
 
 	for {
+		// Both of these are checked before blocking, not only on a wakeup. The
+		// pump applies what the socket delivers as it arrives, and it can have
+		// done so — and sent its notification — while this question was still
+		// being posted, which is before there was anything subscribed to hear
+		// it.
+		//
 		// No click can reach this question once the socket is gone, so the
 		// buttons go with it rather than standing there inviting an answer
-		// nothing could carry. Checked before blocking as well as on every
-		// wakeup: the connection can have ended while the question was being
-		// posted, and the notification for that is already past.
+		// nothing could carry.
 		if b.streamGone(stream) {
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, errors.New("the Slack connection closed")
+		}
+		if !req.InterruptDisabled && b.backlogWaiting() {
+			if msgs := b.backlogWhileAsking(ctx); len(msgs) > 0 {
+				return b.interrupted(api, channel, ts, q, msgs), nil
+			}
+			// A reconnect rather than a message, or a drain that failed and
+			// left the queue where it was. Either way there is nothing to act
+			// on, so the question stands and this waits like any other.
 		}
 
 		select {
@@ -233,24 +245,9 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			}
 			msgs := b.backlogWhileAsking(ctx)
 			if len(msgs) == 0 {
-				// A reconnect rather than a message, or a drain that failed and
-				// left the queue where it was. Either way there is nothing to
-				// act on, so the question stands.
 				continue
 			}
-			// The owner answered with words instead of a button. The question is
-			// no longer the thing being answered, so its buttons go — otherwise
-			// they sit there inviting a click nobody is waiting for any more.
-			b.resolve(api, channel, ts, q.Text+"\n\n⌛ superseded")
-			// The message is the new work, so the clock restarts where the owner
-			// sent it rather than where the question was asked.
-			b.startIndicator(newestConversation(msgs))
-			return AskResult{
-				ChoiceIndex: -1,
-				Interrupted: true,
-				TS:          ts,
-				Messages:    msgs,
-			}, nil
+			return b.interrupted(api, channel, ts, q, msgs), nil
 
 		case choice := <-ask.answered:
 			b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
@@ -296,6 +293,33 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			return AskResult{}, b.ctx.Err()
 
 		}
+	}
+}
+
+// backlogWaiting reports whether there is anything for a question to be
+// interrupted by: messages the pump has queued, or a catch-up that has not run
+// and may find some.
+func (b *Bridge) backlogWaiting() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pending) > 0 || len(b.pendingThreads) > 0 || b.needCatchUp
+}
+
+// interrupted retires a question the owner answered with words instead of a
+// button, and reports what they said.
+//
+// The buttons go: leaving them up invites a click on a question that is no
+// longer the thing being answered. The clock restarts where the owner sent the
+// message rather than where the question was asked, because that message is the
+// new work.
+func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Message) AskResult {
+	b.resolve(api, channel, ts, q.Text+"\n\n⌛ superseded")
+	b.startIndicator(newestConversation(msgs))
+	return AskResult{
+		ChoiceIndex: -1,
+		Interrupted: true,
+		TS:          ts,
+		Messages:    msgs,
 	}
 }
 
@@ -362,18 +386,11 @@ func (b *Bridge) adoptQuestion(ask *pendingAsk, ts string) {
 
 // settleDeadline decides whether the question was answered after all.
 //
-// Three things can be true at the moment the timer fires: the answer is
-// already waiting, a click is still sitting on the channel, or another
-// goroutine has taken a click off the channel and is on its way to delivering
-// it. select picks at random between a ready timer and a ready click, so the
-// first two need looking at rather than assuming; the third is why this waits
-// a moment and looks again, taking the mutex each time so that anything
-// mid-delivery has landed by the time it does.
-//
-// A single dispatcher owning the click channel would remove the third case
-// outright. It is not worth the machinery here: slack_wait already leaves the
-// channel alone while a question is pending, so a competing reader only exists
-// for the instant between the two.
+// The pump routes clicks as it receives them, so a click that arrived in the
+// same instant as the deadline is already on its way to this question rather
+// than sitting on a channel waiting to be read. What is left is the moment
+// between the routing and the answer being taken, which is why this looks more
+// than once: the owner did decide, and honouring it costs nothing.
 func (b *Bridge) settleDeadline(ask *pendingAsk) (int, bool) {
 	deadline := time.Now().Add(deadlineSettleWindow)
 	for {

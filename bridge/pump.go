@@ -42,7 +42,7 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 				b.endStream(stream, events, clicks, reactions)
 				return
 			}
-			b.absorb(evt)
+			b.applyEvent(evt, reactions)
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -61,6 +61,27 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 	}
 }
 
+// applyEvent applies one message together with any reactions already on the
+// wire.
+//
+// The pair rule works both ways round. A message and a reaction that arrive in
+// the same instant land on different channels, and whichever the pump happens
+// to pick first, the other is already there: taking them together is what makes
+// a delivery that has both hand over both, instead of splitting them across two
+// calls on a coin toss.
+//
+// Messages first within the pair, as always — the mention that opens a
+// conversation has to be applied before a reaction is judged against it.
+func (b *Bridge) applyEvent(evt StreamEvent, reactions <-chan Reaction) {
+	b.mu.Lock()
+	b.absorbLocked(evt)
+	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	opens := b.takeThreadOpensLocked()
+	b.mu.Unlock()
+
+	b.persistThreadOpens(opens)
+}
+
 // applyReaction queues one reaction, applying the messages ahead of it first.
 //
 // A reaction is judged against the conversations that are open, and the mention
@@ -75,21 +96,12 @@ func (b *Bridge) applyReaction(events <-chan StreamEvent, r Reaction) {
 	// drain between them and judge the reaction against a scope the mention it
 	// belongs to was about to change.
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-drain:
-	for i := 0; i < maxSweep; i++ {
-		select {
-		case evt, ok := <-events:
-			if !ok {
-				break drain
-			}
-			b.absorbLocked(evt)
-		default:
-			break drain
-		}
-	}
+	drainLocked(events, maxSweep, b.absorbLocked)
 	b.absorbReactionLocked(r)
+	opens := b.takeThreadOpensLocked()
+	b.mu.Unlock()
+
+	b.persistThreadOpens(opens)
 }
 
 // endStream takes what the dying connection had already delivered, and then
@@ -106,54 +118,38 @@ drain:
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
 func (b *Bridge) endStream(stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction) {
-	b.drainStreamEvents(events)
-	b.drainStreamClicks(clicks)
-	b.drainStreamReactions(reactions)
+	b.mu.Lock()
+	// One lock for the whole backlog, for the same reason a reaction and the
+	// messages ahead of it share one: a call woken halfway through would hand
+	// over the messages and find the reactions that arrived with them only on
+	// its next turn, which is the split this design exists to remove.
+	drainLocked(events, maxSweep, b.absorbLocked)
+	drainLocked(clicks, maxSweep, b.deliverInteraction)
+	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	opens := b.takeThreadOpensLocked()
+	b.mu.Unlock()
+
+	b.persistThreadOpens(opens)
 	b.noteStreamClosed(stream)
 }
 
-// drainStreamClicks routes every click already queued. A question about to be
-// told its connection died may yet have its answer sitting here.
-func (b *Bridge) drainStreamClicks(clicks <-chan Interaction) {
-	for i := 0; i < maxSweep; i++ {
-		select {
-		case in, ok := <-clicks:
-			if !ok {
-				return
-			}
-			b.routeInteraction(in)
-		default:
-			return
-		}
-	}
-}
-
-// drainStreamEvents applies every message already queued, without waiting for
-// more. A closed channel yields what it still holds and then stops, so nothing
+// drainLocked applies everything already queued on one channel, without waiting
+// for more, up to a bound. The caller holds b.mu, and apply must expect that.
+//
+// The bound matters because a channel can be refilled as fast as it is emptied:
+// an unbounded sweep would hold the lock, and the pump, for as long as the
+// flood lasted. The closed check is not a formality either — a closed channel
+// is permanently ready, so without it this would spin rather than reach its
+// default. What a closed channel still holds is yielded first, so nothing
 // received before the close is left behind.
-func (b *Bridge) drainStreamEvents(events <-chan StreamEvent) {
-	for i := 0; i < maxSweep; i++ {
+func drainLocked[T any](ch <-chan T, bound int, apply func(T)) {
+	for i := 0; i < bound; i++ {
 		select {
-		case evt, ok := <-events:
+		case v, ok := <-ch:
 			if !ok {
 				return
 			}
-			b.absorb(evt)
-		default:
-			return
-		}
-	}
-}
-
-// drainStreamReactions is the same for emoji.
-func (b *Bridge) drainStreamReactions(reactions <-chan Reaction) {
-	for i := 0; i < maxSweep; i++ {
-		select {
-		case r, ok := <-reactions:
-			if !ok {
-				return
-			}
-			b.absorbReaction(r)
+			apply(v)
 		default:
 			return
 		}

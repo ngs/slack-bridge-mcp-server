@@ -91,7 +91,9 @@ func (b *Bridge) channelHasConversationLocked(channel string) bool {
 	return false
 }
 
-// absorbReaction folds one emoji from the stream into the pending queue.
+// absorbReactionLocked folds one emoji from the stream into the pending queue.
+// The caller must hold b.mu, which is what lets a reaction and the messages
+// ahead of it be applied as one step.
 //
 // It queues without judging. Whether a reaction belongs to a conversation the
 // session is in is decided when the batch is handed over, by which time
@@ -106,14 +108,6 @@ func (b *Bridge) channelHasConversationLocked(channel string) bool {
 // is replaced on every reconnect, and Slack redelivers what it was not
 // acknowledged for — possibly on the replacement. A window on the stream would
 // be empty exactly when the redelivery arrived.
-func (b *Bridge) absorbReaction(r Reaction) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.absorbReactionLocked(r)
-}
-
-// absorbReactionLocked is absorbReaction for a caller that already holds b.mu.
 func (b *Bridge) absorbReactionLocked(r Reaction) {
 	if r.TS == "" || r.Reaction == "" || b.seenReactionLocked(r) {
 		return
