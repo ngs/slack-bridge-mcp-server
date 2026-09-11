@@ -399,6 +399,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	defer deadline.Stop()
 
 	for {
+		// Sweep what is already on the wire before deciding what this batch
+		// contains. Messages and reactions arrive on channels of their own, and
+		// without this a message ready at the same instant as a reaction would
+		// go back alone — leaving the agent counting a vote it had already been
+		// sent, one call later.
+		b.drainStream(stream, reactions)
+
 		// Catch-up first: a pending backlog outranks waiting for something
 		// new, and on a reconnect it is the only place missed messages are.
 		msgs, err := b.drainCatchUp(ctx)
@@ -465,7 +472,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 		case in, ok := <-clicks:
 			if !ok {
-				b.drainStreamReactions(reactions)
+				b.drainStream(stream, reactions)
 				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
@@ -478,8 +485,11 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if !ok {
 				// Whatever emoji are still buffered were received before the
 				// socket died, so they are kept for the next call rather than
-				// dying with the connection.
-				b.drainStreamReactions(reactions)
+				// dying with the connection. The events channel is drained
+				// first even though it is the one that just closed: what is
+				// still in its buffer can be the mention a buffered reaction
+				// has to be judged against.
+				b.drainStream(stream, reactions)
 				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}

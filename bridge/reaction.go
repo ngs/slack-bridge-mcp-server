@@ -158,6 +158,24 @@ func (b *Bridge) drainStreamEvents(stream Stream) error {
 	}
 }
 
+// drainStream absorbs everything already queued on the stream, messages before
+// reactions.
+//
+// The order is the point. A reaction is classified against the conversations
+// that are open, and the mention that opens one is a message: judging the
+// reaction first would drop a vote on the very message that invited the agent
+// in. Socket Mode delivered the mention first, and this is what keeps that true
+// wherever both channels are drained at once.
+//
+// absorb's error is dropped deliberately. Every caller is either on its way out
+// of a dead connection, where there is nothing left to report it to, or about
+// to hand over a batch, where losing the batch to report it would be the worse
+// outcome.
+func (b *Bridge) drainStream(stream Stream, reactions <-chan Reaction) {
+	_ = b.drainStreamEvents(stream)
+	b.drainStreamReactions(reactions)
+}
+
 // drainReactions takes everything queued for the next delivery.
 //
 // Reactions have no cursor and no catch-up: they exist only on the live

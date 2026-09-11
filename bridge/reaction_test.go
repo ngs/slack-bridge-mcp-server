@@ -431,17 +431,11 @@ func TestAReactionOnTheOpeningMentionIsNotDropped(t *testing.T) {
 		send(stream, otherChannel, "200.000100", "", mention("ship it?"))
 		react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
 
-		var (
-			messages  []Message
-			reactions []Reaction
-		)
-		// Two waits: the message and the reaction need not come back in the
-		// same delivery, only both.
-		for i := 0; i < 2; i++ {
-			result := waitOnce(ctx, t, b)
-			messages = append(messages, result.Messages...)
-			reactions = append(reactions, result.Reactions...)
-		}
+		// The message and the reaction need not come back in the same
+		// delivery, only both. The deadline is generous because a timeout
+		// here would mean the wait was slower than the clock, not that
+		// anything was dropped.
+		messages, reactions := collectBoth(ctx, t, b)
 
 		if len(messages) != 1 {
 			t.Fatalf("attempt %d: delivered %v, want the mention", attempt, texts(messages))
@@ -453,6 +447,31 @@ func TestAReactionOnTheOpeningMentionIsNotDropped(t *testing.T) {
 			t.Fatalf("Close() error = %v", err)
 		}
 	}
+}
+
+// collectBoth waits until at least one message and one reaction have been
+// handed over, or until a wait comes back empty. Each wait returns the moment
+// something is there, so the generous deadline costs nothing except when
+// something really is missing.
+func collectBoth(ctx context.Context, t *testing.T, b *Bridge) ([]Message, []Reaction) {
+	t.Helper()
+
+	var (
+		messages  []Message
+		reactions []Reaction
+	)
+	for i := 0; i < 3; i++ {
+		result, err := b.Wait(ctx, 2*time.Second)
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+		messages = append(messages, result.Messages...)
+		reactions = append(reactions, result.Reactions...)
+		if result.TimedOut || (len(messages) > 0 && len(reactions) > 0) {
+			break
+		}
+	}
+	return messages, reactions
 }
 
 // The bridge puts a receipt on every message it delivers, and a catch-up can
@@ -489,7 +508,10 @@ func TestBufferedReactionsSurviveTheStreamClosing(t *testing.T) {
 		react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
 		close(stream.events)
 
-		result, err := b.Wait(ctx, 50*time.Millisecond)
+		// Generous, because both of the outcomes below are reached at once:
+		// a short deadline could fire first on a slow machine and say nothing
+		// about whether the reaction survived.
+		result, err := b.Wait(ctx, 5*time.Second)
 		switch {
 		case err == nil && len(result.Reactions) == 1:
 			// Delivered before the closure was noticed.
@@ -511,4 +533,27 @@ func (b *Bridge) pendingReactionCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.pendingReactions)
+}
+
+// A wait that has both hands over both. Messages and reactions sit on channels
+// of their own, so without a sweep before the batch is decided, a message ready
+// at the same instant as a reaction goes back alone — and the agent counts a
+// vote one call after it was already sent.
+func TestAMessageAndAReactionArriveInOneDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	send(stream, testChannel, "100.000200", "", "ship it?")
+	react(stream, testChannel, "100.000200", colleague, "white_check_mark", true)
+
+	result, err := b.Wait(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if len(result.Messages) != 1 || len(result.Reactions) != 1 {
+		t.Fatalf("Wait() returned %d messages and %d reactions, want one delivery carrying both",
+			len(result.Messages), len(result.Reactions))
+	}
 }
