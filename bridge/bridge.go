@@ -58,6 +58,11 @@ const (
 // disagreed and the process exited mid-cleanup.
 const shutdownIndicatorWait = indicatorRequestTimeout + indicatorDeleteTimeout + 2*time.Second
 
+// threadWriteFlushWait is how long Close waits for the state-file writer to
+// finish what it has. It is short: the writes are small and local, and a disk
+// that cannot manage them in this long is one the process should not hang on.
+const threadWriteFlushWait = 2 * time.Second
+
 // Bridge owns the Slack connection and the message cursors. Every MCP tool
 // goes through it.
 type Bridge struct {
@@ -75,6 +80,10 @@ type Bridge struct {
 	lock      *Lock
 	connected bool
 	lastTS    string
+	// catchUpEpoch counts the requests. A catch-up clears needCatchUp only if
+	// the epoch has not moved since it started, so a request made while it was
+	// in flight survives it.
+	catchUpEpoch uint64
 	// needCatchUp is set on the first connect and on every reconnect. It is
 	// the flag that makes sleep/wake safe: whatever the WebSocket missed is
 	// still in Slack's history, and the next wait goes and gets it.
@@ -102,9 +111,10 @@ type Bridge struct {
 	// stream carries its own marker only as long as it lives, so a loss on a
 	// connection that then died would otherwise go unreported.
 	reactionsDropped bool
-	// stopPump ends the current connection's pump. It is replaced with each
-	// connection and called before the next one starts.
-	stopPump context.CancelFunc
+	// stopConnection ends everything the current connection started: the pump
+	// that owns its stream, and the goroutines the connector runs behind it. It
+	// is replaced with each connection and called before the next one starts.
+	stopConnection context.CancelFunc
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -113,11 +123,18 @@ type Bridge struct {
 	// from the state file on connect, so a restart resumes a conversation
 	// instead of waiting to be mentioned again.
 	threads map[threadKey]bool
-	// threadOpens are conversations registered in memory and not yet written to
-	// the state file. The write happens off b.mu, because the pump holds it and
-	// a slow disk under it would stall the connection.
-	threadOpens   []threadKey
-	threadCursors map[threadKey]string
+	// threadOpens are conversations registered in memory and not yet handed to
+	// the state-file writer. The hand-off happens off b.mu, because the pump
+	// holds it and a slow disk under it would stall the connection.
+	threadOpens []threadKey
+	// threadWrites carries them to the writer that owns the state file, and
+	// threadWritesDone closes when that writer has drained and stopped.
+	threadWrites chan threadKey
+	// stopThreadWrites tells that writer to flush and stop, and
+	// threadWritesDone closes once it has.
+	stopThreadWrites chan struct{}
+	threadWritesDone chan struct{}
+	threadCursors    map[threadKey]string
 	// mentionCursor is how far through time the search for missed mentions has
 	// looked.
 	mentionCursor string
@@ -218,18 +235,32 @@ func New(ctx context.Context, cfg Config, connector Connector) *Bridge {
 	return &Bridge{ctx: ctx, cfg: cfg, connector: connector}
 }
 
-// stopPumpLocked ends the pump of the connection being replaced, if there is
-// one. The caller must hold b.mu.
+// requestCatchUpLocked asks for the window to be re-read, and stamps the
+// request so a catch-up already in flight cannot answer it. The caller must
+// hold b.mu.
 //
-// It does not wait for the goroutine to notice: what matters is that it stops
-// taking from a stream nobody is using any more, and it holds no state of its
-// own to unwind.
-func (b *Bridge) stopPumpLocked() {
-	if b.stopPump == nil {
+// The stamp is what stops a reconnect, an overflow or a refused message from
+// being swallowed: a catch-up that started before the request went to Slack
+// with the old window in mind, and clearing the flag on its way back would
+// leave nothing to fetch what it never asked for.
+func (b *Bridge) requestCatchUpLocked() {
+	b.needCatchUp = true
+	b.catchUpEpoch++
+	b.notifyPendingLocked()
+}
+
+// stopConnectionLocked ends the connection being replaced, if there is one: its
+// pump, and the Socket Mode goroutines under it. The caller must hold b.mu.
+//
+// It does not wait for any of them to notice. What matters is that nothing is
+// left reading a stream nobody is using, or holding a WebSocket open on a
+// connection that has been replaced.
+func (b *Bridge) stopConnectionLocked() {
+	if b.stopConnection == nil {
 		return
 	}
-	b.stopPump()
-	b.stopPump = nil
+	b.stopConnection()
+	b.stopConnection = nil
 }
 
 // Status is what slack_status reports.
@@ -284,8 +315,10 @@ func (b *Bridge) Close() error {
 	b.mu.Lock()
 	b.connected = false
 	// Nothing is listening after this, so nothing should be reading the socket
-	// either.
-	b.stopPumpLocked()
+	// either — nor holding it open.
+	b.stopConnectionLocked()
+	stopWrites, writesDone := b.stopThreadWrites, b.threadWritesDone
+	b.stopThreadWrites = nil
 	b.stopIndicatorLocked()
 	done := b.indicatorDone
 	lock := b.lock
@@ -299,6 +332,21 @@ func (b *Bridge) Close() error {
 	b.mu.Unlock()
 
 	b.writePresence(presence)
+
+	// The conversations opened but not yet written are worth the wait: without
+	// them a restart makes the owner mention the bot again in a thread it was
+	// already in. The wait is short because the alternative to a slow disk here
+	// is a process that will not exit.
+	if stopWrites != nil {
+		close(stopWrites)
+		timeout := time.NewTimer(threadWriteFlushWait)
+		defer timeout.Stop()
+		select {
+		case <-writesDone:
+		case <-timeout.C:
+			log.Printf("gave up waiting for the open conversations to reach the state file")
+		}
+	}
 
 	if done != nil {
 		timeout := time.NewTimer(shutdownIndicatorWait)
@@ -359,10 +407,19 @@ func (b *Bridge) ensure() error {
 		}
 	}
 
-	api, stream, err := b.connector.Connect(b.ctx, b.cfg)
+	// The connection gets a context of its own, so that stopping it stops
+	// everything it started: the pump here, and the Socket Mode goroutines the
+	// connector runs. Bounded by the session's context, so the session ending
+	// still ends all of it.
+	b.stopConnectionLocked()
+	connCtx, stopConnection := context.WithCancel(b.ctx)
+
+	api, stream, err := b.connector.Connect(connCtx, b.cfg)
 	if err != nil {
+		stopConnection()
 		return err
 	}
+	b.stopConnection = stopConnection
 
 	b.api = api
 	// Its own user ID is how the bridge recognises a mention. Without it the
@@ -371,30 +428,30 @@ func (b *Bridge) ensure() error {
 	b.botUserID = api.BotUserID()
 	b.stream = stream
 	b.connected = true
-	// One goroutine owns the socket from here. Its context is the session's, so
-	// a wait that is cancelled does not take the connection down with it, and
-	// its own cancel is kept so this connection's pump can be stopped before
-	// another is started — two pumps writing into the same queues would undo
-	// the single ownership this is all for.
-	b.stopPumpLocked()
-	pumpCtx, stopPump := context.WithCancel(b.ctx)
-	b.stopPump = stopPump
-	go b.pump(pumpCtx, stream)
+	// One goroutine owns the socket from here. It runs on the connection's
+	// context rather than a call's, so a wait that is cancelled does not take
+	// the connection down with it — and it stops when the connection does, so
+	// two pumps can never write into the same queues.
+	go b.pump(connCtx, stream)
 	// A fresh connection is the one moment the scopes can have changed, so the
 	// catch-up outside the home channel is offered another go — and anything the
 	// old connection is still doing no longer speaks for this one.
 	b.connGeneration++
 	// The first catch-up covers everything missed since the last session;
 	// StreamConnected events later cover reconnects.
-	b.needCatchUp = true
+	b.requestCatchUpLocked()
 	return nil
 }
 
-// maxPendingMessages bounds the messages waiting to be handed over. It is far
-// past any conversation and well into a machine writing into the channel, and
-// what it protects against is a session left working for hours while a busy
-// channel fills the heap behind it.
-const maxPendingMessages = 1024
+// maxPendingMessages bounds the messages waiting to be handed over. What it
+// protects against is a session left working for hours while a busy channel
+// fills the heap behind it.
+//
+// It sits well inside what one catch-up can fetch — maxHistoryPages pages of
+// historyPageLimit each — because a refused message is recovered by re-reading
+// the window from the cursor, and that window has to hold everything still
+// queued as well as everything refused.
+const maxPendingMessages = 512
 
 // WaitResult is what slack_wait returns.
 type WaitResult struct {
@@ -607,14 +664,19 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		}
 		if len(b.pending)+len(b.pendingThreads) >= maxPendingMessages {
 			// The socket's buffer used to be the limit, because nothing moved
-			// a message off it until a call asked. The pump moves every one,
-			// so the limit has to be here instead — and it is the same
-			// recovery the socket's own overflow uses: history is the
-			// authority, no cursor has moved, so what is queued can be let go
-			// and fetched again.
-			b.pending, b.pendingThreads = nil, nil
-			b.needCatchUp = true
-			log.Printf("the pending message queue is full; re-reading the window from history")
+			// a message off it until a call asked; the pump moves every one, so
+			// the limit has to be here instead.
+			//
+			// What is already queued stays. Dropping it would throw away
+			// messages that were received, and the replies in conversations
+			// outside the home channel are the ones history is least able to
+			// give back — that catch-up is best effort and stands down
+			// entirely when a scope is missing. So the newest message is
+			// refused instead, and catch-up asked for: no cursor has moved, so
+			// history still has it.
+			b.requestCatchUpLocked()
+			log.Printf("the pending message queue is full at %d; the newest message will be re-read from history", maxPendingMessages)
+			return
 		}
 		if msg.Channel == "" || msg.Channel == b.cfg.Channel {
 			b.pending = append(b.pending, msg)
@@ -624,11 +686,10 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		b.notifyPendingLocked()
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the
-		// authority, so go re-read the window after the cursor.
-		b.needCatchUp = true
-		// A hole is a reason to go and look as much as a message is: what
-		// history has to offer is exactly what a blocked call is waiting for.
-		b.notifyPendingLocked()
+		// authority, so go re-read the window after the cursor. A hole is a
+		// reason to go and look as much as a message is: what history has to
+		// offer is exactly what a blocked call is waiting for.
+		b.requestCatchUpLocked()
 	}
 }
 
@@ -641,6 +702,7 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	b.mu.Lock()
 	needCatchUp := b.needCatchUp
+	epoch := b.catchUpEpoch
 	api := b.api
 	generation := b.connGeneration
 	lastTS := b.lastTS
@@ -684,7 +746,11 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	// it was, and the new connection has its own catch-up to run — the one that
 	// finds what a reinstall has just made readable. The messages it did read
 	// are still handed over; only the flag is left alone.
-	if needCatchUp && generation == b.connGeneration {
+	// Only if nothing has asked again since this one started. A reconnect or a
+	// refused message that arrived while history was in flight is a request
+	// this catch-up never saw, and clearing the flag would answer it with a
+	// window that did not include it.
+	if needCatchUp && generation == b.connGeneration && epoch == b.catchUpEpoch {
 		b.needCatchUp = false
 		if b.lastTS == "" {
 			b.lastTS = lastTS

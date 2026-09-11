@@ -47,7 +47,7 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 				b.endStream(stream, events, clicks, reactions)
 				return
 			}
-			b.applyEvent(evt, reactions)
+			b.applyEvent(evt, events, reactions)
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -77,9 +77,14 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 //
 // Messages first within the pair, as always — the mention that opens a
 // conversation has to be applied before a reaction is judged against it.
-func (b *Bridge) applyEvent(evt StreamEvent, reactions <-chan Reaction) {
+func (b *Bridge) applyEvent(evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction) {
 	b.mu.Lock()
 	b.absorbLocked(evt)
+	// The rest of the ready events before any reaction, not just this one. The
+	// events channel is in order, so a reaction on a mention two places behind
+	// the one just taken would otherwise be queued while that mention is still
+	// unapplied — and judged against a conversation that has not opened yet.
+	drainLocked(events, maxSweep, b.absorbLocked)
 	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
 	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()

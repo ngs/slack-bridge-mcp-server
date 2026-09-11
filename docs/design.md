@@ -479,15 +479,30 @@ arrived before it has not been.
 
 **Backlog.** The socket's own buffer used to bound what was waiting, because
 nothing moved a message off it until a call asked. The pump moves every one, so
-the bound lives on the queue instead: past it, the in-memory backlog is dropped
-and catch-up asked for. No cursor has moved, so history returns exactly what was
-discarded — the same recovery the socket's overflow has always used.
+the bound lives on the queue instead. What is already queued stays: the newest
+message is refused and a catch-up asked for, and since no cursor has moved,
+history still has it. Refusing rather than discarding matters because the queue
+holds replies from conversations outside the home channel, and that catch-up is
+best effort — it stands down entirely when a scope is missing — so a reply
+dropped from the queue might never come back.
 
-**Writes off the lock.** Registering a conversation persists it to the state
-file, and that write no longer happens under `b.mu`. It is recorded in memory
-and written once the lock is released, because the lock the pump holds is the
-one every tool call shares: a slow disk under it would stall the connection
-itself.
+A catch-up request carries an epoch. One already in flight went to Slack with
+the old window in mind, so it clears the flag only if nothing has asked again
+since it started; otherwise a reconnect, or a message refused for want of room,
+would be answered by a fetch that never knew about it.
+
+**Writes off the path.** Registering a conversation persists it to the state
+file, and that write happens on neither `b.mu` nor the pump. A state file is a
+read and a write of the whole thing, so on a slow disk it is both the lock every
+tool call shares and the only socket reader, stopped for the duration. The open
+is recorded in memory and handed to a writer goroutine of its own, which keeps
+the writes in order and flushes what it has when the session ends.
+
+**Lifetime.** A connection gets a context of its own, bounded by the session's.
+Cancelling it stops everything that connection started — the pump, and the
+Socket Mode goroutines the connector runs — and it is cancelled before a
+replacement connection starts and by `Close`. Two pumps can never write into the
+same queues, and a replaced connection cannot hold a socket open behind one.
 
 **Bounds and backpressure.** The pump never blocks on anything slow. Applying an
 event takes the bridge lock for the length of a slice append; catch-up, which

@@ -226,6 +226,11 @@ func TestAQuestionIsInterruptedByAMessageQueuedBeforeItSubscribed(t *testing.T) 
 // the limit, because nothing moved a message off it until a call asked; the
 // pump moves every one, so a session left working while a channel is busy would
 // otherwise grow the heap without bound.
+//
+// What is already queued stays, and the newest is refused instead: a message
+// refused is one history still has, while a message discarded from the queue
+// may be a thread reply that catch-up outside the home channel cannot promise
+// to find again.
 func TestTheMessageQueueFallsBackToHistoryWhenItFills(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -235,6 +240,16 @@ func TestTheMessageQueueFallsBackToHistoryWhenItFills(t *testing.T) {
 		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
 	}
 
+	// A conversation outside the home channel, and a reply in it. Those replies
+	// are the ones history is least able to give back — that catch-up is best
+	// effort and stands down entirely when a scope is missing — so they are the
+	// ones that must not be discarded to make room.
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "200.000100", Channel: otherChannel, User: testOwner, Text: mention("take a look"),
+	}})
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "200.000200", ThreadTS: "200.000100", Channel: otherChannel, User: testOwner, Text: "in the thread",
+	}})
 	for i := 0; i <= maxPendingMessages; i++ {
 		b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
 			TS: fmt.Sprintf("100.%06d", i+1000), Channel: testChannel, User: testOwner, Text: "noise",
@@ -245,8 +260,19 @@ func TestTheMessageQueueFallsBackToHistoryWhenItFills(t *testing.T) {
 		t.Errorf("pending backlog = %d, want it bounded at %d", got, maxPendingMessages)
 	}
 	if !b.catchUpDue() {
-		t.Error("the queue was emptied without asking for a catch-up; those messages would be lost rather than re-read")
+		t.Error("the queue filled without asking for a catch-up; the refused messages would be lost rather than re-read")
 	}
+	if b.pendingThreadCount() != 2 {
+		t.Error("the thread reply was discarded to make room; history's catch-up outside the home channel is best effort and may never bring it back")
+	}
+}
+
+// pendingThreadCount reports how many replies from conversations outside the
+// home channel are waiting.
+func (b *Bridge) pendingThreadCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pendingThreads)
 }
 
 // catchUpDue reports whether the next call will re-read the window from
@@ -298,17 +324,72 @@ func TestACancelledPumpReportsThatNobodyIsReading(t *testing.T) {
 		t.Fatal("the bridge reports no connection, so there is no pump to cancel")
 	}
 
-	b.stopThePump()
+	b.stopTheConnection()
 
 	eventually(t, "the pump to record that it has stopped reading", func() bool {
 		return !b.Status().Connected
 	})
 }
 
-// stopThePump ends the current connection's pump the way a replacement or a
-// shutdown does.
-func (b *Bridge) stopThePump() {
+// stopTheConnection ends the current connection the way a replacement or a
+// shutdown does, taking its pump with it.
+func (b *Bridge) stopTheConnection() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stopPumpLocked()
+	b.stopConnectionLocked()
+}
+
+// A catch-up asked for while another is in flight has to survive it. The one in
+// flight went to Slack with the old window in mind, and clearing the flag on
+// its way back would answer a request it never saw — leaving a reconnect, or a
+// message refused for want of room, with nothing to fetch it.
+func TestACatchUpRequestedMidFlightIsNotSwallowed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	gate := make(chan struct{})
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		historyGate:    gate,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+	}()
+
+	// The reconnect lands while the first catch-up is still fetching history.
+	eventually(t, "catch-up to reach Slack", func() bool { return len(api.calls()) > 0 })
+	b.absorb(StreamEvent{Kind: StreamConnected})
+	close(gate)
+	<-done
+
+	// The proof is that the window was read again. Swallowed, the first
+	// catch-up's single pass would be the only one.
+	reads := 0
+	for _, req := range api.calls() {
+		if req.Channel == testChannel {
+			reads++
+		}
+	}
+	// One catch-up reads the channel twice — the window, then the pass that
+	// looks for threads talked in since the cursor — so a second catch-up is
+	// the difference between two reads and four.
+	if reads < 3 {
+		t.Errorf("read the home channel %d times, want a second catch-up: the request made while history was in flight was cleared by it", reads)
+	}
 }
