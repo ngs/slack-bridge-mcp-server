@@ -44,6 +44,10 @@ oauth_config:
       # reactions.add: the automatic receipt reaction on every delivered
       # message, and whatever slack_ack asks for on top of it.
       - reactions:write
+      # reactions.get for slack_reactions, plus the reaction_added and
+      # reaction_removed subscriptions below: Slack rejects a manifest that
+      # subscribes to those events without this scope.
+      - reactions:read
       # users.info, which turns the user IDs in slack_history results into
       # names. Optional in practice: without it the tool falls back to IDs.
       - users:read
@@ -64,6 +68,11 @@ settings:
       # Everywhere else the app has been added: a mention is what opens a
       # conversation, and app_mention is the event that carries one.
       - app_mention
+      # Emoji put on or taken off a message the session can see, which is how
+      # the agent learns that somebody answered a post it asked people to react
+      # to. Unlike messages, these are relayed whoever reacted.
+      - reaction_added
+      - reaction_removed
   interactivity:
     # Required for slack_ask: without it Slack refuses to deliver the button
     # clicks. Socket Mode apps need no request URL, since the clicks arrive

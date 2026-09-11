@@ -336,6 +336,37 @@ Being read-only is what keeps the two apart. The tool cannot move the cursor,
 consume a pending message, react, or touch the indicator, so no amount of
 reading changes what the relay will deliver next.
 
+### Reactions are relayed, and from everybody
+
+Emoji are the cheapest thing a person can say, which makes them the natural way
+to answer a post that asks a channel to decide something. `slack_wait`
+therefore delivers `reaction_added` and `reaction_removed` alongside messages,
+in a `reactions` array of its own; either one on its own ends a wait.
+
+Two rules differ from the owner filter of decision 5, deliberately:
+
+- **Anybody's reaction counts.** An approval is other people answering, so
+  relaying only the owner's emoji would leave the feature with nothing to
+  report. The one exception is the bridge's own: the automatic 👀 receipt goes
+  on every delivered message, and relaying it would answer each message with an
+  event about itself.
+- **The channel decides, not the thread.** A reaction event carries the reacted
+  message's `ts` and its channel, and nothing else — whether that message sits
+  inside an open conversation cannot be known without another API call on the
+  socket's path. So the home channel is relayed, and so is any channel with a
+  conversation open in it; everywhere else is dropped. It errs towards
+  delivering within a channel the owner has already brought the agent into, and
+  never outside one.
+
+A reaction is not a message and is not treated as one. It gets no receipt
+reaction, it does not start the processing indicator, and it moves no cursor.
+
+Reactions are also the one thing the bridge cannot catch up on. They are not in
+`conversations.history` and there is no cursor for them, so a reaction added
+while the session was down reaches nobody. That is why `slack_reactions` exists:
+`reactions.get` reports the standing tally, which is what an agent counting
+answers actually needs after a restart.
+
 ### Clicks travel apart from messages
 
 A message that cannot be queued live is not lost: the overflow becomes a
@@ -554,3 +585,6 @@ needed. The one constraint the SDK imposes is a Go 1.25 minimum, which is why
   button click.
 - **Editing and deletion.** `message_changed` and `message_deleted` are ignored;
   an edited message is not re-delivered.
+- **Catch-up for reactions.** Live only: an emoji added or removed while the
+  session was down is delivered to nobody, and `slack_reactions` is how the
+  tally is recovered.
