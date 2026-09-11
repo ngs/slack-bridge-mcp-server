@@ -321,7 +321,12 @@ func (b *Bridge) drainReactions() []Reaction {
 		}
 		if len(b.deferredReactions) < maxPendingReactions {
 			b.deferredReactions = append(b.deferredReactions, heldReaction{reaction: r, expires: now.Add(reactionHold)})
+			continue
 		}
+		// No room to hold it, so it goes — and one that goes is one that might
+		// have come into scope before its hold was up. That is a lost reaction
+		// like any other, and the agent is told so it can re-read the tally.
+		b.reactionsDropped = true
 	}
 	if len(kept) == 0 {
 		return nil

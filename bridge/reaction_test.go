@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -831,4 +832,52 @@ func (b *Bridge) deferredReactionCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.deferredReactions)
+}
+
+// A delivery carrying only reactions still reports an empty message array. A
+// caller reading the bridge directly has always had one, and null is a
+// different shape to parse.
+func TestAReactionOnlyDeliveryStillCarriesAnEmptyMessageArray(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+
+	result := waitOnce(ctx, t, b)
+	if len(result.Reactions) != 1 {
+		t.Fatalf("Wait() returned %+v, want the reaction", result)
+	}
+	if result.Messages == nil {
+		t.Error("messages is null on a reaction-only delivery, want the empty array every other result carries")
+	}
+}
+
+// A reaction with nowhere to be held is a reaction lost, and a lost one is
+// something the agent has to hear about: it might have come into scope before
+// its hold was up, and no history brings it back.
+func TestAnUnheldableReactionIsReportedAsDropped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	// Fill the hold list with reactions that match nothing.
+	for i := 0; i < maxPendingReactions; i++ {
+		react(stream, otherChannel, fmt.Sprintf("200.%06d", i), colleague, "white_check_mark", true)
+		b.drainStreamReactions(stream.reactions)
+		b.drainReactions()
+	}
+	if b.deferredReactionCount() != maxPendingReactions {
+		t.Fatalf("held %d reactions, want the list full at %d", b.deferredReactionCount(), maxPendingReactions)
+	}
+
+	react(stream, otherChannel, "300.000100", colleague, "white_check_mark", true)
+	b.drainStreamReactions(stream.reactions)
+	b.drainReactions()
+
+	if !b.droppedReactionMark() {
+		t.Error("a reaction was discarded for want of room with nothing said; the agent would never know to re-read the tally")
+	}
 }

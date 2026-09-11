@@ -546,6 +546,12 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 		b.startIndicator(newestConversation(msgs))
 		b.autoAck(msgs)
 	}
+	if msgs == nil {
+		// Never null. A reaction-only delivery has no messages, and a caller
+		// reading the bridge directly gets the empty array every other result
+		// has always carried.
+		msgs = []Message{}
+	}
 	return WaitResult{
 		Messages:         msgs,
 		Reactions:        b.nameReactions(ctx, reactions),
