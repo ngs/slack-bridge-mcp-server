@@ -26,6 +26,9 @@ type fakeAPI struct {
 	channelHistory map[string][]candidate
 	// historyErr, when set, fails the next History call.
 	historyErr error
+	// historyGate, when set, holds every History call open until the test
+	// closes it.
+	historyGate chan struct{}
 	// channelHistoryErr fails History for one channel only, which is how a
 	// scope the app has in its home channel and nowhere else behaves.
 	channelHistoryErr map[string]error
@@ -140,9 +143,20 @@ func (f *fakeAPI) historyForLocked(channel string) []candidate {
 
 func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, error) {
 	f.mu.Lock()
+	// Recorded before the gate, so a test holding catch-up open can see that it
+	// has started.
+	f.historyCalls = append(f.historyCalls, req)
+	gate := f.historyGate
+	f.mu.Unlock()
+	if gate != nil {
+		// Held open so a test can make something happen while catch-up is in
+		// flight, which is otherwise a window too small to aim at.
+		<-gate
+	}
+
+	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.historyCalls = append(f.historyCalls, req)
 	if f.historyErr != nil {
 		return HistoryPage{}, f.historyErr
 	}

@@ -68,12 +68,10 @@ func TestWaitWakesWhenAnotherCallAbsorbsAMessage(t *testing.T) {
 	eventually(t, "the wait to finish its catch-up", b.caughtUp)
 	eventually(t, "the wait to subscribe", func() bool { return b.pendingSubscribers() > 0 })
 
-	if err := b.absorb(StreamEvent{
+	b.absorb(StreamEvent{
 		Kind:    StreamMessage,
 		Message: Message{TS: "100.000200", User: testOwner, Text: "while you were blocked"},
-	}); err != nil {
-		t.Fatalf("absorb() error = %v", err)
-	}
+	})
 
 	select {
 	case got := <-done:

@@ -419,25 +419,91 @@ cases, for a conversation that was open by the time anybody looked.
 
 So the rule is the one that can be stated without reference to ordering: a
 reaction is delivered when the message it is on belongs to a conversation the
-session is in at the moment the batch is handed over. Draining messages before
-reactions is kept anyway, since a batch that carries both should carry them
-whole, but nothing depends on it any more.
+session is in at the moment the batch is handed over.
 
-One instant is still too small for that rule to catch on its own. Two calls read
-the same stream, and receiving a mention and absorbing it are not one step: for
-as long as it takes the receiving call to reach `absorb`, the thread that
-mention opens does not exist yet, and another call judging a reaction against
-the scope right then would find nothing. So a reaction that matches nothing is
-held for a couple of seconds rather than dropped where it lands, and judged
-again on the next drain. The window being covered is sub-millisecond; the hold
-is generous because the cost of holding is one entry in a bounded list, and the
-cost of not holding is a vote.
+The instant that rule cannot catch on its own — a mention received but not yet
+applied — is closed by the pump below, which applies a reaction and the messages
+ahead of it under one lock. A reaction still matching nothing at delivery is one
+Slack genuinely sent before the agent was part of the conversation, and that is
+not a live event to be recovered but a tally to be read.
 
 Both channels are optional halves of the `Stream` interface, reached by type
 assertion. `Stream`, `API` and `Connector` are exported, so requiring a new
 method on them would break anything outside this repository that implements
 one; an implementation without the reaction half simply delivers no reactions,
 and `slack_reactions` says so rather than failing obscurely.
+
+### One goroutine owns the connection
+
+Every tool call reads bridge state. Nothing but the pump reads the socket.
+
+The pump is one goroutine per connection, started when the connection opens and
+ended when it closes. It owns all three stream channels — messages, clicks,
+reactions — receives from them, and writes what it receives into the bridge's
+own queues under the same lock every tool call uses. `slack_wait` and
+`slack_ask` never touch a stream channel.
+
+**Why.** Receiving an event and applying it are two steps, and while two callers
+both read the socket there is no way to make them one. A wait can take a mention
+off the events channel and be descheduled before it registers the thread that
+mention opens; a question running at the same time then judges a reaction
+against a scope that is about to change and finds nothing. The reaction was
+never out of scope — it was early by the width of a goroutine switch. Every fix
+that keeps two readers is a patch over that gap rather than a closure of it: a
+drain here, an ordering rule there, a grace period on top. With one reader,
+receive and apply happen in the same goroutine, and no other call can observe a
+state between them.
+
+**Queues.** The bridge already had most of them; the pump makes them the whole
+interface.
+
+| What arrives | Where the pump puts it | Who takes it |
+|---|---|---|
+| Owner message | `pending` / `pendingThreads` | the next `slack_wait`, or a settled `slack_ask` |
+| Reaction | `pendingReactions` | the next `slack_wait` |
+| Button click | routed straight to the pending question | the `slack_ask` waiting for it |
+| Reconnect or overflow | `needCatchUp` | the next call to run catch-up |
+| Disconnect | `connected`, cleared | whoever is blocked, as an error |
+
+Every write wakes the subscribers, so a call blocked on an empty queue hears
+about what another call's connection just received.
+
+**Ordering.** The pump takes messages before reactions: when a reaction is ready
+and events are too, the ready events are applied first. That rule already
+existed, but it could not be relied upon while another goroutine might receive a
+message in the middle of it. In the pump it holds absolutely — a caller cannot
+see a reaction applied while a message that arrived before it has not been.
+
+**Bounds and backpressure.** The pump never blocks on anything slow. Applying an
+event takes the bridge lock for the length of a slice append; catch-up, which
+goes to Slack and back, stays in the calling goroutine where it always was, and
+the pump keeps draining the socket while it runs. The queues are bounded where
+losing something is survivable and unbounded where it is not: reactions are
+capped, because a lost one can be recovered with `slack_reactions` and an
+unbounded queue cannot; messages are not, because they are recovered from
+history and the socket's own buffer is what limits them.
+
+**Catch-up.** Unchanged, and still in the caller. `drainCatchUp` merges what
+history returns with what the pump has queued, under the lock, so a message that
+arrives live while history is being fetched is deduplicated by timestamp exactly
+as before. A disconnection during catch-up is recorded by the pump and reported
+by the call when its drain comes back empty, so nothing already received is
+thrown away to report it.
+
+**What this removes.** The hold from the reaction work — an unmatched reaction
+kept for a couple of seconds in case the mention that opens its channel was a
+moment behind — was a workaround for precisely the gap the pump closes. It is
+gone, along with the deferred queue and its expiry. The rule it was propping up
+stands on its own now: a reaction is delivered when the message it is on belongs
+to a conversation the session is in as the batch is decided, and the only way to
+be early for that is for Slack to have genuinely sent the reaction first.
+Reactions that predate the agent being invited into a channel are not a live
+concern at all — they are a tally, and `slack_reactions` reads tallies.
+
+**What does not change.** Every tool's arguments and results are exactly as they
+were, including `reactions`, `reactions_dropped` and the disconnection error.
+The `Stream`, `ReactionStream`, `API` and `Connector` interfaces are untouched:
+the pump reads the same channels the two loops used to read between them.
 
 ### Whoever is blocked hears about the message
 

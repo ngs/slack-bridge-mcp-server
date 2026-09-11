@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // Reaction is one emoji reaction, added or removed, as slack_wait hands it
@@ -111,6 +110,11 @@ func (b *Bridge) absorbReaction(r Reaction) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	b.absorbReactionLocked(r)
+}
+
+// absorbReactionLocked is absorbReaction for a caller that already holds b.mu.
+func (b *Bridge) absorbReactionLocked(r Reaction) {
 	if r.TS == "" || r.Reaction == "" || b.seenReactionLocked(r) {
 		return
 	}
@@ -124,20 +128,6 @@ func (b *Bridge) absorbReaction(r Reaction) {
 	b.pendingReactions = append(b.pendingReactions, r)
 	b.notifyPendingLocked()
 }
-
-// heldReaction is a reaction that matched no open conversation, kept until its
-// hold expires in case the mention that opens one is a moment behind it.
-type heldReaction struct {
-	reaction Reaction
-	expires  time.Time
-}
-
-// reactionHold is how long such a reaction is kept. The window it covers is the
-// instant between one call receiving a mention and another call judging a
-// reaction against the scope that mention is about to change — sub-millisecond,
-// and this is generous by four orders of magnitude while still letting go of
-// anything that simply belongs elsewhere.
-const reactionHold = 2 * time.Second
 
 // maxPendingReactions bounds the queue of emoji waiting to be handed over. It
 // is generous — a decision post collects a burst, not a stream — and exists so
@@ -178,94 +168,6 @@ func (b *Bridge) seenReactionLocked(r Reaction) bool {
 	return false
 }
 
-// drainStreamReactions absorbs every reaction already queued on the stream,
-// without waiting for more.
-//
-// It is called on the way out of a dying connection. The socket closes its
-// three channels together, and a call that notices the events channel first
-// would otherwise abandon whatever emoji were still sitting in the buffer —
-// and those are reactions the bridge did receive, which is not the loss the
-// live-only limitation describes.
-//
-// The closed check is not a formality: a closed channel is permanently ready,
-// so without it this loop would spin instead of reaching its default. Receiving
-// from a closed channel still yields what was buffered first, so nothing that
-// arrived before the close is left behind.
-func (b *Bridge) drainStreamReactions(reactions <-chan Reaction) {
-	for i := 0; i < maxSweep; i++ {
-		select {
-		case r, ok := <-reactions:
-			if !ok {
-				return
-			}
-			b.absorbReaction(r)
-		default:
-			return
-		}
-	}
-}
-
-// drainStreamEvents absorbs every message already queued on the stream, without
-// waiting for more.
-//
-// It runs before a reaction is classified. Messages and reactions arrive on
-// channels of their own, and a select picks between two ready channels at
-// random, so a reaction on the very message that opens a conversation could
-// otherwise be judged before the mention that opened it — and dropped for want
-// of a conversation that was already on its way. Socket Mode delivers the
-// mention first; this keeps that order where it matters.
-func (b *Bridge) drainStreamEvents(stream Stream) (closed bool, err error) {
-	// Bounded, because the channel can be refilled as fast as it is emptied. An
-	// unbounded sweep under a sustained flood would never hand control back to
-	// the reactions, to catch-up, or to the deadline, and the call would run
-	// past the timeout it promised.
-	for i := 0; i < maxSweep; i++ {
-		select {
-		case evt, ok := <-stream.Events():
-			if !ok {
-				return true, nil
-			}
-			if err := b.absorb(evt); err != nil {
-				return false, err
-			}
-		default:
-			return false, nil
-		}
-	}
-	return false, nil
-}
-
-// maxSweep bounds one non-blocking drain of a stream channel. It is comfortably
-// past both live buffers, so an ordinary backlog is taken in one pass and only
-// a flood is interrupted.
-const maxSweep = 512
-
-// drainStream absorbs everything already queued on the stream, messages before
-// reactions.
-//
-// The order is the point. A reaction is classified against the conversations
-// that are open, and the mention that opens one is a message: judging the
-// reaction first would drop a vote on the very message that invited the agent
-// in. Socket Mode delivered the mention first, and this is what keeps that true
-// wherever both channels are drained at once.
-//
-// absorb's error is dropped deliberately. Every caller is either on its way out
-// of a dead connection, where there is nothing left to report it to, or about
-// to hand over a batch, where losing the batch to report it would be the worse
-// outcome.
-func (b *Bridge) drainStream(stream Stream, reactions <-chan Reaction) {
-	closed, _ := b.drainStreamEvents(stream)
-	b.drainStreamReactions(reactions)
-	if closed {
-		// The buffer is emptied first and the closure recorded after, so what
-		// the connection delivered before it died is kept and the next call
-		// opens a new one instead of listening to a dead socket. Anything the
-		// stream lost on the way is kept by noteStreamClosed, which every
-		// disconnect path goes through.
-		b.noteStreamClosed(stream)
-	}
-}
-
 // drainReactions takes everything queued for the next delivery.
 //
 // Reactions have no cursor and no catch-up: they exist only on the live
@@ -274,10 +176,7 @@ func (b *Bridge) drainReactions() []Reaction {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// The held ones count: a drain with nothing new still has to re-judge them,
-	// or one that matched nothing would sit in the list for ever instead of
-	// being let go after its round of grace.
-	if len(b.pendingReactions) == 0 && len(b.deferredReactions) == 0 {
+	if len(b.pendingReactions) == 0 {
 		return nil
 	}
 	queued := b.pendingReactions
@@ -288,51 +187,17 @@ func (b *Bridge) drainReactions() []Reaction {
 	// is in by the time the batch goes out — not by the order two channels
 	// happened to be read in.
 	//
-	// One that matches nothing is held for a moment rather than dropped where
-	// it lands. Two calls can read the same stream, and the one that takes the
-	// opening mention off it is not always the one that absorbs it first: there
-	// is an instant where the mention has been received and the thread it opens
-	// is not registered yet. A reaction judged in that instant looks out of
-	// scope and is not.
-	//
-	// The hold is a short deadline rather than a number of drains, because a
-	// single wait drains several times and the instant being covered is shorter
-	// than any of them. A reaction that belongs nowhere is let go when its hold
-	// expires, so the list cannot grow into every emoji in every channel the bot
-	// is in.
-	held := b.deferredReactions
-	b.deferredReactions = nil
-
-	now := time.Now()
-	kept := make([]Reaction, 0, len(held)+len(queued))
-	for _, h := range held {
-		// Expiry first. A hold covers the instant between a mention being
-		// received and the thread it opens being registered, and nothing
-		// longer: a reaction whose hold ran out while no drain happened is
-		// let go, rather than revived by a conversation that opened minutes
-		// later.
-		if !now.Before(h.expires) {
-			continue
-		}
-		if reaction, ok := b.classifyReactionLocked(h.reaction); ok {
-			kept = append(kept, reaction)
-			continue
-		}
-		b.deferredReactions = append(b.deferredReactions, h)
-	}
+	// A reaction that matches nothing is dropped here and not held. It was
+	// held while two goroutines read the socket, to cover the instant between
+	// one of them receiving a mention and registering the thread it opens; the
+	// pump closed that instant, and a reaction still matching nothing is one
+	// Slack genuinely sent before the agent was part of the conversation. Those
+	// are a tally rather than an event, and slack_reactions reads tallies.
+	kept := make([]Reaction, 0, len(queued))
 	for _, r := range queued {
 		if reaction, ok := b.classifyReactionLocked(r); ok {
 			kept = append(kept, reaction)
-			continue
 		}
-		if len(b.deferredReactions) < maxPendingReactions {
-			b.deferredReactions = append(b.deferredReactions, heldReaction{reaction: r, expires: now.Add(reactionHold)})
-			continue
-		}
-		// No room to hold it, so it goes — and one that goes is one that might
-		// have come into scope before its hold was up. That is a lost reaction
-		// like any other, and the agent is told so it can re-read the tally.
-		b.reactionsDropped = true
 	}
 	if len(kept) == 0 {
 		return nil

@@ -92,10 +92,6 @@ type Bridge struct {
 	// messages: no cursor applies to them, they are never merged with history,
 	// and a reaction older than the home cursor is still news.
 	pendingReactions []Reaction
-	// deferredReactions are reactions that matched no open conversation when
-	// they were judged, held briefly in case the mention that opens one is a
-	// moment behind them. See drainReactions.
-	deferredReactions []heldReaction
 	// seenReactions and seenReactionOrder are the window of reactions already
 	// queued, against Slack redelivering an envelope it was not acknowledged
 	// for. They live here rather than on the stream because a reconnect
@@ -351,6 +347,10 @@ func (b *Bridge) ensure() error {
 	b.botUserID = api.BotUserID()
 	b.stream = stream
 	b.connected = true
+	// One goroutine owns the socket from here. It runs until the connection
+	// ends, and the session's context outlives every call, so a wait that is
+	// cancelled does not take the connection down with it.
+	go b.pump(b.ctx, stream)
 	// A fresh connection is the one moment the scopes can have changed, so the
 	// catch-up outside the home channel is offered another go — and anything the
 	// old connection is still doing no longer speaks for this one.
@@ -406,11 +406,6 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	stream := b.stream
 	b.mu.Unlock()
 
-	// Reactions arrive on a channel of their own, so a backlog of messages
-	// cannot fill the queue a vote lands in. A stream that predates them has
-	// none, and a nil channel simply never fires.
-	reactions := reactionsOf(stream)
-
 	// Subscribed before the first drain, so a message absorbed by another call
 	// between the drain and the select is a wakeup rather than a message this
 	// call blocks straight through.
@@ -421,35 +416,25 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	defer deadline.Stop()
 
 	for {
-		// Sweep what is already on the wire before deciding what this batch
-		// contains. Messages and reactions arrive on channels of their own, and
-		// without this a message ready at the same instant as a reaction would
-		// go back alone — leaving the agent counting a vote it had already been
-		// sent, one call later.
-		b.drainStream(stream, reactions)
-
 		// Catch-up first: a pending backlog outranks waiting for something
 		// new, and on a reconnect it is the only place missed messages are.
+		// Everything the socket has delivered is already in the queues, put
+		// there by the pump, so there is nothing to sweep here.
 		msgs, err := b.drainCatchUp(ctx)
 		if err != nil {
 			return WaitResult{}, err
 		}
-		// Again, because catch-up goes to Slack and back: emoji that arrived
-		// while it was fetching history belong in the batch it produced.
-		b.drainStream(stream, reactions)
 		drained := b.drainReactions()
 		if len(msgs) > 0 || len(drained) > 0 {
 			return b.deliver(ctx, stream, msgs, drained), nil
 		}
 
-		// A pending question owns the click channel. Reading it here as well
-		// would mean a click could be taken by this goroutine and handed
-		// across to the question, and the question's own deadline cannot see
-		// a click that is still in transit. A nil channel blocks forever,
-		// which is exactly "leave those to the asker".
-		clicks := stream.Interactions()
-		if b.askPending() {
-			clicks = nil
+		// Only once there is nothing to hand over. Anything the dying
+		// connection had already delivered is in the queues above, and
+		// reporting the disconnection before taking it would throw away what
+		// the owner actually sent.
+		if b.streamGone(stream) {
+			return WaitResult{}, errors.New("the Slack connection closed")
 		}
 
 		select {
@@ -461,16 +446,11 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// any point during the poll, including the instant the timer fires
 			// and including from another call entirely, and reporting an empty
 			// timeout on top of one would hold it back for another full poll
-			// while the owner waits on a reply. The wire is swept here for the
-			// same reason it is swept at the top of the loop: a reaction ready
-			// at the same instant as the timer is one the agent can have now.
-			b.drainStream(stream, reactions)
-
+			// while the owner waits on a reply.
 			msgs, err := b.drainCatchUp(ctx)
 			if err != nil {
 				return WaitResult{}, err
 			}
-			b.drainStream(stream, reactions)
 			drained := b.drainReactions()
 			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
@@ -489,44 +469,8 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			}, nil
 
 		case <-sub:
-			// Something reached the queue. Round the loop to drain it.
-
-		case r, ok := <-reactions:
-			if !ok {
-				// The socket is gone. The events channel closing is what
-				// reports that; this one simply stops firing, so the select
-				// does not spin on a closed channel.
-				reactions = nil
-				continue
-			}
-			b.absorbReaction(r)
-
-		case in, ok := <-clicks:
-			if !ok {
-				b.drainStream(stream, reactions)
-				b.noteStreamClosed(stream)
-				return WaitResult{}, errors.New("the Slack connection closed")
-			}
-			// A click arriving while nobody is asking anything is answered by
-			// whoever is: routing it here keeps slack_wait from starving the
-			// click channel while it holds the connection.
-			b.routeInteraction(in)
-
-		case evt, ok := <-stream.Events():
-			if !ok {
-				// Whatever emoji are still buffered were received before the
-				// socket died, so they are kept for the next call rather than
-				// dying with the connection. The events channel is drained
-				// first even though it is the one that just closed: what is
-				// still in its buffer can be the mention a buffered reaction
-				// has to be judged against.
-				b.drainStream(stream, reactions)
-				b.noteStreamClosed(stream)
-				return WaitResult{}, errors.New("the Slack connection closed")
-			}
-			if err := b.absorb(evt); err != nil {
-				return WaitResult{}, err
-			}
+			// Something reached the queue, or the connection ended. Round the
+			// loop, which drains the first and reports the second.
 		}
 	}
 }
@@ -588,13 +532,10 @@ func (b *Bridge) noteStreamClosed(stream Stream) {
 	if b.stream == stream {
 		b.connected = false
 	}
-}
-
-// askPending reports whether a slack_ask question is waiting for a click.
-func (b *Bridge) askPending() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.ask != nil
+	// A blocked call is waiting for something to happen, and this is something:
+	// it rounds its loop, finds the queues empty and the connection gone, and
+	// says so instead of sitting out its whole timeout on a dead socket.
+	b.notifyPendingLocked()
 }
 
 // absorb folds one stream event into the bridge's pending state.
@@ -602,10 +543,16 @@ func (b *Bridge) askPending() bool {
 // Both slack_wait and slack_ask read the stream, so a message goes to the same
 // place whichever of them happened to pick it up: the queue the next
 // slack_wait drains.
-func (b *Bridge) absorb(evt StreamEvent) error {
+func (b *Bridge) absorb(evt StreamEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	b.absorbLocked(evt)
+}
+
+// absorbLocked is absorb for a caller that already holds b.mu, which is how a
+// reaction and the messages ahead of it are applied as one step.
+func (b *Bridge) absorbLocked(evt StreamEvent) {
 	switch evt.Kind {
 	case StreamMessage:
 		// The socket relays every owner message in every channel the bot is in,
@@ -613,7 +560,7 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 		// This is where that is decided.
 		msg, ok := b.classifyLocked(evt.Message)
 		if !ok {
-			return nil
+			return
 		}
 		if msg.Channel == "" || msg.Channel == b.cfg.Channel {
 			b.pending = append(b.pending, msg)
@@ -629,7 +576,6 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 		// history has to offer is exactly what a blocked call is waiting for.
 		b.notifyPendingLocked()
 	}
-	return nil
 }
 
 // drainCatchUp runs catch-up when it is due, merges the result with anything

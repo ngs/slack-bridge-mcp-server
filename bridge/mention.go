@@ -106,11 +106,6 @@ func (b *Bridge) openThreadLocked(channel, threadTS string) {
 		return
 	}
 	b.threads[key] = true
-	// A conversation opening changes what is in scope, and a reaction being
-	// held may have been waiting for exactly this. Whoever is blocked is told
-	// to go and drain, the same way a message reaching the queue tells them —
-	// otherwise a wait would sit out its whole timeout with a vote in hand.
-	b.notifyPendingLocked()
 
 	if b.store == nil {
 		return

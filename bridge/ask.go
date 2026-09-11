@@ -216,6 +216,16 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	defer deadline.Stop()
 
 	for {
+		// No click can reach this question once the socket is gone, so the
+		// buttons go with it rather than standing there inviting an answer
+		// nothing could carry. Checked before blocking as well as on every
+		// wakeup: the connection can have ended while the question was being
+		// posted, and the notification for that is already past.
+		if b.streamGone(stream) {
+			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			return AskResult{}, errors.New("the Slack connection closed")
+		}
+
 		select {
 		case <-sub:
 			if req.InterruptDisabled {
@@ -259,7 +269,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		case <-deadline.C:
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
-			if choice, ok := b.settleDeadline(ask, stream); ok {
+			if choice, ok := b.settleDeadline(ask); ok {
 				b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
 				b.startIndicator(channel, threadTS)
 				return AskResult{
@@ -285,32 +295,6 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, b.ctx.Err()
 
-		case in, ok := <-stream.Interactions():
-			if !ok {
-				b.drainStream(stream, reactionsOf(stream))
-				b.noteStreamClosed(stream)
-				// The click channel closes with the socket, and a closed
-				// channel is permanently ready — so this has to be handled
-				// here or the loop spins on it. No answer can arrive now.
-				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
-				return AskResult{}, errors.New("the Slack connection closed")
-			}
-			b.routeInteraction(in)
-
-		case evt, ok := <-stream.Events():
-			if !ok {
-				b.drainStream(stream, reactionsOf(stream))
-				b.noteStreamClosed(stream)
-				// The socket is gone, so no click can reach this call any
-				// more. The buttons have to go with it.
-				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
-				return AskResult{}, errors.New("the Slack connection closed")
-			}
-			// absorb routes the event: clicks reach this question, messages
-			// queue up for the next slack_wait.
-			if err := b.absorb(evt); err != nil {
-				return AskResult{}, err
-			}
 		}
 	}
 }
@@ -376,26 +360,6 @@ func (b *Bridge) adoptQuestion(ask *pendingAsk, ts string) {
 	}
 }
 
-// drainInteractions takes everything already queued on the interaction channel
-// and routes it, without waiting for more.
-//
-// The closed check is not a formality: a closed channel is permanently ready,
-// so without it this loop would never reach its default and would spin for
-// ever the moment the socket went away.
-func (b *Bridge) drainInteractions(stream Stream) {
-	for {
-		select {
-		case in, ok := <-stream.Interactions():
-			if !ok {
-				return
-			}
-			b.routeInteraction(in)
-		default:
-			return
-		}
-	}
-}
-
 // settleDeadline decides whether the question was answered after all.
 //
 // Three things can be true at the moment the timer fires: the answer is
@@ -410,10 +374,9 @@ func (b *Bridge) drainInteractions(stream Stream) {
 // outright. It is not worth the machinery here: slack_wait already leaves the
 // channel alone while a question is pending, so a competing reader only exists
 // for the instant between the two.
-func (b *Bridge) settleDeadline(ask *pendingAsk, stream Stream) (int, bool) {
+func (b *Bridge) settleDeadline(ask *pendingAsk) (int, bool) {
 	deadline := time.Now().Add(deadlineSettleWindow)
 	for {
-		b.drainInteractions(stream)
 		if choice, ok := b.lastChance(ask); ok {
 			return choice, true
 		}
