@@ -175,7 +175,7 @@ intended rather than a problem. [docs/setup.md](docs/setup.md) covers the rest o
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel", "files"?}…], "timed_out": false}`, oldest first, plus `reactions` when any emoji arrived: `[{"ts", "channel", "user", "user_name", "reaction", "added", "event_ts"}…]`. On timeout, `{"messages": [], "timed_out": true}`. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel", "files"?}…], "timed_out": false}`, oldest first, plus `reactions` when any emoji arrived: `[{"ts", "channel", "user", "user_name", "reaction", "added", "event_ts"}…]`, plus `reactions_dropped: true` when some were lost. On timeout, `{"messages": [], "timed_out": true}`. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `{"ts", "channel"}` — where the message landed |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | Confirmation. Receipt is marked automatically, so this is for a deliberate signal beyond it. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | `{"choice_index", "choice_label", "ts", "timed_out": false}`. On timeout, `{"choice_index": -1, "timed_out": true}`. When a message ends the question instead of a click, `{"choice_index": -1, "interrupted": true}`. Every settled outcome also carries `messages`: whatever the owner said while the question was up, delivered as `slack_wait` would have. |
@@ -357,7 +357,11 @@ its own.
 
 **Reactions are live only.** They are in no history and have no cursor, so one
 added while the session was down is delivered to nobody — unlike a message,
-which catch-up recovers. When the standing count is what matters, ask for it:
+which catch-up recovers. The same is true of a burst too large for the queue,
+and that case says so: `reactions_dropped: true` on a result means some emoji
+were received and lost, and any count kept from the stream alone is now wrong.
+
+When the standing count is what matters, ask for it:
 
 ```json
 {"reactions": [{"name": "white_check_mark", "count": 2,

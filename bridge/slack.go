@@ -205,6 +205,11 @@ type ReactionStream interface {
 	// Reactions delivers emoji added to and removed from messages until the
 	// stream's context is done, at which point the channel is closed.
 	Reactions() <-chan Reaction
+	// ReactionsDropped reports whether any reaction was lost since it was last
+	// asked, and clears the record. A lost reaction is in no history, so the
+	// only honest thing to do with one is say so: the wait passes the answer
+	// on, and the agent reads the tally back with slack_reactions.
+	ReactionsDropped() bool
 }
 
 // reactionsOf returns a stream's reaction channel, or nil if it has none. A nil
@@ -216,6 +221,16 @@ func reactionsOf(stream Stream) <-chan Reaction {
 		return nil
 	}
 	return rs.Reactions()
+}
+
+// reactionsDropped asks a stream whether it lost any emoji since it was last
+// asked. A stream with no reaction half never loses one.
+func reactionsDropped(stream Stream) bool {
+	rs, ok := stream.(ReactionStream)
+	if !ok {
+		return false
+	}
+	return rs.ReactionsDropped()
 }
 
 // Connector opens both halves of the Slack connection. Connect is called

@@ -557,3 +557,53 @@ func TestAMessageAndAReactionArriveInOneDelivery(t *testing.T) {
 			len(result.Messages), len(result.Reactions))
 	}
 }
+
+// Slack redelivers any envelope it is not acknowledged for, and the
+// acknowledgement can fail. A message survives that because history merges by
+// timestamp; a reaction has no history and no merge, so the same vote would be
+// counted twice unless the stream remembers it.
+func TestARedeliveredReactionIsQueuedOnce(t *testing.T) {
+	stream := newTestStream(4)
+
+	envelope := reactionEnvelope(t, "reaction_added", colleague, "white_check_mark")
+	stream.handle(func(socketmode.Request) {}, envelope)
+	stream.handle(func(socketmode.Request) {}, envelope)
+
+	if len(stream.reactions) != 1 {
+		t.Fatalf("queued %d reactions, want 1: the redelivery is the same event", len(stream.reactions))
+	}
+
+	// The same person taking the emoji off is a different action, and has to
+	// get through.
+	stream.handle(func(socketmode.Request) {}, reactionEnvelope(t, "reaction_removed", colleague, "white_check_mark"))
+	if len(stream.reactions) != 2 {
+		t.Errorf("queued %d reactions, want the removal through as well", len(stream.reactions))
+	}
+}
+
+// A reaction that did not fit in the queue is gone, and no history brings it
+// back. The one honest thing left is to say so, so the agent knows its count is
+// wrong and reads the tally back.
+func TestADroppedReactionIsReportedToTheAgent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	stream.reactionsDropped.Store(true)
+
+	// Nothing else to hand over: a timeout is exactly when the loss would
+	// otherwise go unmentioned.
+	result := waitOnce(ctx, t, b)
+	if !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout", result)
+	}
+	if !result.ReactionsDropped {
+		t.Error("reactions_dropped = false after the queue overflowed; the agent is left counting a tally it cannot know is wrong")
+	}
+
+	// And it is reported once: the record is cleared by the call that carried
+	// it, so the next wait is not still complaining about an old loss.
+	if result := waitOnce(ctx, t, b); result.ReactionsDropped {
+		t.Error("reactions_dropped = true on the next wait as well; the loss was already reported")
+	}
+}

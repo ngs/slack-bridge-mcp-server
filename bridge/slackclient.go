@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/slack-go/slack"
@@ -26,6 +29,17 @@ const liveEventBuffer = 64
 // reaction the agent never sees — recoverable with slack_reactions, but only if
 // it thinks to ask.
 const liveReactionBuffer = 256
+
+// reactionDedupWindow is how many recent reactions are remembered so a
+// redelivered envelope is not queued twice. Slack redelivers anything it is not
+// acknowledged for, and an acknowledgement can fail: the ack goes out before the
+// event is handled, and nothing downstream hears whether it landed. Messages
+// survive that because history merges them by timestamp; a reaction has no
+// history and no merge, so a consumer counting votes would count one twice.
+//
+// A thousand is far past any burst a decision post produces, and the whole
+// window is one small map.
+const reactionDedupWindow = 1024
 
 // liveInteractionBuffer is the click queue. It is small because clicks are
 // rare — at most one question is outstanding at a time — and separate because
@@ -441,6 +455,16 @@ type socketModeStream struct {
 	interactions chan Interaction
 	reactions    chan Reaction
 	owner        string
+	// reactionsDropped records that a reaction did not fit in the queue. It is
+	// sticky and read by the wait, which passes it to the agent: a lost vote
+	// that nobody is told about is a count quietly wrong, where one that is
+	// reported is a slack_reactions call away from being right.
+	reactionsDropped atomic.Bool
+	// seenReactions remembers what has already been queued, against
+	// redelivery. Access is guarded because the tests drive handle directly.
+	seenReactionsMu sync.Mutex
+	seenReactions   map[string]struct{}
+	seenReactionsIn []string
 	// botUserID is this app's own user ID, learned when the connection opened.
 	// It is here, rather than only on the bridge, so the receipt reactions the
 	// bridge itself adds are discarded before they take space in the queue: a
@@ -459,6 +483,11 @@ func (s *socketModeStream) Events() <-chan StreamEvent { return s.events }
 func (s *socketModeStream) Interactions() <-chan Interaction { return s.interactions }
 
 func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
+
+// ReactionsDropped reports whether any reaction was lost since the last time it
+// was asked, and clears the record. It is a question the wait asks on its way
+// to handing a batch over.
+func (s *socketModeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
 	defer close(s.events)
@@ -715,11 +744,43 @@ func (s *socketModeStream) emitInteraction(in Interaction) {
 // click it can still be recovered deliberately, by asking reactions.get for the
 // tally, which is what the message says to do.
 func (s *socketModeStream) emitReaction(r Reaction) {
+	if s.alreadySeen(r) {
+		return
+	}
 	select {
 	case s.reactions <- r:
 	default:
+		s.reactionsDropped.Store(true)
 		log.Printf("dropped a reaction because nothing was reading them; read the tally with slack_reactions if you are counting")
 	}
+}
+
+// alreadySeen reports whether this exact reaction has been queued before, and
+// records it if not.
+//
+// The key is the whole event: who reacted, with what, to which message, when,
+// and whether it went on or came off. A redelivery repeats all of it, while two
+// genuinely different actions differ in at least the timestamp — so this drops
+// duplicates without ever swallowing a vote somebody actually cast.
+func (s *socketModeStream) alreadySeen(r Reaction) bool {
+	key := strings.Join([]string{r.User, r.Reaction, r.Channel, r.TS, r.EventTS, strconv.FormatBool(r.Added)}, "\x00")
+
+	s.seenReactionsMu.Lock()
+	defer s.seenReactionsMu.Unlock()
+
+	if _, ok := s.seenReactions[key]; ok {
+		return true
+	}
+	if s.seenReactions == nil {
+		s.seenReactions = make(map[string]struct{}, reactionDedupWindow)
+	}
+	s.seenReactions[key] = struct{}{}
+	s.seenReactionsIn = append(s.seenReactionsIn, key)
+	if len(s.seenReactionsIn) > reactionDedupWindow {
+		delete(s.seenReactions, s.seenReactionsIn[0])
+		s.seenReactionsIn = s.seenReactionsIn[1:]
+	}
+	return false
 }
 
 // emit queues an event, recording an overflow rather than blocking the

@@ -138,6 +138,10 @@ met, keep waiting — a decision post is not a timer.
 Ask for a reaction only when you have said what each emoji means and who has to
 supply it. "React if you agree" collects nothing you can act on.
 
+If a result carries `reactions_dropped: true`, emoji were received and lost —
+more arrived at once than the queue could hold. Which ones is unknowable, so
+treat any count you are keeping as wrong and read it back, as below.
+
 ### After a gap, read the tally instead of trusting the stream
 
 Reactions are live only. They are in no history, and nothing replays them: an

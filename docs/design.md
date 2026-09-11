@@ -388,6 +388,15 @@ single answer, and an overflow is logged pointing at `slack_reactions` — the
 one recovery a dropped reaction has, and the reason its loss is recoverable
 where a click's is not.
 
+A reaction that still does not fit is reported rather than swallowed:
+`slack_wait` answers `reactions_dropped: true`, once, on the first result after
+the loss. A silently wrong count is worse than a count the agent knows to go
+and check, and `slack_reactions` is how it checks. The stream also remembers the
+reactions it has queued, because Slack redelivers any envelope it is not
+acknowledged for and an acknowledgement can fail: a message survives that
+through the history merge, and a reaction, having no history, would be counted
+twice.
+
 Both channels are optional halves of the `Stream` interface, reached by type
 assertion. `Stream`, `API` and `Connector` are exported, so requiring a new
 method on them would break anything outside this repository that implements

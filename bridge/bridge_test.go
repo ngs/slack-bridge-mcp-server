@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -366,6 +367,8 @@ type fakeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
 	reactions    chan Reaction
+	// reactionsDropped stands in for a queue that overflowed.
+	reactionsDropped atomic.Bool
 }
 
 func newFakeStream() *fakeStream {
@@ -381,6 +384,8 @@ func (s *fakeStream) Events() <-chan StreamEvent { return s.events }
 func (s *fakeStream) Interactions() <-chan Interaction { return s.interactions }
 
 func (s *fakeStream) Reactions() <-chan Reaction { return s.reactions }
+
+func (s *fakeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
 // fakeConnector hands out a fixed API and stream, and records how often it was
 // asked to connect.

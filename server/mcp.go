@@ -54,7 +54,9 @@ conversation you can see, from anybody and not only the owner, which is how a po
 people to vote on tells you the votes. They arrive in a reactions array beside the messages,
 and either one on its own ends the wait. Reactions are live-only — one added while the
 session was down is delivered to nobody — so when the standing tally matters, read it with
-slack_reactions rather than assuming you saw every emoji.
+slack_reactions rather than assuming you saw every emoji. The same goes when a result
+carries reactions_dropped: some emoji did not fit the queue and are gone, so any count you
+are keeping is wrong until you read it back.
 When slack_wait returns timed_out, simply call it again to keep the conversation open.
 When the owner asks you to read the channel — to summarise a discussion, or catch up on what
 was said — use slack_history, which returns everyone's messages and not just theirs. Treat
@@ -146,7 +148,7 @@ func New(b *bridge.Bridge) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "slack_wait",
 		Title:       "Wait for a Slack message or reaction",
-		Description: "Block until the owner sends a message or somebody reacts to one, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. A message the owner attached something to carries a files array describing it — the metadata, not the bytes, which you fetch from url_private with the bot token if you need them. Emoji come back in a reactions array beside the messages, from anybody and not only the owner, so a post you asked people to answer with a reaction tells you the answers; either kind on its own ends the wait. Returns any messages missed while the session was down; reactions are live only, and slack_reactions reads back the ones that were missed. Marks messages it delivers as received, and starts the progress indicator, so it is not a read-only call.",
+		Description: "Block until the owner sends a message or somebody reacts to one, or the timeout expires. Delivers from the home channel and from any conversation they opened by mentioning you elsewhere; each message says which channel it came from. A message the owner attached something to carries a files array describing it — the metadata, not the bytes, which you fetch from url_private with the bot token if you need them. Emoji come back in a reactions array beside the messages, from anybody and not only the owner, so a post you asked people to answer with a reaction tells you the answers; either kind on its own ends the wait. Returns any messages missed while the session was down; reactions are live only, and slack_reactions reads back the ones that were missed. A result with reactions_dropped true means some emoji were lost outright: re-read any tally you are counting. Marks messages it delivers as received, and starts the progress indicator, so it is not a read-only call.",
 		// Not ReadOnlyHint: delivering messages reacts to them and starts the
 		// elapsed-time indicator, both of which write to the channel. A client
 		// may use that hint to decide what to allow without asking.

@@ -355,7 +355,12 @@ type WaitResult struct {
 	// so a caller that only knows about messages reads the same result it
 	// always did.
 	Reactions []Reaction `json:"reactions,omitempty"`
-	TimedOut  bool       `json:"timed_out"`
+	// ReactionsDropped reports that at least one reaction was received and
+	// could not be queued, so the emoji delivered here are not the whole story.
+	// There is no way to recover which: read the tally of anything you are
+	// counting with slack_reactions. Absent means nothing was lost.
+	ReactionsDropped bool `json:"reactions_dropped,omitempty"`
+	TimedOut         bool `json:"timed_out"`
 }
 
 // Wait blocks until at least one owner message is available or the timeout
@@ -414,7 +419,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		}
 		drained := b.drainReactions()
 		if len(msgs) > 0 || len(drained) > 0 {
-			return b.deliver(ctx, msgs, drained), nil
+			return b.deliver(ctx, stream, msgs, drained), nil
 		}
 
 		// A pending question owns the click channel. Reading it here as well
@@ -447,9 +452,16 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				// timed_out of true alongside messages would be read as "call
 				// again", which is the one thing that must not happen to
 				// messages already handed over.
-				return b.deliver(ctx, msgs, drained), nil
+				return b.deliver(ctx, stream, msgs, drained), nil
 			}
-			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
+			return WaitResult{
+				Messages: []Message{},
+				// A wait with nothing to hand over still has to say a
+				// reaction was lost: that is precisely when the agent's count
+				// is wrong and nothing else would tell it.
+				ReactionsDropped: reactionsDropped(stream),
+				TimedOut:         true,
+			}, nil
 
 		case <-sub:
 			// Something reached the queue. Round the loop to drain it.
@@ -510,7 +522,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 // The indicator is started where the owner is looking: the newest message is
 // the one they just sent, so its channel and thread are the conversation they
 // are waiting on.
-func (b *Bridge) deliver(ctx context.Context, msgs []Message, reactions []Reaction) WaitResult {
+func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, reactions []Reaction) WaitResult {
 	// Only messages start the clock. A reaction is not something the owner is
 	// waiting on an answer to, and marking one as received would put a receipt
 	// emoji on a message for every emoji anybody else put on it.
@@ -518,7 +530,11 @@ func (b *Bridge) deliver(ctx context.Context, msgs []Message, reactions []Reacti
 		b.startIndicator(newestConversation(msgs))
 		b.autoAck(msgs)
 	}
-	return WaitResult{Messages: msgs, Reactions: b.nameReactions(ctx, reactions)}
+	return WaitResult{
+		Messages:         msgs,
+		Reactions:        b.nameReactions(ctx, reactions),
+		ReactionsDropped: reactionsDropped(stream),
+	}
 }
 
 // noteStreamClosed records that the live connection is gone, but only if the
