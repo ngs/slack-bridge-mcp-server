@@ -5,22 +5,7 @@ import (
 	"time"
 )
 
-// stateWrite is one change to the state file, as the writer receives it.
-//
-// The kinds are the three cursors the bridge keeps: how far the home channel
-// has been read, how far each conversation outside it has been read (and that
-// it is open at all), and how far the search for missed mentions has looked.
-type stateWrite struct {
-	kind    stateWriteKind
-	channel string
-	// threadTS names the conversation for a thread write, and is empty for the
-	// other kinds.
-	threadTS string
-	// ts is the cursor being recorded: a message timestamp, or empty for a
-	// conversation that is being opened rather than read.
-	ts string
-}
-
+// stateWriteKind names the cursors the bridge keeps in the state file.
 type stateWriteKind int
 
 const (
@@ -33,10 +18,24 @@ const (
 	writeMentionCursor
 )
 
-// stateWriteBuffer is how many changes can be waiting to reach the state file.
-// Each is a few bytes of cursor, and the queue only grows behind a disk that has
-// stopped answering.
-const stateWriteBuffer = 256
+// stateKey identifies what a change is about, so that two changes to the same
+// thing collapse into the later one.
+type stateKey struct {
+	kind     stateWriteKind
+	channel  string
+	threadTS string
+}
+
+// stateWrite is one change to the state file.
+type stateWrite struct {
+	stateKey
+	// ts is the cursor being recorded: a message timestamp, or empty for a
+	// conversation being opened rather than read.
+	ts string
+	// remove marks a conversation the bridge has given up on, which is a
+	// deletion rather than a cursor.
+	remove bool
+}
 
 // stateWriteFlushWait is how long Close waits for the writer to finish what it
 // has. It is short: the writes are small and local, and a disk that cannot
@@ -52,63 +51,85 @@ const stateWriteFlushWait = 2 * time.Second
 // stops the only reader of the connection, and the click and reaction buffers
 // behind it are the ones nothing can recover.
 //
-// The queue is bounded and the send never blocks. A change that does not fit is
-// dropped with a line saying so: every one of them costs at most some repeated
-// work after a restart, which is the same price a failed write has always had.
+// Changes are held in a map rather than a queue, keyed by what they are about.
+// Nothing is ever dropped for want of room: a second cursor for the same
+// channel replaces the first, which is exactly what writing them in order would
+// have left behind anyway, and the number of distinct things is the number of
+// conversations the session has open.
 func (b *Bridge) recordStateWriteLocked(w stateWrite) {
 	if b.store == nil {
 		return
 	}
-	if b.stateWrites == nil {
-		b.stateWrites = make(chan stateWrite, stateWriteBuffer)
+	if b.stateDirty == nil {
+		b.stateDirty = make(map[stateKey]stateWrite)
+		b.stateWake = make(chan struct{}, 1)
 		b.stopStateWrites = make(chan struct{})
 		b.stateWritesDone = make(chan struct{})
-		go writeState(b.store, b.stateWrites, b.stopStateWrites, b.stateWritesDone)
+		go b.writeState(b.store, b.stateWake, b.stopStateWrites, b.stateWritesDone)
 	}
 
+	b.stateDirty[w.stateKey] = w
 	select {
-	case b.stateWrites <- w:
+	case b.stateWake <- struct{}{}:
 	default:
-		log.Printf("could not queue a cursor for the state file; it will not survive a restart")
+		// Already awake. One signal and two mean the same instruction, which
+		// is to come and take whatever is there.
 	}
+}
+
+// takeStateWrites hands back everything waiting, leaving the map empty.
+func (b *Bridge) takeStateWrites() []stateWrite {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.stateDirty) == 0 {
+		return nil
+	}
+	writes := make([]stateWrite, 0, len(b.stateDirty))
+	for _, w := range b.stateDirty {
+		writes = append(writes, w)
+	}
+	b.stateDirty = make(map[stateKey]stateWrite)
+	return writes
 }
 
 // writeState is the only goroutine that writes the state file.
 //
-// One writer keeps the changes in the order they were made, which matters
-// because two of them can name the same cursor, and keeps every one of them off
-// the paths that must not wait for a disk.
+// One writer keeps the changes off every path that must not wait for a disk,
+// and makes the file's contents the business of one place rather than five.
 //
-// It drains what is queued before it returns, so a session that ends with
+// It writes what is waiting before it returns, so a session that ends with
 // changes outstanding still records them.
-func writeState(store *Store, writes <-chan stateWrite, stop <-chan struct{}, done chan<- struct{}) {
+func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
+
+	flush := func() {
+		for _, w := range b.takeStateWrites() {
+			applyStateWrite(store, w)
+		}
+	}
 
 	for {
 		select {
-		case w := <-writes:
-			applyStateWrite(store, w)
+		case <-wake:
+			flush()
 		case <-stop:
-			for {
-				select {
-				case w := <-writes:
-					applyStateWrite(store, w)
-				default:
-					return
-				}
-			}
+			flush()
+			return
 		}
 	}
 }
 
 func applyStateWrite(store *Store, w stateWrite) {
 	var err error
-	switch w.kind {
-	case writeLastTS:
-		err = store.SetLastTS(w.channel, w.ts)
-	case writeThread:
+	switch {
+	case w.kind == writeThread && w.remove:
+		err = store.RemoveThread(w.channel, w.threadTS)
+	case w.kind == writeThread:
 		err = store.SetThread(w.channel, w.threadTS, w.ts)
-	case writeMentionCursor:
+	case w.kind == writeLastTS:
+		err = store.SetLastTS(w.channel, w.ts)
+	case w.kind == writeMentionCursor:
 		err = store.SetMentionCursor(w.ts)
 	}
 	if err != nil {

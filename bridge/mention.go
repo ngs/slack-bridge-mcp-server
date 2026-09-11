@@ -110,7 +110,7 @@ func (b *Bridge) openThreadLocked(channel, threadTS string) {
 	if b.store == nil {
 		return
 	}
-	b.recordStateWriteLocked(stateWrite{kind: writeThread, channel: channel, threadTS: threadTS})
+	b.recordStateWriteLocked(stateWrite{stateKey: stateKey{kind: writeThread, channel: channel, threadTS: threadTS}})
 }
 
 // loadThreadsLocked restores the conversations open when the last session
@@ -415,9 +415,10 @@ func (b *Bridge) closeThread(key threadKey) {
 	if b.store == nil {
 		return
 	}
-	if err := b.store.RemoveThread(key.channel, key.threadTS); err != nil {
-		log.Printf("could not forget a closed conversation thread: %v", err)
-	}
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeThread, channel: key.channel, threadTS: key.threadTS},
+		remove:   true,
+	})
 }
 
 // noteMentionCursor records how far the search for mentions has looked.
@@ -439,5 +440,5 @@ func (b *Bridge) advanceMentionCursorLocked(ts string) {
 	}
 	// The cost of losing this is a repeated scan of a window already read,
 	// which the thread cursors then filter out.
-	b.recordStateWriteLocked(stateWrite{kind: writeMentionCursor, ts: ts})
+	b.recordStateWriteLocked(stateWrite{stateKey: stateKey{kind: writeMentionCursor}, ts: ts})
 }

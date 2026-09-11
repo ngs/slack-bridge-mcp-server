@@ -124,12 +124,15 @@ type Bridge struct {
 	// waits on it before the state writer is stopped, so a cursor the pump was
 	// in the middle of recording still reaches the file.
 	pumpDone chan struct{}
-	// stateWrites carries cursor changes to the goroutine that owns the state
-	// file. Nothing writes that file from under b.mu: it is the lock the pump
-	// holds while it applies what the socket delivered, and a slow disk beneath
-	// it stops the only reader the connection has. stopStateWrites tells the
-	// writer to flush and stop; stateWritesDone closes once it has.
-	stateWrites     chan stateWrite
+	// stateDirty holds the cursor changes that have not reached the state file,
+	// keyed so that a later change to the same thing replaces an earlier one.
+	// Nothing writes that file from under b.mu: it is the lock the pump holds
+	// while it applies what the socket delivered, and a slow disk beneath it
+	// stops the only reader the connection has. stateWake tells the writer
+	// there is something to take, stopStateWrites tells it to flush and stop,
+	// and stateWritesDone closes once it has.
+	stateDirty      map[stateKey]stateWrite
+	stateWake       chan struct{}
 	stopStateWrites chan struct{}
 	stateWritesDone chan struct{}
 	threadCursors   map[threadKey]string
@@ -806,13 +809,20 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 
 	if len(home) > 0 {
 		newest := home[len(home)-1].TS
+		// Never backwards. On the run that seeds the cursor, a message the pump
+		// took while history was being read can be older than the seed, and
+		// moving the cursor back to it would have the next reconnect re-read
+		// the channel's past.
+		if tsLess(newest, b.lastTS) {
+			newest = b.lastTS
+		}
 		if b.store != nil {
-			if err := b.store.SetLastTS(channel, newest); err != nil {
-				// Keep the messages rather than dropping them: a stale cursor
-				// costs a duplicate after a restart, losing them costs the
-				// owner a reply.
-				log.Printf("could not persist the cursor: %v", err)
-			}
+			// A stale cursor costs a duplicate after a restart; the messages
+			// reach the agent either way.
+			b.recordStateWriteLocked(stateWrite{
+				stateKey: stateKey{kind: writeLastTS, channel: channel},
+				ts:       newest,
+			})
 		}
 		b.lastTS = newest
 	}
@@ -874,9 +884,10 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	if b.store == nil {
 		return
 	}
-	if err := b.store.SetThread(m.Channel, m.ThreadTS, m.TS); err != nil {
-		log.Printf("could not persist a conversation cursor: %v", err)
-	}
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeThread, channel: m.Channel, threadTS: m.ThreadTS},
+		ts:       m.TS,
+	})
 }
 
 // seedCursor records where the conversation already is, without returning any
@@ -909,10 +920,13 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 	if ts == "" {
 		return "", nil
 	}
-	if b.store != nil && ts != "" {
-		if err := b.store.SetLastTS(channel, ts); err != nil {
-			log.Printf("could not persist the initial cursor: %v", err)
-		}
+	if ts != "" {
+		b.mu.Lock()
+		b.recordStateWriteLocked(stateWrite{
+			stateKey: stateKey{kind: writeLastTS, channel: channel},
+			ts:       ts,
+		})
+		b.mu.Unlock()
 	}
 	return ts, nil
 }

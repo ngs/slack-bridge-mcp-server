@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -153,7 +154,7 @@ func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	b, _, _ := mentionBridge(ctx, t)
+	b, _, stream := mentionBridge(ctx, t)
 
 	// Open the connection, so the bridge knows its own user ID and can
 	// recognise the mention below.
@@ -168,7 +169,7 @@ func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 		TS: "200.000100", Channel: otherChannel, User: testOwner, Text: mention("ship it?"),
 	}}
 
-	b.applyReaction(events, Reaction{
+	b.applyReaction(stream, events, Reaction{
 		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "white_check_mark", Added: true,
 	})
 
@@ -439,6 +440,9 @@ func TestAMessageArrivingDuringTheInitialSeedIsDelivered(t *testing.T) {
 
 	eventually(t, "the seed to reach Slack", func() bool { return len(api.calls()) > 0 })
 	send(stream, testChannel, "100.000150", "", "sent while the cursor was being seeded")
+	// Taken by the pump before the seed comes back, which is the case this is
+	// about: the message is in hand when the cursor is established.
+	eventually(t, "the pump to take it", func() bool { return b.Status().PendingBacklogCount > 0 })
 	close(gate)
 
 	select {
@@ -449,4 +453,78 @@ func TestAMessageArrivingDuringTheInitialSeedIsDelivered(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Wait() never returned")
 	}
+}
+
+// Cancelling a connection does not stop its pump the instant it is called: the
+// goroutine can be inside a select with a buffered channel ready. What it must
+// not do is apply one more event after a replacement connection is installed —
+// the single owner would then be two of them, writing into the same queues.
+func TestAReplacedConnectionsPumpAppliesNothingMore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	connector := &reconnectingConnector{api: api, streams: []*fakeStream{newFakeStream(), newFakeStream()}}
+	b := New(ctx, cfg, connector)
+	t.Cleanup(func() { _ = b.Close() })
+
+	old := connector.streams[0]
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// The connection dies, its pump records it, and the next call opens the
+	// replacement.
+	close(old.events)
+	eventually(t, "the pump to record the disconnection", func() bool { return !b.Status().Connected })
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on the replacement", result)
+	}
+	if !b.Status().Connected {
+		t.Fatal("the replacement connection was never opened")
+	}
+
+	// Anything still on the old stream belongs to a connection nobody owns.
+	old.reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "tada", Added: true}
+	send(connector.streams[1], testChannel, "100.000600", "", "on the live connection")
+
+	result := waitOnce(ctx, t, b)
+	if len(result.Messages) != 1 || result.Messages[0].TS != "100.000600" {
+		t.Fatalf("Wait() returned %v, want only what the live connection delivered", texts(result.Messages))
+	}
+	if len(result.Reactions) != 0 {
+		t.Errorf("Wait() returned %+v from a connection that had been replaced", result.Reactions)
+	}
+}
+
+// reconnectingConnector hands out a fresh stream for each connection, the way
+// the real one does.
+type reconnectingConnector struct {
+	api     *fakeAPI
+	streams []*fakeStream
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *reconnectingConnector) Connect(context.Context, Config) (API, Stream, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stream := c.streams[len(c.streams)-1]
+	if c.calls < len(c.streams) {
+		stream = c.streams[c.calls]
+	}
+	c.calls++
+	return c.api, stream, nil
 }

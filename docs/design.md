@@ -470,7 +470,11 @@ about what another call's connection just received.
 
 **Ordering.** Messages first, always: the pump applies everything waiting on the
 events channel before it will take a reaction at all, and it applies the pair it
-does take as one step, under one lock. Both directions matter: whichever
+does take as one step, under one lock. Every sweep is bounded, so a flood cannot
+hold the lock indefinitely — and a sweep that comes back at its bound defers the
+reactions rather than applying them, since there may still be a mention behind
+what it took. A flood defers reactions and nothing else: clicks keep no order
+with messages, and shutdown is answered throughout. Both directions matter: whichever
 channel the select happens to pick, the other is already there, so a delivery
 that has both hands over both instead of splitting them across two calls on a
 coin toss. The ordering rule already existed, but it could not be relied upon
@@ -511,8 +515,17 @@ way.
 **Lifetime.** A connection gets a context of its own, bounded by the session's.
 Cancelling it stops everything that connection started — the pump, and the
 Socket Mode goroutines the connector runs — and it is cancelled before a
-replacement connection starts and by `Close`. Two pumps can never write into the
-same queues, and a replaced connection cannot hold a socket open behind one.
+replacement connection starts and by `Close`. Cancelling is not instant: a pump
+can be inside a select with a buffered channel ready, so it also checks that its
+stream is still the bridge's before applying anything. A replaced connection
+cannot write into the queues, nor hold a socket open behind the reader that
+replaced it.
+
+`Close` stops the connection, waits for the pump, and only then stops the state
+writer. In that order, because a pump still running can record one more cursor,
+and a writer already stopped would leave it in a queue nobody is reading. Both
+waits are bounded: shutdown may be delayed by a slow disk and must not be
+prevented by one.
 
 **Bounds and backpressure.** The pump never blocks on anything slow. Applying an
 event takes the bridge lock for the length of a slice append; catch-up, which

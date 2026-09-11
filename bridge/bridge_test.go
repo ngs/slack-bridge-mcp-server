@@ -522,9 +522,12 @@ func TestFirstWaitReturnsTheBacklogMissedWhileDown(t *testing.T) {
 	if got := b.Status().LastTS; got != "100.000300" {
 		t.Errorf("last_ts = %q, want 100.000300", got)
 	}
-	if got, _ := store.LastTS(testChannel); got != "100.000300" {
-		t.Errorf("persisted last_ts = %q, want 100.000300 so a restart does not replay", got)
-	}
+	// The state file is written by a goroutine of its own, off the paths that
+	// must not wait for a disk, so it catches up a moment after the delivery.
+	eventually(t, "the cursor to reach the state file", func() bool {
+		got, _ := store.LastTS(testChannel)
+		return got == "100.000300"
+	})
 
 	// Nothing new has happened, so the next wait should block rather than
 	// hand the same messages over again.

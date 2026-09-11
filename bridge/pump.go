@@ -34,22 +34,35 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 
 	for {
 		// Messages first, always. The sweep is bounded, so a channel refilled
-		// as fast as it is emptied leaves some behind — and if a reaction were
-		// taken while a mention was still sitting there, it would be judged
-		// against a conversation that had not opened yet. Going round again
-		// instead means the reactions are only reached when nothing is waiting
-		// ahead of them.
-		if b.applyReadyEvents(events, reactions) == maxSweep {
+		// as fast as it is emptied leaves some behind — and a reaction taken
+		// while a mention was still sitting there would be judged against a
+		// conversation that had not opened yet. Going round again instead
+		// means the reactions are reached only when nothing is waiting ahead
+		// of them.
+		if b.applyReadyEvents(stream, events, reactions) == maxSweep {
+			// A flood defers the reactions, and nothing else. Clicks have no
+			// order to keep with messages and no history to be recovered from,
+			// and a shutdown that waited for the flood to end would be a
+			// shutdown that did not happen.
+			b.drainReadyClicks(stream, clicks)
+			select {
+			case <-ctx.Done():
+				b.endStream(stream, events, clicks, reactions)
+				return
+			default:
+			}
 			continue
 		}
 
 		select {
 		case <-ctx.Done():
-			// The session ended, or this connection was replaced. Either way
-			// nothing is reading the socket from here, and a call blocked on a
-			// context of its own would otherwise wait out its whole timeout on
-			// a stream with no reader.
-			b.noteStreamClosed(stream)
+			// The session ended, or this connection was replaced. What the
+			// connection had already delivered is taken first — it was
+			// received, and the clicks among it are answers nothing can
+			// recover — and then the closure is recorded, so a call blocked on
+			// a context of its own is told rather than left waiting on a
+			// stream with no reader.
+			b.endStream(stream, events, clicks, reactions)
 			return
 
 		case evt, ok := <-events:
@@ -57,7 +70,7 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 				b.endStream(stream, events, clicks, reactions)
 				return
 			}
-			b.applyEvent(evt, events, reactions)
+			b.applyEvent(stream, evt, events, reactions)
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -71,7 +84,7 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 				b.endStream(stream, events, clicks, reactions)
 				return
 			}
-			b.applyReaction(events, r)
+			b.applyReaction(stream, events, r)
 		}
 	}
 }
@@ -79,19 +92,51 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 // applyReadyEvents applies every message already waiting, with any reactions
 // that are ready behind them, and reports how many messages it took. Reaching
 // the bound is how the caller knows there may be more.
-func (b *Bridge) applyReadyEvents(events <-chan StreamEvent, reactions <-chan Reaction) int {
+func (b *Bridge) applyReadyEvents(stream Stream, events <-chan StreamEvent, reactions <-chan Reaction) int {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(stream) {
+		return 0
+	}
+
 	applied := 0
 	drainLocked(events, maxSweep, func(evt StreamEvent) {
 		b.absorbLocked(evt)
 		applied++
 	})
-	if applied > 0 {
+	// Only once the events are exhausted. At the bound there may be more
+	// waiting, and a reaction applied ahead of them is a reaction judged
+	// against a scope those messages have not had their say in.
+	if applied > 0 && applied < maxSweep {
 		drainLocked(reactions, maxSweep, b.absorbReactionLocked)
 	}
-	b.mu.Unlock()
-
 	return applied
+}
+
+// drainReadyClicks routes every click already waiting. Clicks keep no order
+// with messages, so this is safe at any point — including in the middle of a
+// flood, which is the one time it matters.
+func (b *Bridge) drainReadyClicks(stream Stream, clicks <-chan Interaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(stream) {
+		return
+	}
+	drainLocked(clicks, maxSweep, b.deliverInteraction)
+}
+
+// stale reports whether this pump's connection has already been replaced. The
+// caller must hold b.mu.
+//
+// Cancelling a connection does not stop its pump the instant it is called: the
+// goroutine may be inside a select with a buffered channel ready. Without this
+// it could apply one more event from the old connection after the replacement
+// was installed, which is the one thing having a single owner is for. What it
+// drops is re-read by the new connection's catch-up.
+func (b *Bridge) stale(stream Stream) bool {
+	return b.stream != stream
 }
 
 // applyEvent applies one message together with any reactions already on the
@@ -105,16 +150,22 @@ func (b *Bridge) applyReadyEvents(events <-chan StreamEvent, reactions <-chan Re
 //
 // Messages first within the pair, as always — the mention that opens a
 // conversation has to be applied before a reaction is judged against it.
-func (b *Bridge) applyEvent(evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction) {
+func (b *Bridge) applyEvent(stream Stream, evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(stream) {
+		return
+	}
+
 	b.absorbLocked(evt)
 	// The rest of the ready events before any reaction, not just this one. The
 	// events channel is in order, so a reaction on a mention two places behind
 	// the one just taken would otherwise be queued while that mention is still
 	// unapplied — and judged against a conversation that has not opened yet.
-	drainLocked(events, maxSweep, b.absorbLocked)
-	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
-	b.mu.Unlock()
+	if drainLocked(events, maxSweep, b.absorbLocked) < maxSweep {
+		drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	}
 }
 
 // applyReaction queues one reaction, applying the messages ahead of it first.
@@ -125,16 +176,36 @@ func (b *Bridge) applyEvent(evt StreamEvent, events <-chan StreamEvent, reaction
 // it — and both happen in the pump's goroutine, so a call draining the queues
 // sees the pair or neither, never the reaction without the mention it belongs
 // to.
-func (b *Bridge) applyReaction(events <-chan StreamEvent, r Reaction) {
+func (b *Bridge) applyReaction(stream Stream, events <-chan StreamEvent, r Reaction) {
 	// One lock for both, which is what makes "the pair or neither" true rather
 	// than merely likely. Taking the lock twice would leave a call able to
 	// drain between them and judge the reaction against a scope the mention it
 	// belongs to was about to change.
 	b.mu.Lock()
-	drainLocked(events, maxSweep, b.absorbLocked)
+	defer b.mu.Unlock()
+
+	if b.stale(stream) {
+		return
+	}
+
+	// Until the events are exhausted, not merely swept once: this reaction is
+	// already in hand and cannot be put back, so the messages ahead of it have
+	// to be applied before it whatever it takes. Bounded by passes rather than
+	// by messages, so a channel refilled for ever still cannot hold the lock
+	// for ever.
+	for i := 0; i < maxEventPasses; i++ {
+		if drainLocked(events, maxSweep, b.absorbLocked) < maxSweep {
+			break
+		}
+	}
 	b.absorbReactionLocked(r)
-	b.mu.Unlock()
 }
+
+// maxEventPasses bounds how long applying one reaction will wait for the
+// messages ahead of it. Each pass is maxSweep messages, and the events channel
+// holds liveEventBuffer, so reaching the end of this is a socket delivering
+// faster than a memory copy for the whole of it.
+const maxEventPasses = 8
 
 // endStream takes what the dying connection had already delivered, and then
 // records that it is over.
@@ -171,18 +242,21 @@ func (b *Bridge) endStream(stream Stream, events <-chan StreamEvent, clicks <-ch
 // is permanently ready, so without it this would spin rather than reach its
 // default. What a closed channel still holds is yielded first, so nothing
 // received before the close is left behind.
-func drainLocked[T any](ch <-chan T, bound int, apply func(T)) {
-	for i := 0; i < bound; i++ {
+func drainLocked[T any](ch <-chan T, bound int, apply func(T)) int {
+	applied := 0
+	for applied < bound {
 		select {
 		case v, ok := <-ch:
 			if !ok {
-				return
+				return applied
 			}
 			apply(v)
+			applied++
 		default:
-			return
+			return applied
 		}
 	}
+	return applied
 }
 
 // streamGone reports whether the connection a call is using has ended.

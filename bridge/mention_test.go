@@ -634,13 +634,11 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 		t.Fatalf("Wait() returned %v, want the mention", texts(msgs))
 	}
 
-	threads, err := NewStore(b.cfg.StateDir).Threads()
-	if err != nil {
-		t.Fatalf("Threads() error = %v", err)
-	}
-	if len(threads) != 1 {
-		t.Fatalf("Threads() = %+v, want the conversation recorded", threads)
-	}
+	// The state file is written by a goroutine of its own, off the paths that
+	// must not wait for a disk, so what is on disk arrives a moment later.
+	eventually(t, "the conversation to reach the state file", func() bool {
+		return len(storedThreads(t, b)) == 1
+	})
 
 	// The thread has been deleted since.
 	api.mu.Lock()
@@ -652,12 +650,8 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 		t.Errorf("Wait() returned %v from a thread that cannot be read, want nothing", texts(msgs))
 	}
 
-	threads, err = NewStore(b.cfg.StateDir).Threads()
-	if err != nil {
-		t.Fatalf("Threads() error = %v", err)
-	}
-	if len(threads) != 0 {
-		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", threads)
+	if !storedThreadsEventually(t, b, 0) {
+		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", storedThreads(t, b))
 	}
 }
 
@@ -708,4 +702,32 @@ func TestAnEmptyFirstScanStillRecordsThatItLooked(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].TS != sent {
 		t.Fatalf("Wait() returned %v, want the first mention delivered rather than swallowed as history", texts(msgs))
 	}
+}
+
+// storedThreads reads the conversations recorded in the state file.
+func storedThreads(t *testing.T, b *Bridge) []ThreadState {
+	t.Helper()
+
+	threads, err := NewStore(b.cfg.StateDir).Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	return threads
+}
+
+// storedThreadsEventually waits for the state file to hold want conversations.
+// The writer is a goroutine of its own — the paths that record a conversation
+// must not wait for a disk — so the file catches up a moment after the bridge
+// does.
+func storedThreadsEventually(t *testing.T, b *Bridge, want int) bool {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(storedThreads(t, b)) == want {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
 }
