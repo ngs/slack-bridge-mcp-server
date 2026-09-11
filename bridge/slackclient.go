@@ -345,6 +345,26 @@ func (w *webAPI) updateBlocks(ctx context.Context, channel, ts, text string, blo
 	return nil
 }
 
+// MessageReactions reads the emoji on one message. Full is asked for so the
+// answer names everybody who reacted rather than the first few: the point of
+// the call is counting who has answered.
+func (w *webAPI) MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error) {
+	item, err := w.client.GetReactionsContext(ctx, slack.NewRefToMessage(channel, ts), slack.GetReactionsParameters{Full: true})
+	if err != nil {
+		return nil, apiError("reactions.get", err)
+	}
+
+	out := make([]ReactionSummary, 0, len(item.Reactions))
+	for _, r := range item.Reactions {
+		users := make([]ReactionUser, 0, len(r.Users))
+		for _, id := range r.Users {
+			users = append(users, ReactionUser{ID: id})
+		}
+		out = append(out, ReactionSummary{Name: r.Name, Count: r.Count, Users: users})
+	}
+	return out, nil
+}
+
 func (w *webAPI) Update(ctx context.Context, channel, ts, text string) error {
 	if _, _, _, err := w.client.UpdateMessageContext(ctx, channel, ts, slack.MsgOptionText(text, false)); err != nil {
 		return fmt.Errorf("chat.update: %w", err)
@@ -476,6 +496,11 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 			ack(*evt.Request)
 		}
 
+		if reaction, ok := toReaction(api.InnerEvent.Data); ok {
+			s.emit(StreamEvent{Kind: StreamReaction, Reaction: reaction})
+			return
+		}
+
 		c, ok := toEventCandidate(api.InnerEvent.Data)
 		if !ok {
 			return
@@ -579,6 +604,41 @@ func toEventCandidate(data any) (candidate, bool) {
 	default:
 		return candidate{}, false
 	}
+}
+
+// toReaction normalises the two reaction events into the bridge's own shape.
+//
+// No filtering happens here, for the same reason none happens for messages:
+// which channels have a conversation open in them changes while the session
+// runs, and the socket has no business knowing. It reports what Slack said and
+// lets the bridge decide whether it is wanted.
+//
+// Only reactions on messages are translated. Slack puts emoji on files and
+// file comments too, and those carry no channel and no message to answer, so
+// there is nothing for an agent to do with one.
+func toReaction(data any) (Reaction, bool) {
+	switch evt := data.(type) {
+	case *slackevents.ReactionAddedEvent:
+		return reactionFromItem(evt.User, evt.Reaction, evt.EventTimestamp, evt.Item, true)
+	case *slackevents.ReactionRemovedEvent:
+		return reactionFromItem(evt.User, evt.Reaction, evt.EventTimestamp, evt.Item, false)
+	default:
+		return Reaction{}, false
+	}
+}
+
+func reactionFromItem(user, emoji, eventTS string, item slackevents.Item, added bool) (Reaction, bool) {
+	if item.Timestamp == "" {
+		return Reaction{}, false
+	}
+	return Reaction{
+		TS:       item.Timestamp,
+		Channel:  item.Channel,
+		User:     user,
+		Reaction: emoji,
+		Added:    added,
+		EventTS:  eventTS,
+	}, true
 }
 
 // filesFromEnvelope recovers a message's attachments from the raw Socket Mode

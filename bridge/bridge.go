@@ -87,6 +87,11 @@ type Bridge struct {
 	// does not apply to them: every thread has its own, and one queue would let
 	// a reply older than the home cursor be discarded as already seen.
 	pendingThreads []Message
+	// pendingReactions holds the emoji events read from the stream but not yet
+	// handed over. They are a queue of their own because they are not
+	// messages: no cursor applies to them, they are never merged with history,
+	// and a reaction older than the home cursor is still news.
+	pendingReactions []Reaction
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -345,7 +350,12 @@ func (b *Bridge) ensure() error {
 // WaitResult is what slack_wait returns.
 type WaitResult struct {
 	Messages []Message `json:"messages"`
-	TimedOut bool      `json:"timed_out"`
+	// Reactions are the emoji put on or taken off messages the session can
+	// see, since the last delivery. The field is absent when there are none,
+	// so a caller that only knows about messages reads the same result it
+	// always did.
+	Reactions []Reaction `json:"reactions,omitempty"`
+	TimedOut  bool       `json:"timed_out"`
 }
 
 // Wait blocks until at least one owner message is available or the timeout
@@ -390,8 +400,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		if err != nil {
 			return WaitResult{}, err
 		}
-		if len(msgs) > 0 {
-			return b.deliver(msgs), nil
+		reactions := b.drainReactions()
+		if len(msgs) > 0 || len(reactions) > 0 {
+			return b.deliver(ctx, msgs, reactions), nil
 		}
 
 		// A pending question owns the click channel. Reading it here as well
@@ -418,12 +429,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if err != nil {
 				return WaitResult{}, err
 			}
-			if len(msgs) > 0 {
+			reactions := b.drainReactions()
+			if len(msgs) > 0 || len(reactions) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
 				// timed_out of true alongside messages would be read as "call
 				// again", which is the one thing that must not happen to
 				// messages already handed over.
-				return b.deliver(msgs), nil
+				return b.deliver(ctx, msgs, reactions), nil
 			}
 			return WaitResult{Messages: []Message{}, TimedOut: true}, nil
 
@@ -462,10 +474,15 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 // The indicator is started where the owner is looking: the newest message is
 // the one they just sent, so its channel and thread are the conversation they
 // are waiting on.
-func (b *Bridge) deliver(msgs []Message) WaitResult {
-	b.startIndicator(newestConversation(msgs))
-	b.autoAck(msgs)
-	return WaitResult{Messages: msgs}
+func (b *Bridge) deliver(ctx context.Context, msgs []Message, reactions []Reaction) WaitResult {
+	// Only messages start the clock. A reaction is not something the owner is
+	// waiting on an answer to, and marking one as received would put a receipt
+	// emoji on a message for every emoji anybody else put on it.
+	if len(msgs) > 0 {
+		b.startIndicator(newestConversation(msgs))
+		b.autoAck(msgs)
+	}
+	return WaitResult{Messages: msgs, Reactions: b.nameReactions(ctx, reactions)}
 }
 
 // noteStreamClosed records that the live connection is gone, but only if the
@@ -515,6 +532,15 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 		} else {
 			b.pendingThreads = append(b.pendingThreads, msg)
 		}
+		b.notifyPendingLocked()
+	case StreamReaction:
+		// Reactions come from everybody, so the filter is about where the
+		// message is rather than who reacted to it.
+		reaction, ok := b.classifyReactionLocked(evt.Reaction)
+		if !ok {
+			return nil
+		}
+		b.pendingReactions = append(b.pendingReactions, reaction)
 		b.notifyPendingLocked()
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the

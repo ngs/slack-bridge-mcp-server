@@ -110,6 +110,10 @@ type API interface {
 	PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error)
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, channel, ts, emoji string) error
+	// MessageReactions reports the emoji already on a message, and who put
+	// them there. It is the standing tally the live reaction events cannot
+	// give, since those exist only for as long as the connection does.
+	MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error)
 	// Update rewrites the text of a message the bridge posted.
 	Update(ctx context.Context, channel, ts, text string) error
 	// ResolveQuestion rewrites an answered or expired question and removes
@@ -136,12 +140,19 @@ const (
 	// Nothing is lost: the bridge treats it exactly like a reconnect and
 	// re-reads the window from history.
 	StreamDropped
+	// StreamReaction carries one emoji added to or removed from a message.
+	// Unlike a message it is relayed whoever reacted, because a reaction is
+	// how somebody other than the owner answers a question put to a channel.
+	StreamReaction
 )
 
 // StreamEvent is one item from the live event stream.
 type StreamEvent struct {
 	Kind    StreamEventKind
 	Message Message
+	// Reaction is set on StreamReaction events, and is the raw event: which
+	// conversations it belongs to, if any, is the bridge's decision.
+	Reaction Reaction
 }
 
 // Interaction is one button click on a message the bridge posted. It is
