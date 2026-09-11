@@ -92,6 +92,10 @@ type Bridge struct {
 	// messages: no cursor applies to them, they are never merged with history,
 	// and a reaction older than the home cursor is still news.
 	pendingReactions []Reaction
+	// deferredReactions are reactions that matched no open conversation when
+	// they were judged, held briefly in case the mention that opens one is a
+	// moment behind them. See drainReactions.
+	deferredReactions []heldReaction
 	// seenReactions and seenReactionOrder are the window of reactions already
 	// queued, against Slack redelivering an envelope it was not acknowledged
 	// for. They live here rather than on the stream because a reconnect
@@ -427,6 +431,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		if err != nil {
 			return WaitResult{}, err
 		}
+		// Again, because catch-up goes to Slack and back: emoji that arrived
+		// while it was fetching history belong in the batch it produced.
+		b.drainStream(stream, reactions)
 		drained := b.drainReactions()
 		if len(msgs) > 0 || len(drained) > 0 {
 			return b.deliver(ctx, stream, msgs, drained), nil
@@ -460,6 +467,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if err != nil {
 				return WaitResult{}, err
 			}
+			b.drainStream(stream, reactions)
 			drained := b.drainReactions()
 			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A

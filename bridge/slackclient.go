@@ -734,8 +734,13 @@ func (s *socketModeStream) emitReaction(r Reaction) {
 	select {
 	case s.reactions <- r:
 	default:
-		s.reactionsDropped.Store(true)
-		log.Printf("dropped a reaction because nothing was reading them; read the tally with slack_reactions if you are counting")
+		// Once per outstanding marker, not once per lost reaction: the queue
+		// fills under a burst, and a line of synchronous stderr for every event
+		// in it would slow the socket down at exactly the wrong moment. Swap
+		// reports whether this is the first loss since the agent was last told.
+		if !s.reactionsDropped.Swap(true) {
+			log.Printf("dropped a reaction because nothing was reading them; read the tally with slack_reactions if you are counting")
+		}
 	}
 }
 

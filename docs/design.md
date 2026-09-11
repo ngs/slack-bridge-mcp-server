@@ -267,7 +267,7 @@ dropped.
 
 | Tool | Arguments | Behaviour |
 |---|---|---|
-| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}, …], "timed_out": false}`, oldest first, across every conversation, plus `reactions` when emoji arrived: `[{"ts", "channel", "user", "user_name", "reaction", "added", "event_ts"}, …]`, from any user. Either kind on its own ends the wait. |
+| `slack_wait` | `timeout_seconds` (optional, default 300, clamped to 5–1500) | Blocks. The first call connects and catches up. Returns as soon as at least one message or reaction is available; a catch-up backlog comes back immediately as an array. On timeout: `{"messages": [], "timed_out": true}`. Otherwise `{"messages": [{"ts", "thread_ts"?, "user", "text", "channel"}, …], "timed_out": false}`, oldest first, across every conversation, plus `reactions` when emoji arrived: `[{"ts", "channel", "user", "user_name", "reaction", "added", "event_ts"}, …]`, from any user. Either kind on its own ends the wait. |
 | `slack_post` | `text` (required), `thread_ts`, `channel` (optional) | `chat.postMessage`, to the home channel unless `channel` names another. Returns `{"ts", "channel"}`. |
 | `slack_ack` | `ts` (required), `emoji` (optional, default `eyes`), `channel` (optional) | `reactions.add` on that message. Receipt is already marked automatically for everything `slack_wait` returns, so this is for a deliberate signal beyond it. An emoji already present counts as success. |
 | `slack_ask` | `question` (required), `options` (required, 2–10), `timeout_seconds`, `thread_ts`, `channel` and `interrupt_on_message` (optional, default true) | Posts a question with one button per option and blocks for a click. Returns `{"choice_index", "choice_label", "ts", "timed_out": false}`, or `{"choice_index": -1, "timed_out": true}`, or `{"choice_index": -1, "interrupted": true}` when a message ends the question instead of a click. Every settled outcome also carries `messages`, the backlog that built up while the question was on the channel. The message is rewritten without its buttons in every case. |
@@ -422,6 +422,16 @@ reaction is delivered when the message it is on belongs to a conversation the
 session is in at the moment the batch is handed over. Draining messages before
 reactions is kept anyway, since a batch that carries both should carry them
 whole, but nothing depends on it any more.
+
+One instant is still too small for that rule to catch on its own. Two calls read
+the same stream, and receiving a mention and absorbing it are not one step: for
+as long as it takes the receiving call to reach `absorb`, the thread that
+mention opens does not exist yet, and another call judging a reaction against
+the scope right then would find nothing. So a reaction that matches nothing is
+held for a couple of seconds rather than dropped where it lands, and judged
+again on the next drain. The window being covered is sub-millisecond; the hold
+is generous because the cost of holding is one entry in a bounded list, and the
+cost of not holding is a vote.
 
 Both channels are optional halves of the `Stream` interface, reached by type
 assertion. `Stream`, `API` and `Connector` are exported, so requiring a new

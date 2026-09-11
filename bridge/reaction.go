@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Reaction is one emoji reaction, added or removed, as slack_wait hands it
@@ -124,6 +125,20 @@ func (b *Bridge) absorbReaction(r Reaction) {
 	b.notifyPendingLocked()
 }
 
+// heldReaction is a reaction that matched no open conversation, kept until its
+// hold expires in case the mention that opens one is a moment behind it.
+type heldReaction struct {
+	reaction Reaction
+	expires  time.Time
+}
+
+// reactionHold is how long such a reaction is kept. The window it covers is the
+// instant between one call receiving a mention and another call judging a
+// reaction against the scope that mention is about to change — sub-millisecond,
+// and this is generous by four orders of magnitude while still letting go of
+// anything that simply belongs elsewhere.
+const reactionHold = 2 * time.Second
+
 // maxPendingReactions bounds the queue of emoji waiting to be handed over. It
 // is generous — a decision post collects a burst, not a stream — and exists so
 // that a busy workspace cannot grow the queue without limit while nothing is
@@ -177,7 +192,7 @@ func (b *Bridge) seenReactionLocked(r Reaction) bool {
 // from a closed channel still yields what was buffered first, so nothing that
 // arrived before the close is left behind.
 func (b *Bridge) drainStreamReactions(reactions <-chan Reaction) {
-	for {
+	for i := 0; i < maxSweep; i++ {
 		select {
 		case r, ok := <-reactions:
 			if !ok {
@@ -200,7 +215,11 @@ func (b *Bridge) drainStreamReactions(reactions <-chan Reaction) {
 // of a conversation that was already on its way. Socket Mode delivers the
 // mention first; this keeps that order where it matters.
 func (b *Bridge) drainStreamEvents(stream Stream) (closed bool, err error) {
-	for {
+	// Bounded, because the channel can be refilled as fast as it is emptied. An
+	// unbounded sweep under a sustained flood would never hand control back to
+	// the reactions, to catch-up, or to the deadline, and the call would run
+	// past the timeout it promised.
+	for i := 0; i < maxSweep; i++ {
 		select {
 		case evt, ok := <-stream.Events():
 			if !ok {
@@ -213,7 +232,13 @@ func (b *Bridge) drainStreamEvents(stream Stream) (closed bool, err error) {
 			return false, nil
 		}
 	}
+	return false, nil
 }
+
+// maxSweep bounds one non-blocking drain of a stream channel. It is comfortably
+// past both live buffers, so an ordinary backlog is taken in one pass and only
+// a flood is interrupted.
+const maxSweep = 512
 
 // drainStream absorbs everything already queued on the stream, messages before
 // reactions.
@@ -249,7 +274,10 @@ func (b *Bridge) drainReactions() []Reaction {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if len(b.pendingReactions) == 0 {
+	// The held ones count: a drain with nothing new still has to re-judge them,
+	// or one that matched nothing would sit in the list for ever instead of
+	// being let go after its round of grace.
+	if len(b.pendingReactions) == 0 && len(b.deferredReactions) == 0 {
 		return nil
 	}
 	queued := b.pendingReactions
@@ -259,10 +287,40 @@ func (b *Bridge) drainReactions() []Reaction {
 	// delivered when the message it is on belongs to a conversation the session
 	// is in by the time the batch goes out — not by the order two channels
 	// happened to be read in.
-	kept := make([]Reaction, 0, len(queued))
+	//
+	// One that matches nothing is held for a moment rather than dropped where
+	// it lands. Two calls can read the same stream, and the one that takes the
+	// opening mention off it is not always the one that absorbs it first: there
+	// is an instant where the mention has been received and the thread it opens
+	// is not registered yet. A reaction judged in that instant looks out of
+	// scope and is not.
+	//
+	// The hold is a short deadline rather than a number of drains, because a
+	// single wait drains several times and the instant being covered is shorter
+	// than any of them. A reaction that belongs nowhere is let go when its hold
+	// expires, so the list cannot grow into every emoji in every channel the bot
+	// is in.
+	held := b.deferredReactions
+	b.deferredReactions = nil
+
+	now := time.Now()
+	kept := make([]Reaction, 0, len(held)+len(queued))
+	for _, h := range held {
+		if reaction, ok := b.classifyReactionLocked(h.reaction); ok {
+			kept = append(kept, reaction)
+			continue
+		}
+		if now.Before(h.expires) {
+			b.deferredReactions = append(b.deferredReactions, h)
+		}
+	}
 	for _, r := range queued {
 		if reaction, ok := b.classifyReactionLocked(r); ok {
 			kept = append(kept, reaction)
+			continue
+		}
+		if len(b.deferredReactions) < maxPendingReactions {
+			b.deferredReactions = append(b.deferredReactions, heldReaction{reaction: r, expires: now.Add(reactionHold)})
 		}
 	}
 	if len(kept) == 0 {

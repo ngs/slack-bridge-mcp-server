@@ -757,3 +757,78 @@ func TestADroppedReactionIsRescuedWhicheverChannelClosesFirst(t *testing.T) {
 		t.Error("the loss died with the connection because a different channel closed first")
 	}
 }
+
+// Two calls read the same stream, and the one that takes the opening mention
+// off it is not always the one that absorbs it first. A reaction judged in that
+// instant looks out of scope and is not, so an unmatched one is held briefly
+// rather than dropped where it lands.
+func TestAnUnmatchedReactionIsHeldUntilItsScopeCanOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	// Judged with no conversation open anywhere: held, not delivered, not gone.
+	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
+	b.drainStreamReactions(stream.reactions)
+	if kept := b.drainReactions(); len(kept) != 0 {
+		t.Fatalf("drainReactions() = %+v, want nothing delivered while no conversation is open", kept)
+	}
+	if b.deferredReactionCount() != 1 {
+		t.Fatal("the reaction was dropped where it landed; a mention a moment behind it would arrive too late")
+	}
+
+	// The mention lands, and the held reaction goes out with it.
+	send(stream, otherChannel, "200.000100", "", mention("ship it?"))
+	result := waitOnce(ctx, t, b)
+	if len(result.Messages) != 1 {
+		t.Fatalf("Wait() returned %v, want the mention", texts(result.Messages))
+	}
+	if len(result.Reactions) != 1 {
+		t.Fatalf("Wait() returned %+v, want the held reaction once its conversation is open", result.Reactions)
+	}
+}
+
+// The hold is brief, not for ever: a reaction that belongs nowhere is let go
+// when it expires, or the list would grow with every emoji in every channel the
+// bot is in.
+func TestAnUnmatchedReactionIsLetGoWhenItsHoldExpires(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
+	b.drainStreamReactions(stream.reactions)
+
+	b.drainReactions()
+	if b.deferredReactionCount() != 1 {
+		t.Fatalf("held %d reactions after the first drain, want 1", b.deferredReactionCount())
+	}
+
+	// Wind the hold back rather than waiting it out.
+	b.expireHeldReactions()
+
+	b.drainReactions()
+	if b.deferredReactionCount() != 0 {
+		t.Errorf("held %d reactions after the hold expired, want it let go", b.deferredReactionCount())
+	}
+}
+
+// expireHeldReactions puts every hold in the past, so a test can see one let go
+// without waiting for the clock.
+func (b *Bridge) expireHeldReactions() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.deferredReactions {
+		b.deferredReactions[i].expires = time.Now().Add(-time.Second)
+	}
+}
+
+// deferredReactionCount reports how many reactions are being held for another
+// round, for tests that need to see the grace period working.
+func (b *Bridge) deferredReactionCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.deferredReactions)
+}
