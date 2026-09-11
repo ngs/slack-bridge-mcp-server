@@ -64,7 +64,7 @@ func TestServerExposesTheBridgeTools(t *testing.T) {
 		got[tool.Name] = tool
 	}
 
-	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_history", "slack_progress", "slack_status"}
+	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_history", "slack_reactions", "slack_progress", "slack_status"}
 	if len(got) != len(want) {
 		t.Errorf("ListTools() returned %d tools, want %d", len(got), len(want))
 	}
@@ -94,7 +94,7 @@ func TestOnlyTheReadOnlyToolsSayTheyAre(t *testing.T) {
 		t.Fatalf("ListTools() error = %v", err)
 	}
 
-	readOnly := map[string]bool{"slack_history": true, "slack_status": true}
+	readOnly := map[string]bool{"slack_history": true, "slack_reactions": true, "slack_status": true}
 	for _, tool := range result.Tools {
 		if tool.Annotations == nil {
 			t.Errorf("%s has no annotations", tool.Name)

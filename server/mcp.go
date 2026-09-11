@@ -49,6 +49,12 @@ said while the question was up comes back in messages, however the question ende
 delivered to you there and nowhere else, so answer it rather than waiting for a slack_wait
 that will not repeat it. If interrupted is true they answered with a message rather than a
 button — they have redirected you, so act on what they said and drop the question.
+slack_wait also delivers reactions: an emoji added to or removed from a message in a
+conversation you can see, from anybody and not only the owner, which is how a post you asked
+people to vote on tells you the votes. They arrive in a reactions array beside the messages,
+and either one on its own ends the wait. Reactions are live-only — one added while the
+session was down is delivered to nobody — so when the standing tally matters, read it with
+slack_reactions rather than assuming you saw every emoji.
 When slack_wait returns timed_out, simply call it again to keep the conversation open.
 When the owner asks you to read the channel — to summarise a discussion, or catch up on what
 was said — use slack_history, which returns everyone's messages and not just theirs. Treat
@@ -100,6 +106,12 @@ type HistoryArgs struct {
 	Channel  string `json:"channel,omitempty" jsonschema:"the channel to read; leave it out for the home channel"`
 }
 
+// ReactionsArgs is the argument set for slack_reactions.
+type ReactionsArgs struct {
+	TS      string `json:"ts" jsonschema:"the ts of the message to read the reactions of"`
+	Channel string `json:"channel,omitempty" jsonschema:"the channel the message is in; leave it out for the home channel"`
+}
+
 // ProgressArgs is the argument set for slack_progress.
 type ProgressArgs struct {
 	Text     string `json:"text" jsonschema:"a short line saying what you are working on or waiting for, e.g. 'release chain: waiting for CI'"`
@@ -123,7 +135,7 @@ type AckResult struct {
 	Emoji string `json:"emoji"`
 }
 
-// New builds the MCP server and registers the seven bridge tools.
+// New builds the MCP server and registers the eight bridge tools.
 func New(b *bridge.Bridge) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    ServerName,
@@ -227,6 +239,22 @@ func New(b *bridge.Bridge) *mcp.Server {
 		}
 		if result.Messages == nil {
 			result.Messages = []bridge.HistoryMessage{}
+		}
+		return nil, result, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "slack_reactions",
+		Title:       "Read the reactions on a message",
+		Description: "Report the emoji currently on a message and who put them there — the standing tally, not the changes. Reads a message in the home channel unless you name another. Use it when you posted something for people to answer with a reaction and need to know where the count stands: slack_wait delivers reactions as they happen, but only while the session is connected, so anything added while it was down is here and nowhere else. Changes nothing.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(true)},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ReactionsArgs) (*mcp.CallToolResult, bridge.ReactionsResult, error) {
+		result, err := b.Reactions(ctx, bridge.ReactionsRequest{TS: args.TS, Channel: args.Channel})
+		if err != nil {
+			return nil, bridge.ReactionsResult{}, err
+		}
+		if result.Reactions == nil {
+			result.Reactions = []bridge.ReactionSummary{}
 		}
 		return nil, result, nil
 	})
