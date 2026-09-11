@@ -524,8 +524,12 @@ do not stop:
 
 Reactions are live only: nothing replays the ones sent while you were down. On
 your first slack_wait, and after any wait that failed with the connection
-closing, call slack_reactions with the ts of anything you are still collecting
-on and rebuild the count from what it reports.
+closing, take that wait's reactions first — a disconnect keeps whatever had
+already arrived — and only then call slack_reactions with the ts of anything you
+are still collecting on. What it reports is the count as it stands, including
+everything you just took, so make it your new baseline and apply later
+reactions to it. Rebuilding first and then applying that batch counts the same
+emoji twice.
 
 Keep replies short — I am reading them on a phone.
 ```

@@ -377,13 +377,16 @@ type WaitResult struct {
 	TimedOut         bool `json:"timed_out"`
 }
 
-// Wait blocks until at least one owner message is available or the timeout
-// expires.
+// Wait blocks until at least one owner message or one reaction is available, or
+// the timeout expires. Either kind on its own ends it, and a wait that has both
+// hands over both.
 //
 // The first call connects and runs catch-up, so a backlog that accumulated
 // while the session was down comes back immediately as an array rather than
 // trickling in. After that it waits on the live stream, running catch-up again
-// on every reconnect.
+// on every reconnect. Catch-up is for messages: reactions live only on the
+// connection, and the ones missed while it was down are read back with
+// Reactions instead.
 func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, error) {
 	// Before anything that can fail: the point of the presence file is that
 	// somebody is listening, and a wait that ends in an error was still a wait

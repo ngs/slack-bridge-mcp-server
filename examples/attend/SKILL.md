@@ -148,8 +148,11 @@ Reactions are live only. They are in no history, and nothing replays them: an
 emoji added while this session was down or disconnected reaches nobody. So
 whenever the loop resumes across a gap — your first `slack_wait` of a session,
 or the wait after one returned an error about the connection closing — do not
-assume your count is current. Call `slack_reactions` with the `ts` of every
-post you are still collecting on, and rebuild the count from what it reports:
+assume your count is current.
+
+Take that wait's `reactions` first. A disconnect does not throw away what had
+already arrived, so the batch after a gap can carry votes you have not counted.
+Then call `slack_reactions` on every post you are still collecting on:
 
 ```
 slack_reactions {"ts": "1726000000.000100"}
@@ -158,10 +161,16 @@ slack_reactions {"ts": "1726000000.000100"}
                             {"id": "U0…", "user_name": "Mei Tanaka"}]}]}
 ```
 
-That is the standing tally rather than the changes, so it is also the right
-call whenever the answer matters more than the speed — before acting on an
-approval, say. It is a pure read, like `slack_history`: it consumes nothing and
-disturbs nothing the loop depends on.
+That is the standing tally rather than the changes: it already includes every
+reaction you have just been handed. So make it your new baseline and apply only
+later `reactions` to it — rebuilding first and then applying the batch you were
+holding counts the same emoji twice, which is how a vote of two becomes a vote
+of three.
+
+Being the standing tally also makes it the right call whenever the answer
+matters more than the speed — before acting on an approval, say. It is a pure
+read, like `slack_history`: it consumes nothing and disturbs nothing the loop
+depends on.
 
 If it fails saying the app is missing a scope, the installed Slack app predates
 reaction support: tell the owner to reinstall from the manifest, and fall back
