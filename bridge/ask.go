@@ -222,6 +222,13 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		// being posted, which is before there was anything subscribed to hear
 		// it.
 		//
+		// The caller giving up, or the session ending, comes first: both of
+		// those end the pump as well, and answering "the connection closed" to
+		// a cancelled call describes the consequence rather than the cause.
+		if err := callerGone(ctx, b.ctx); err != nil {
+			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			return AskResult{}, err
+		}
 		// No click can reach this question once the socket is gone, so the
 		// buttons go with it rather than standing there inviting an answer
 		// nothing could carry.
@@ -277,7 +284,10 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// The deadline and the end of the connection can be ready at the
 			// same moment, and a timeout would be the wrong answer to the
 			// second: it says "ask again", which is not what a call does with
-			// a socket that has gone.
+			// a socket that has gone. A cancellation outranks both.
+			if err := callerGone(ctx, b.ctx); err != nil {
+				return AskResult{}, err
+			}
 			if b.streamGone(generation) {
 				return AskResult{}, errors.New("the Slack connection closed")
 			}
@@ -298,6 +308,15 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 		}
 	}
+}
+
+// callerGone reports the cancellation, if either context has one. The call's
+// own comes first: it is the more specific answer to "why did this stop".
+func callerGone(call, session context.Context) error {
+	if err := call.Err(); err != nil {
+		return err
+	}
+	return session.Err()
 }
 
 // backlogWaiting reports whether there is anything for a question to be

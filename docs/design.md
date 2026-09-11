@@ -536,12 +536,24 @@ agent is told so it can re-read the tally; a message past the cap is not, and
 the whole in-memory backlog is dropped in favour of a catch-up that fetches it
 again.
 
+**Cancellation before disconnection.** Cancelling a call cancels the session's
+context in the usual arrangement, which ends the pump, which reports that the
+connection is gone. A caller that gave up is told that it gave up: the
+disconnection is the consequence, not the cause, and only a call that is still
+running hears about it.
+
 **Catch-up.** Unchanged, and still in the caller. `drainCatchUp` merges what
 history returns with what the pump has queued, under the lock, so a message that
 arrives live while history is being fetched is deduplicated by timestamp exactly
 as before. A disconnection during catch-up is recorded by the pump and reported
 by the call when its drain comes back empty, so nothing already received is
 thrown away to report it.
+
+A catch-up that outlives its connection commits nothing: not the cursor, not the
+conversations it opened or gave up on, not the queues it would have merged.
+Everything it read came from the installation as it was, and a reinstall is
+exactly what changes which of it is visible; the replacement asks for its own
+catch-up on connect, and that one reads the window again.
 
 **What this removes.** The hold from the reaction work — an unmatched reaction
 kept for a couple of seconds in case the mention that opens its channel was a

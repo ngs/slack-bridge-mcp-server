@@ -544,6 +544,14 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return b.deliver(ctx, generation, msgs, drained), nil
 		}
 
+		// The caller giving up comes first. Cancelling this call cancels the
+		// session's context in the usual arrangement, which ends the pump,
+		// which says the connection is gone — and answering "the connection
+		// closed" to a caller that has cancelled describes the consequence
+		// rather than the cause.
+		if err := ctx.Err(); err != nil {
+			return WaitResult{}, err
+		}
 		// Only once there is nothing to hand over. Anything the dying
 		// connection had already delivered is in the queues above, and
 		// reporting the disconnection before taking it would throw away what

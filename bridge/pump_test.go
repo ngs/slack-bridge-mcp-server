@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -170,10 +171,9 @@ func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 		TS: "200.000100", Channel: otherChannel, User: testOwner, Text: mention("ship it?"),
 	}}
 
-	// The pump's two steps, in the order it does them: the messages waiting,
-	// then the reaction it was carrying.
-	b.applyReadyEvents(generation, events, nil)
-	b.applyCarriedReactions(generation, []Reaction{{
+	// One step, the way the pump does it: the messages waiting, then the
+	// reaction it was carrying, under one lock.
+	b.applyReady(generation, events, nil, []Reaction{{
 		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "white_check_mark", Added: true,
 	}})
 
@@ -569,4 +569,54 @@ func TestAClickFromAReplacedConnectionIsIgnored(t *testing.T) {
 	if !result.TimedOut {
 		t.Errorf("Ask() = %+v, want the question to time out: the click belonged to a connection that is over", result)
 	}
+}
+
+// Cancelling a call cancels the session's context in the usual arrangement,
+// which ends the pump, which says the connection is gone. The answer to a
+// caller that gave up is still that it gave up: the disconnection is the
+// consequence, not the cause.
+func TestACancelledWaitReportsTheCancellationNotTheDisconnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Wait(ctx, 10*time.Second)
+		done <- err
+	}()
+	eventually(t, "the wait to be listening", func() bool { return b.activeWaitCount() > 0 })
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Wait() error = %v, want the cancellation the caller asked for", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait() never returned after its context was cancelled")
+	}
+}
+
+// activeWaitCount reports how many calls are listening, so a test can tell that
+// a wait has started before changing what it is waiting for.
+func (b *Bridge) activeWaitCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.activeWaits
 }

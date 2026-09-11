@@ -185,6 +185,15 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 	// does not have to mention the bot twice.
 	starts := b.openThreads()
 	b.mu.Lock()
+	// A scan that started on a connection since replaced speaks for an
+	// installation that is no longer the one in use: what it found may be
+	// invisible to the replacement, and what it would forget may be readable
+	// there. So it records nothing, and the replacement's own catch-up — which
+	// every new connection asks for — reads the window again.
+	if b.stale(generation) {
+		b.mu.Unlock()
+		return nil, nil
+	}
 	for _, m := range mentions {
 		b.openThreadLocked(m.Channel, m.ThreadTS)
 		// The opening message is already in hand, so the walk starts just after
@@ -194,7 +203,7 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 	}
 	b.mu.Unlock()
 
-	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts)
+	replies, err := b.catchUpThreadConversations(ctx, api, owner, generation, starts)
 	if err != nil {
 		if !errors.Is(err, ErrMissingScope) {
 			return nil, err
@@ -207,7 +216,7 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 	}
 
 	if cursor != "" {
-		b.noteMentionCursor(cursor)
+		b.noteMentionCursor(generation, cursor)
 	}
 	return mergeConversations(mentions, replies), nil
 }
@@ -253,7 +262,7 @@ func (b *Bridge) degradeConversations(generation uint64, err error) {
 
 // catchUpThreadConversations reads every open thread from the point it was
 // last read to.
-func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner string, cursors map[threadKey]string) ([]Message, error) {
+func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner string, generation uint64, cursors map[threadKey]string) ([]Message, error) {
 	if len(cursors) == 0 {
 		return nil, nil
 	}
@@ -282,7 +291,7 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 			// channel. It will be gone next time too, so the conversation is
 			// closed rather than retried forever.
 			log.Printf("closing a conversation thread that cannot be read: %s", logSafe(err.Error(), maxLoggedError))
-			b.closeThread(key)
+			b.closeThread(generation, key)
 			continue
 		}
 		messages = append(messages, replies...)
@@ -405,9 +414,16 @@ func nowTS() string {
 // Forgetting it only in memory would mean reading it back on the next connect
 // and failing on it again, on every reconnect of every session from then on —
 // the thread is not coming back, and neither should the record of it.
-func (b *Bridge) closeThread(key threadKey) {
+func (b *Bridge) closeThread(generation uint64, key threadKey) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Unreadable on the connection this ran on, which is not a verdict a
+	// replaced connection gets to pass: a reinstall is exactly what makes a
+	// thread readable again.
+	if b.stale(generation) {
+		return
+	}
 
 	delete(b.threads, key)
 	delete(b.threadCursors, key)
@@ -422,9 +438,16 @@ func (b *Bridge) closeThread(key threadKey) {
 }
 
 // noteMentionCursor records how far the search for mentions has looked.
-func (b *Bridge) noteMentionCursor(ts string) {
+func (b *Bridge) noteMentionCursor(generation uint64, ts string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// How far a scan looked is only true of the installation it looked with.
+	// Moving the cursor on behalf of a replaced connection would step over
+	// mentions the replacement can see and this one could not.
+	if b.stale(generation) {
+		return
+	}
 	b.advanceMentionCursorLocked(ts)
 }
 
