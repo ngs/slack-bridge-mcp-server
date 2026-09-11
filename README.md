@@ -502,15 +502,26 @@ do not stop:
    the reply in the conversation it answers rather than in my home channel.
    Receipt is already marked for you, so reach for slack_ack only to say
    something an emoji says well — done, rejected, picked up by hand.
-4. If you need a decision from me before you can go on, call slack_ask with the
+4. If it returns reactions, they are emoji people put on messages — from
+   anybody, not only me. Ignore them unless you are collecting answers on a
+   post of your own; then match them by ts and count, remembering that
+   added: false is somebody taking their answer back.
+5. If you need a decision from me before you can go on, call slack_ask with the
    question and the answers to choose from, in the same channel and thread, and
    act on what I tap. If it comes back interrupted, I answered with a message
    instead of a button: drop the question and act on the messages it returned,
-   the same way you would treat slack_wait's.
-5. If something is going to take a while — CI, a release, a long build — call
+   the same way you would treat slack_wait's. When the decision needs other
+   people instead, post it and say which emoji means what — their reactions
+   come back to you in step 4.
+6. If something is going to take a while — CI, a release, a long build — call
    slack_progress once with what you are waiting on, so I can see it from the
    channel.
-6. Go back to step 1.
+7. Go back to step 1.
+
+Reactions are live only: nothing replays the ones sent while you were down. On
+your first slack_wait, and after any wait that failed with the connection
+closing, call slack_reactions with the ts of anything you are still collecting
+on and rebuild the count from what it reports.
 
 Keep replies short — I am reading them on a phone.
 ```
@@ -524,9 +535,11 @@ For a session you start this way often, the loop is better kept as a Claude
 Code skill than pasted in each time.
 [examples/attend/SKILL.md](examples/attend/SKILL.md) is a generic one: the same
 loop, plus when to reach for each of the other tools and how to treat what
-comes back. Copy it to `.claude/skills/attend/SKILL.md` in a project, or to
-`~/.claude/skills/attend/SKILL.md` for every project, and start the session
-with `/attend`.
+comes back — including a worked example of collecting approvals on a decision
+post from the `reactions` array, and reading the tally back with
+`slack_reactions` after a gap. Copy it to `.claude/skills/attend/SKILL.md` in a
+project, or to `~/.claude/skills/attend/SKILL.md` for every project, and start
+the session with `/attend`.
 
 ## Manual smoke test
 
