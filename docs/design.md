@@ -390,12 +390,38 @@ where a click's is not.
 
 A reaction that still does not fit is reported rather than swallowed:
 `slack_wait` answers `reactions_dropped: true`, once, on the first result after
-the loss. A silently wrong count is worse than a count the agent knows to go
-and check, and `slack_reactions` is how it checks. The stream also remembers the
-reactions it has queued, because Slack redelivers any envelope it is not
-acknowledged for and an acknowledgement can fail: a message survives that
-through the history merge, and a reaction, having no history, would be counted
-twice.
+the loss — on a timeout as well as on a delivery, since a wait with nothing else
+to hand over is exactly when it would go unmentioned. A silently wrong count is
+worse than a count the agent knows to go and check, and `slack_reactions` is how
+it checks. The marker outlives the connection the loss happened on, because the
+stream it was recorded on does not.
+
+The bridge also remembers the reactions it has queued, because Slack redelivers
+any envelope it is not acknowledged for and an acknowledgement can fail: a
+message survives that through the history merge, and a reaction, having no
+history, would be counted twice. The window is on the bridge rather than on the
+stream because a reconnect replaces the stream, and the redelivery can arrive on
+the replacement.
+
+### A reaction is judged when it is handed over
+
+Which conversations are open changes while the session runs, so a reaction is
+classified at delivery rather than on arrival: queued as it comes, and judged
+against the scope as it stands when the batch goes out.
+
+The alternative — judging on arrival — loses votes to timing that has nothing to
+do with the vote. The mention that brings the agent into a channel may still be
+on the socket behind the reaction, may have been taken by a concurrent
+`slack_ask`, or may not be on the socket at all: a mention sent while the
+session was down is recovered from history by catch-up, which runs inside the
+same call that delivers. Judging on arrival drops the reaction in all three
+cases, for a conversation that was open by the time anybody looked.
+
+So the rule is the one that can be stated without reference to ordering: a
+reaction is delivered when the message it is on belongs to a conversation the
+session is in at the moment the batch is handed over. Draining messages before
+reactions is kept anyway, since a batch that carries both should carry them
+whole, but nothing depends on it any more.
 
 Both channels are optional halves of the `Stream` interface, reached by type
 assertion. `Stream`, `API` and `Connector` are exported, so requiring a new

@@ -134,7 +134,7 @@ func TestAReactionInAnUntrackedChannelIsIgnored(t *testing.T) {
 		t.Fatalf("Wait() returned %v, want the mention that opens the conversation", texts(msgs))
 	}
 
-	react(stream, otherChannel, "200.000100", colleague, "tada", true)
+	react(stream, otherChannel, "200.000100", colleague, "+1", true)
 	result = waitOnce(ctx, t, b)
 	if len(result.Reactions) != 1 || result.Reactions[0].Channel != otherChannel {
 		t.Fatalf("Wait() returned %+v, want the reaction once the conversation is open", result.Reactions)
@@ -561,23 +561,34 @@ func TestAMessageAndAReactionArriveInOneDelivery(t *testing.T) {
 // Slack redelivers any envelope it is not acknowledged for, and the
 // acknowledgement can fail. A message survives that because history merges by
 // timestamp; a reaction has no history and no merge, so the same vote would be
-// counted twice unless the stream remembers it.
-func TestARedeliveredReactionIsQueuedOnce(t *testing.T) {
-	stream := newTestStream(4)
+// counted twice unless it is remembered.
+//
+// The memory is on the bridge rather than on the stream deliberately: a
+// reconnect replaces the stream, the redelivery can arrive on the replacement,
+// and a window that was replaced along with the connection would be empty
+// exactly when it was needed.
+func TestARedeliveredReactionIsDeliveredOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	envelope := reactionEnvelope(t, "reaction_added", colleague, "white_check_mark")
-	stream.handle(func(socketmode.Request) {}, envelope)
-	stream.handle(func(socketmode.Request) {}, envelope)
+	b, _, stream := mentionBridge(ctx, t)
 
-	if len(stream.reactions) != 1 {
-		t.Fatalf("queued %d reactions, want 1: the redelivery is the same event", len(stream.reactions))
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+	if result := waitOnce(ctx, t, b); len(result.Reactions) != 1 {
+		t.Fatalf("Wait() returned %+v, want the vote", result.Reactions)
+	}
+
+	// The same event again, as a redelivery carries it, including its event_ts.
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+	if result := waitOnce(ctx, t, b); len(result.Reactions) != 0 {
+		t.Errorf("Wait() returned %+v, want nothing: the redelivery is the vote already counted", result.Reactions)
 	}
 
 	// The same person taking the emoji off is a different action, and has to
 	// get through.
-	stream.handle(func(socketmode.Request) {}, reactionEnvelope(t, "reaction_removed", colleague, "white_check_mark"))
-	if len(stream.reactions) != 2 {
-		t.Errorf("queued %d reactions, want the removal through as well", len(stream.reactions))
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", false)
+	if result := waitOnce(ctx, t, b); len(result.Reactions) != 1 || result.Reactions[0].Added {
+		t.Errorf("Wait() returned %+v, want the removal delivered", result.Reactions)
 	}
 }
 
@@ -605,5 +616,120 @@ func TestADroppedReactionIsReportedToTheAgent(t *testing.T) {
 	// it, so the next wait is not still complaining about an old loss.
 	if result := waitOnce(ctx, t, b); result.ReactionsDropped {
 		t.Error("reactions_dropped = true on the next wait as well; the loss was already reported")
+	}
+}
+
+// A reaction is judged when the batch goes out, not when it arrives. The
+// mention that brings the agent into a channel can still be on the socket, held
+// by another call, or waiting in history to be recovered on a reconnect — and a
+// vote must not be lost to whichever of those it is.
+func TestAReactionIsJudgedAgainstTheScopeAtDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the home cursor: %v", err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatalf("seeding the mention cursor: %v", err)
+	}
+
+	// The mention is not on the socket at all: it was sent while the session
+	// was down, and only the search through history will find it.
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		joined:    []string{otherChannel, testChannel},
+		channelHistory: map[string][]candidate{
+			testChannel:  {ownerMsg("100.000100", "already answered")},
+			otherChannel: {{Channel: otherChannel, User: testOwner, Text: mention("ship it?"), TS: "300.000300"}},
+		},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// The vote lands live, before catch-up has opened the conversation it
+	// belongs to.
+	react(stream, otherChannel, "300.000300", colleague, "white_check_mark", true)
+
+	messages, reactions := collectBoth(ctx, t, b)
+	if len(messages) != 1 {
+		t.Fatalf("delivered %v, want the mention", texts(messages))
+	}
+	if len(reactions) != 1 {
+		t.Fatalf("delivered %d reactions, want the vote that arrived before catch-up opened the conversation", len(reactions))
+	}
+}
+
+// Draining a dead connection must also record that it is dead. Otherwise the
+// call hands its batch over as a success, the bridge still believes it is
+// connected, and the next slack_wait listens to a closed socket and reports a
+// disconnection that has already been dealt with.
+func TestDrainingAClosedStreamMarksItDisconnected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+	close(stream.events)
+
+	_, _ = b.Wait(ctx, 5*time.Second)
+
+	if b.Status().Connected {
+		t.Error("status reports connected after the stream closed; the next wait would listen to a dead socket")
+	}
+}
+
+// A loss recorded on a connection that then died is still a loss the agent has
+// to hear about, and the stream it happened on is gone.
+func TestADroppedReactionSurvivesTheConnectionItWasLostOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+
+	stream.reactionsDropped.Store(true)
+	close(stream.events)
+
+	_, _ = b.Wait(ctx, 5*time.Second)
+
+	if !b.droppedReactionMark() {
+		t.Error("the record of a lost reaction died with the connection; the agent would never learn its count is wrong")
+	}
+}
+
+// droppedReactionMark reports whether the bridge is still holding a loss to
+// report, for tests that need to see one outlive its connection.
+func (b *Bridge) droppedReactionMark() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reactionsDropped
+}
+
+// A timestamp identifies a message only within its channel, so an item carrying
+// one without the other is not addressable. Accepting it would report the
+// reaction in the home channel, which is simply the wrong place.
+func TestAReactionWithNoChannelIsNotTranslated(t *testing.T) {
+	stream := newTestStream(2)
+
+	stream.handle(func(socketmode.Request) {}, eventsAPIEnvelope(t, `{
+		"type": "event_callback",
+		"event": {
+			"type": "reaction_added",
+			"user": "`+colleague+`",
+			"reaction": "tada",
+			"item": {"type": "message", "ts": "100.000500"},
+			"event_ts": "100.000600"
+		}
+	}`))
+
+	if len(stream.reactions) != 0 {
+		t.Errorf("queued %d reactions, want none for an item with no channel", len(stream.reactions))
 	}
 }

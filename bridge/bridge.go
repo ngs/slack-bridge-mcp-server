@@ -92,6 +92,16 @@ type Bridge struct {
 	// messages: no cursor applies to them, they are never merged with history,
 	// and a reaction older than the home cursor is still news.
 	pendingReactions []Reaction
+	// seenReactions and seenReactionOrder are the window of reactions already
+	// queued, against Slack redelivering an envelope it was not acknowledged
+	// for. They live here rather than on the stream because a reconnect
+	// replaces the stream, and the redelivery can arrive on the replacement.
+	seenReactions     map[string]struct{}
+	seenReactionOrder []string
+	// reactionsDropped records a loss the agent has not been told about yet. A
+	// stream carries its own marker only as long as it lives, so a loss on a
+	// connection that then died would otherwise go unreported.
+	reactionsDropped bool
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -459,7 +469,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				// A wait with nothing to hand over still has to say a
 				// reaction was lost: that is precisely when the agent's count
 				// is wrong and nothing else would tell it.
-				ReactionsDropped: reactionsDropped(stream),
+				ReactionsDropped: b.takeReactionsDropped(stream),
 				TimedOut:         true,
 			}, nil
 
@@ -473,12 +483,6 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				// does not spin on a closed channel.
 				reactions = nil
 				continue
-			}
-			// Messages first: a reaction on the message that opens a
-			// conversation must not be judged before that message has opened
-			// it.
-			if err := b.drainStreamEvents(stream); err != nil {
-				return WaitResult{}, err
 			}
 			b.absorbReaction(r)
 
@@ -533,7 +537,7 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 	return WaitResult{
 		Messages:         msgs,
 		Reactions:        b.nameReactions(ctx, reactions),
-		ReactionsDropped: reactionsDropped(stream),
+		ReactionsDropped: b.takeReactionsDropped(stream),
 	}
 }
 

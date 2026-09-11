@@ -223,9 +223,9 @@ func reactionsOf(stream Stream) <-chan Reaction {
 	return rs.Reactions()
 }
 
-// reactionsDropped asks a stream whether it lost any emoji since it was last
-// asked. A stream with no reaction half never loses one.
-func reactionsDropped(stream Stream) bool {
+// streamDroppedReactions asks a stream whether it lost any emoji since it was
+// last asked. A stream with no reaction half never loses one.
+func streamDroppedReactions(stream Stream) bool {
 	rs, ok := stream.(ReactionStream)
 	if !ok {
 		return false

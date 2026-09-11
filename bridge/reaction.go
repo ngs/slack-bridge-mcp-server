@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Reaction is one emoji reaction, added or removed, as slack_wait hands it
@@ -91,19 +93,74 @@ func (b *Bridge) channelHasConversationLocked(channel string) bool {
 
 // absorbReaction folds one emoji from the stream into the pending queue.
 //
-// It is the reaction half of absorb, and separate for the same reason the
-// channel is: what arrives here is never merged with history and never
-// compared against a cursor.
+// It queues without judging. Whether a reaction belongs to a conversation the
+// session is in is decided when the batch is handed over, by which time
+// catch-up has run and every message in the batch has been absorbed — so a
+// reaction cannot be dropped for want of a mention that was moments behind it,
+// wherever that mention happened to be at this instant: still on the socket,
+// taken by a concurrent call, or waiting in history to be recovered on a
+// reconnect. The one thing decided here is whether this is a reaction the
+// bridge has already seen.
+//
+// The dedup lives on the bridge rather than on the stream because a connection
+// is replaced on every reconnect, and Slack redelivers what it was not
+// acknowledged for — possibly on the replacement. A window on the stream would
+// be empty exactly when the redelivery arrived.
 func (b *Bridge) absorbReaction(r Reaction) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	reaction, ok := b.classifyReactionLocked(r)
-	if !ok {
+	if r.TS == "" || r.Reaction == "" || b.seenReactionLocked(r) {
 		return
 	}
-	b.pendingReactions = append(b.pendingReactions, reaction)
+	if len(b.pendingReactions) >= maxPendingReactions {
+		// The agent has not called back in long enough for this many emoji to
+		// pile up. Dropping the oldest keeps the newest votes, and the marker
+		// is what tells the agent to stop trusting its count.
+		b.pendingReactions = b.pendingReactions[1:]
+		b.reactionsDropped = true
+	}
+	b.pendingReactions = append(b.pendingReactions, r)
 	b.notifyPendingLocked()
+}
+
+// maxPendingReactions bounds the queue of emoji waiting to be handed over. It
+// is generous — a decision post collects a burst, not a stream — and exists so
+// that a busy workspace cannot grow the queue without limit while nothing is
+// calling slack_wait.
+const maxPendingReactions = 512
+
+// reactionDedupWindow is how many recent reactions are remembered so a
+// redelivered envelope is not counted twice. Slack redelivers anything it is
+// not acknowledged for, and an acknowledgement can fail: it goes out before the
+// event is handled, and nothing downstream hears whether it landed. Messages
+// survive that because history merges them by timestamp; a reaction has no
+// history and no merge, so a consumer counting votes would count one twice.
+const reactionDedupWindow = 1024
+
+// seenReactionLocked reports whether this exact reaction has been queued
+// before, and records it if not. The caller must hold b.mu.
+//
+// The key is the whole event: who reacted, with what, to which message, when,
+// and whether it went on or came off. A redelivery repeats all of it, while two
+// genuinely different actions differ in at least the timestamp — so this drops
+// duplicates without ever swallowing a vote somebody actually cast.
+func (b *Bridge) seenReactionLocked(r Reaction) bool {
+	key := strings.Join([]string{r.User, r.Reaction, r.Channel, r.TS, r.EventTS, strconv.FormatBool(r.Added)}, "\x00")
+
+	if _, ok := b.seenReactions[key]; ok {
+		return true
+	}
+	if b.seenReactions == nil {
+		b.seenReactions = make(map[string]struct{}, reactionDedupWindow)
+	}
+	b.seenReactions[key] = struct{}{}
+	b.seenReactionOrder = append(b.seenReactionOrder, key)
+	if len(b.seenReactionOrder) > reactionDedupWindow {
+		delete(b.seenReactions, b.seenReactionOrder[0])
+		b.seenReactionOrder = b.seenReactionOrder[1:]
+	}
+	return false
 }
 
 // drainStreamReactions absorbs every reaction already queued on the stream,
@@ -142,18 +199,18 @@ func (b *Bridge) drainStreamReactions(reactions <-chan Reaction) {
 // otherwise be judged before the mention that opened it — and dropped for want
 // of a conversation that was already on its way. Socket Mode delivers the
 // mention first; this keeps that order where it matters.
-func (b *Bridge) drainStreamEvents(stream Stream) error {
+func (b *Bridge) drainStreamEvents(stream Stream) (closed bool, err error) {
 	for {
 		select {
 		case evt, ok := <-stream.Events():
 			if !ok {
-				return nil
+				return true, nil
 			}
 			if err := b.absorb(evt); err != nil {
-				return err
+				return false, err
 			}
 		default:
-			return nil
+			return false, nil
 		}
 	}
 }
@@ -172,8 +229,17 @@ func (b *Bridge) drainStreamEvents(stream Stream) error {
 // to hand over a batch, where losing the batch to report it would be the worse
 // outcome.
 func (b *Bridge) drainStream(stream Stream, reactions <-chan Reaction) {
-	_ = b.drainStreamEvents(stream)
+	closed, _ := b.drainStreamEvents(stream)
 	b.drainStreamReactions(reactions)
+	if closed {
+		// The buffer is emptied first and the closure recorded after, so what
+		// the connection delivered before it died is kept and the next call
+		// opens a new one instead of listening to a dead socket. Anything the
+		// dying stream lost is kept too: the marker is the agent's only sign
+		// that its count is wrong, and it must not die with the socket.
+		b.keepStreamDroppedMark(stream)
+		b.noteStreamClosed(stream)
+	}
 }
 
 // drainReactions takes everything queued for the next delivery.
@@ -187,9 +253,51 @@ func (b *Bridge) drainReactions() []Reaction {
 	if len(b.pendingReactions) == 0 {
 		return nil
 	}
-	drained := b.pendingReactions
+	queued := b.pendingReactions
 	b.pendingReactions = nil
-	return drained
+
+	// Judged here, against the conversations that are open now. A reaction is
+	// delivered when the message it is on belongs to a conversation the session
+	// is in by the time the batch goes out — not by the order two channels
+	// happened to be read in.
+	kept := make([]Reaction, 0, len(queued))
+	for _, r := range queued {
+		if reaction, ok := b.classifyReactionLocked(r); ok {
+			kept = append(kept, reaction)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// takeReactionsDropped reports whether any reaction has been lost since the
+// agent was last told, and clears the record.
+//
+// It reads the live stream's marker and the bridge's own together: a loss on a
+// connection that has since died is still a loss the agent has to hear about,
+// and the stream it happened on is gone.
+func (b *Bridge) takeReactionsDropped(stream Stream) bool {
+	dropped := streamDroppedReactions(stream)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	dropped = dropped || b.reactionsDropped
+	b.reactionsDropped = false
+	return dropped
+}
+
+// keepStreamDroppedMark moves a dying stream's record of a lost reaction onto
+// the bridge, so it outlives the connection it happened on.
+func (b *Bridge) keepStreamDroppedMark(stream Stream) {
+	if !streamDroppedReactions(stream) {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reactionsDropped = true
 }
 
 // nameReactions fills in the display name on each reaction, leaving the ID in
