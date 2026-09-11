@@ -102,6 +102,9 @@ type Bridge struct {
 	// stream carries its own marker only as long as it lives, so a loss on a
 	// connection that then died would otherwise go unreported.
 	reactionsDropped bool
+	// stopPump ends the current connection's pump. It is replaced with each
+	// connection and called before the next one starts.
+	stopPump context.CancelFunc
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -215,6 +218,20 @@ func New(ctx context.Context, cfg Config, connector Connector) *Bridge {
 	return &Bridge{ctx: ctx, cfg: cfg, connector: connector}
 }
 
+// stopPumpLocked ends the pump of the connection being replaced, if there is
+// one. The caller must hold b.mu.
+//
+// It does not wait for the goroutine to notice: what matters is that it stops
+// taking from a stream nobody is using any more, and it holds no state of its
+// own to unwind.
+func (b *Bridge) stopPumpLocked() {
+	if b.stopPump == nil {
+		return
+	}
+	b.stopPump()
+	b.stopPump = nil
+}
+
 // Status is what slack_status reports.
 type Status struct {
 	Connected bool   `json:"connected"`
@@ -266,6 +283,9 @@ func (b *Bridge) Status() Status {
 func (b *Bridge) Close() error {
 	b.mu.Lock()
 	b.connected = false
+	// Nothing is listening after this, so nothing should be reading the socket
+	// either.
+	b.stopPumpLocked()
 	b.stopIndicatorLocked()
 	done := b.indicatorDone
 	lock := b.lock
@@ -351,10 +371,15 @@ func (b *Bridge) ensure() error {
 	b.botUserID = api.BotUserID()
 	b.stream = stream
 	b.connected = true
-	// One goroutine owns the socket from here. It runs until the connection
-	// ends, and the session's context outlives every call, so a wait that is
-	// cancelled does not take the connection down with it.
-	go b.pump(b.ctx, stream)
+	// One goroutine owns the socket from here. Its context is the session's, so
+	// a wait that is cancelled does not take the connection down with it, and
+	// its own cancel is kept so this connection's pump can be stopped before
+	// another is started — two pumps writing into the same queues would undo
+	// the single ownership this is all for.
+	b.stopPumpLocked()
+	pumpCtx, stopPump := context.WithCancel(b.ctx)
+	b.stopPump = stopPump
+	go b.pump(pumpCtx, stream)
 	// A fresh connection is the one moment the scopes can have changed, so the
 	// catch-up outside the home channel is offered another go — and anything the
 	// old connection is still doing no longer speaks for this one.

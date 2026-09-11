@@ -35,6 +35,11 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 	for {
 		select {
 		case <-ctx.Done():
+			// The session ended, or this connection was replaced. Either way
+			// nothing is reading the socket from here, and a call blocked on a
+			// context of its own would otherwise wait out its whole timeout on
+			// a stream with no reader.
+			b.noteStreamClosed(stream)
 			return
 
 		case evt, ok := <-events:

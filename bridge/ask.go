@@ -226,6 +226,15 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		// buttons go with it rather than standing there inviting an answer
 		// nothing could carry.
 		if b.streamGone(stream) {
+			// The connection hands over what it had before it says it is
+			// gone, so the owner's click can already be waiting here. It is an
+			// answer whatever happened to the socket afterwards.
+			if choice, ok := b.lastChance(ask); ok {
+				return b.answered(ctx, api, answer{
+					channel: channel, threadTS: threadTS, ts: ts,
+					q: q, labels: labels, options: options, choice: choice,
+				}), nil
+			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, errors.New("the Slack connection closed")
 		}
@@ -250,31 +259,19 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			return b.interrupted(api, channel, ts, q, msgs), nil
 
 		case choice := <-ask.answered:
-			b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
-			// The answer is new work handed to the agent, exactly like the
-			// messages slack_wait returns, so the clock starts again here —
-			// and in the thread the question was asked in, which is where the
-			// owner just clicked and where they are watching for what follows.
-			b.startIndicator(channel, threadTS)
-			return AskResult{
-				ChoiceIndex: choice,
-				ChoiceLabel: options[choice],
-				TS:          ts,
-				Messages:    b.backlogWhileAsking(ctx),
-			}, nil
+			return b.answered(ctx, api, answer{
+				channel: channel, threadTS: threadTS, ts: ts,
+				q: q, labels: labels, options: options, choice: choice,
+			}), nil
 
 		case <-deadline.C:
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask); ok {
-				b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
-				b.startIndicator(channel, threadTS)
-				return AskResult{
-					ChoiceIndex: choice,
-					ChoiceLabel: options[choice],
-					TS:          ts,
-					Messages:    b.backlogWhileAsking(ctx),
-				}, nil
+				return b.answered(ctx, api, answer{
+					channel: channel, threadTS: threadTS, ts: ts,
+					q: q, labels: labels, options: options, choice: choice,
+				}), nil
 			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			// A question nobody answered leaves the agent with nothing to act
@@ -303,6 +300,35 @@ func (b *Bridge) backlogWaiting() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.pending) > 0 || len(b.pendingThreads) > 0 || b.needCatchUp
+}
+
+// answer is everything the settled question needs to report itself, gathered so
+// the three places a click can arrive say it the same way.
+type answer struct {
+	channel  string
+	threadTS string
+	ts       string
+	q        Question
+	labels   []string
+	options  []string
+	choice   int
+}
+
+// answered retires a question the owner clicked, and reports the choice.
+//
+// The answer is new work handed to the agent, exactly like the messages
+// slack_wait returns, so the clock starts again here — and in the thread the
+// question was asked in, which is where the owner just clicked and where they
+// are watching for what follows.
+func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
+	b.resolve(api, a.channel, a.ts, answeredText(a.q.Text, a.labels[a.choice]))
+	b.startIndicator(a.channel, a.threadTS)
+	return AskResult{
+		ChoiceIndex: a.choice,
+		ChoiceLabel: a.options[a.choice],
+		TS:          a.ts,
+		Messages:    b.backlogWhileAsking(ctx),
+	}
 }
 
 // interrupted retires a question the owner answered with words instead of a

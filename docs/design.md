@@ -492,11 +492,11 @@ itself.
 **Bounds and backpressure.** The pump never blocks on anything slow. Applying an
 event takes the bridge lock for the length of a slice append; catch-up, which
 goes to Slack and back, stays in the calling goroutine where it always was, and
-the pump keeps draining the socket while it runs. The queues are bounded where
-losing something is survivable and unbounded where it is not: reactions are
-capped, because a lost one can be recovered with `slack_reactions` and an
-unbounded queue cannot; messages are not, because they are recovered from
-history and the socket's own buffer is what limits them.
+the pump keeps draining the socket while it runs. Both queues are bounded, and what
+happens at the bound is what differs: a reaction past the cap is gone, and the
+agent is told so it can re-read the tally; a message past the cap is not, and
+the whole in-memory backlog is dropped in favour of a catch-up that fetches it
+again.
 
 **Catch-up.** Unchanged, and still in the caller. `drainCatchUp` merges what
 history returns with what the pump has queued, under the lock, so a message that
@@ -522,11 +522,11 @@ the pump reads the same channels the two loops used to read between them.
 
 ### Whoever is blocked hears about the message
 
-Both loops read the same stream, so the call that takes a message off it is not
-necessarily the call that wants it. A wait drains the shared pending queue at
-the top of its loop and then blocks; a message a concurrent question absorbs
-after that lands in the queue with nothing left watching it, and the wait sits
-out its whole timeout with the message already in hand.
+The pump applies a message the moment it arrives, and the call that wants it may
+not be running yet, or may already be blocked. A wait drains the pending queue
+at the top of its loop and then blocks; a message the pump applies a moment
+later lands in the queue with nothing watching it, and the wait sits out its
+whole timeout with the message already in hand.
 
 So a blocked call subscribes, and whatever grows the queue wakes every
 subscriber. Every subscriber, not one of them: a wakeup delivered to a single
@@ -540,8 +540,13 @@ timeout. `timed_out: true` is an instruction to call again, so returning it
 alongside messages would be telling the agent to go back for what it has just
 been given; a wait that finds something at the bell reports a delivery instead.
 
-A question has a second problem underneath that one: it blocks the loop that
-would otherwise be collecting messages at all. Whatever arrives while it is up
+A question has to look as well as listen, for the same reason: the pump can
+apply a message — and send its notification — while the question is still being
+posted, before anything has subscribed to hear it. So it checks the backlog
+before it blocks, not only when it is woken.
+
+A question has a second problem underneath that one: it is not collecting
+messages while it waits. Whatever arrives while it is up
 is absorbed and then stranded until the next `slack_wait` — which, if the answer
 sends the agent off to work, is a long time. So every settled question drains
 the backlog and returns it in `messages`, through the same path a wait uses, so

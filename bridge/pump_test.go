@@ -256,3 +256,59 @@ func (b *Bridge) catchUpDue() bool {
 	defer b.mu.Unlock()
 	return b.needCatchUp
 }
+
+// The connection hands over what it had before it reports that it is gone, so
+// the owner's click can be waiting when the closure is noticed. It is an answer
+// whatever happened to the socket afterwards.
+func TestAClickThatArrivedWithTheDisconnectionIsStillAnAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := askBridge(ctx, t)
+
+	go func() {
+		waitForQuestion(b)
+		// Queued, then the socket dies: endStream routes the click and records
+		// the closure, and both reach the question together.
+		stream.interactions <- click(testOwner, askTS, 1)
+		close(stream.events)
+	}()
+
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout})
+	if err != nil {
+		t.Fatalf("Ask() error = %v, want the click honoured rather than the disconnection reported", err)
+	}
+	if result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the option the owner actually clicked", result)
+	}
+}
+
+// A pump whose connection is replaced, or whose session ends, stops reading and
+// says so. Otherwise a call blocked on a context of its own waits out its whole
+// timeout on a stream with nobody reading it.
+func TestACancelledPumpReportsThatNobodyIsReading(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	if !b.Status().Connected {
+		t.Fatal("the bridge reports no connection, so there is no pump to cancel")
+	}
+
+	b.stopThePump()
+
+	eventually(t, "the pump to record that it has stopped reading", func() bool {
+		return !b.Status().Connected
+	})
+}
+
+// stopThePump ends the current connection's pump the way a replacement or a
+// shutdown does.
+func (b *Bridge) stopThePump() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopPumpLocked()
+}
