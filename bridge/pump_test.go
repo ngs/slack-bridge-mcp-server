@@ -256,8 +256,10 @@ func TestTheMessageQueueFallsBackToHistoryWhenItFills(t *testing.T) {
 		}})
 	}
 
-	if got := b.Status().PendingBacklogCount; got > maxPendingMessages {
-		t.Errorf("pending backlog = %d, want it bounded at %d", got, maxPendingMessages)
+	// Each queue is counted apart, so the bound is per kind: the home channel's
+	// flood cannot crowd out the conversation elsewhere.
+	if got := b.pendingHomeCount(); got > maxPendingMessages {
+		t.Errorf("pending home messages = %d, want it bounded at %d", got, maxPendingMessages)
 	}
 	if !b.catchUpDue() {
 		t.Error("the queue filled without asking for a catch-up; the refused messages would be lost rather than re-read")
@@ -265,6 +267,13 @@ func TestTheMessageQueueFallsBackToHistoryWhenItFills(t *testing.T) {
 	if b.pendingThreadCount() != 2 {
 		t.Error("the thread reply was discarded to make room; history's catch-up outside the home channel is best effort and may never bring it back")
 	}
+}
+
+// pendingHomeCount reports how many home-channel messages are waiting.
+func (b *Bridge) pendingHomeCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pending)
 }
 
 // pendingThreadCount reports how many replies from conversations outside the
@@ -391,5 +400,53 @@ func TestACatchUpRequestedMidFlightIsNotSwallowed(t *testing.T) {
 	// the difference between two reads and four.
 	if reads < 3 {
 		t.Errorf("read the home channel %d times, want a second catch-up: the request made while history was in flight was cleared by it", reads)
+	}
+}
+
+// The first run against a channel seeds the cursor from what is already there,
+// so that a fresh install joins the conversation rather than replaying it. A
+// message the pump takes from the socket while that read is in flight is not
+// part of what was already there: the owner sent it to this session, and
+// filtering it against the seed would lose it.
+func TestAMessageArrivingDuringTheInitialSeedIsDelivered(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	gate := make(chan struct{})
+	api := &fakeAPI{
+		botUserID:   testBotUser,
+		historyGate: gate,
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "before this session"), ownerMsg("100.000200", "also before")},
+		},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	done := make(chan WaitResult, 1)
+	go func() {
+		result, err := b.Wait(ctx, 5*time.Second)
+		if err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+		done <- result
+	}()
+
+	eventually(t, "the seed to reach Slack", func() bool { return len(api.calls()) > 0 })
+	send(stream, testChannel, "100.000150", "", "sent while the cursor was being seeded")
+	close(gate)
+
+	select {
+	case result := <-done:
+		if len(result.Messages) != 1 || result.Messages[0].TS != "100.000150" {
+			t.Fatalf("Wait() returned %v, want the message that arrived live during the seed", texts(result.Messages))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait() never returned")
 	}
 }

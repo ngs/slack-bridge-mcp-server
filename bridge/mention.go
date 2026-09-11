@@ -110,120 +110,7 @@ func (b *Bridge) openThreadLocked(channel, threadTS string) {
 	if b.store == nil {
 		return
 	}
-	// Recorded, not written. This runs under b.mu, and on the pump's path b.mu
-	// is what every tool call and the socket reader share: a slow disk here
-	// would stall the connection itself. The caller writes it once the lock is
-	// released — see persistThreadOpens.
-	b.threadOpens = append(b.threadOpens, key)
-}
-
-// takeThreadOpensLocked hands back the conversations opened since it was last
-// called, for a caller about to release b.mu and write them. The caller must
-// hold b.mu.
-func (b *Bridge) takeThreadOpensLocked() []threadKey {
-	if len(b.threadOpens) == 0 {
-		return nil
-	}
-	opens := b.threadOpens
-	b.threadOpens = nil
-	return opens
-}
-
-// persistThreadOpens hands the conversations to the writer that owns the state
-// file, so a restart resumes them rather than waiting to be mentioned again. It
-// must be called without b.mu held.
-//
-// It hands over rather than writing, because the pump calls it: a state file is
-// a read and a write of the whole thing, and on a slow disk that is the only
-// socket reader stopped for the duration. The writer is a goroutine of its own,
-// so the order of the writes is kept and none of them is on anybody's path.
-//
-// A write that fails costs only surviving a restart: the thread works for this
-// session either way, and the owner can reopen it with another mention. A queue
-// that is full costs the same, and says so.
-func (b *Bridge) persistThreadOpens(opens []threadKey) {
-	if len(opens) == 0 {
-		return
-	}
-
-	writes := b.threadWriter()
-	if writes == nil {
-		return
-	}
-	for _, key := range opens {
-		select {
-		case writes <- key:
-		default:
-			log.Printf("could not queue an open conversation thread for the state file; it will not survive a restart")
-		}
-	}
-}
-
-// threadWriteBuffer is how many thread opens can be waiting to be written. A
-// conversation is opened by a mention, so this is hundreds of mentions behind a
-// disk that has stopped answering.
-const threadWriteBuffer = 256
-
-// threadWriter returns the channel the state-file writer reads, starting it on
-// first use. It returns nil when there is no store to write to.
-func (b *Bridge) threadWriter() chan<- threadKey {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.store == nil {
-		return nil
-	}
-	if b.threadWrites == nil {
-		b.threadWrites = make(chan threadKey, threadWriteBuffer)
-		b.stopThreadWrites = make(chan struct{})
-		b.threadWritesDone = make(chan struct{})
-		go b.writeThreads(b.store, b.threadWrites, b.stopThreadWrites, b.threadWritesDone)
-	}
-	return b.threadWrites
-}
-
-// writeThreads is the only goroutine that writes opened conversations to the
-// state file. One writer keeps them in the order they were opened, and keeps
-// the disk off the pump's path.
-//
-// It drains what is queued before it returns, so a session that ends with
-// writes outstanding still records them.
-func (b *Bridge) writeThreads(store *Store, writes <-chan threadKey, stop <-chan struct{}, done chan<- struct{}) {
-	defer close(done)
-
-	write := func(key threadKey) {
-		if err := store.SetThread(key.channel, key.threadTS, ""); err != nil {
-			log.Printf("could not persist an open conversation thread: %v", err)
-		}
-	}
-
-	for {
-		select {
-		case key := <-writes:
-			write(key)
-		case <-b.ctx.Done():
-			drainWrites(writes, write)
-			return
-		case <-stop:
-			drainWrites(writes, write)
-			return
-		}
-	}
-}
-
-// drainWrites writes what is still queued, so a session that ends with opens
-// outstanding still records them. The channel is never closed — producers call
-// this from the pump, and a closed channel would panic them — so this stops at
-// the first moment there is nothing left.
-func drainWrites(writes <-chan threadKey, write func(threadKey)) {
-	for {
-		select {
-		case key := <-writes:
-			write(key)
-		default:
-			return
-		}
-	}
+	b.recordStateWriteLocked(stateWrite{kind: writeThread, channel: channel, threadTS: threadTS})
 }
 
 // loadThreadsLocked restores the conversations open when the last session
@@ -305,10 +192,7 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 		// filter out the very message that opened the conversation.
 		starts[threadKey{m.Channel, m.ThreadTS}] = m.TS
 	}
-	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()
-
-	b.persistThreadOpens(opens)
 
 	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts)
 	if err != nil {
@@ -553,9 +437,7 @@ func (b *Bridge) advanceMentionCursorLocked(ts string) {
 	if b.store == nil {
 		return
 	}
-	if err := b.store.SetMentionCursor(ts); err != nil {
-		// The cost is a repeated scan of a window already read, which the
-		// thread cursors then filter out. Not worth failing a delivery over.
-		log.Printf("could not persist the mention cursor: %v", err)
-	}
+	// The cost of losing this is a repeated scan of a window already read,
+	// which the thread cursors then filter out.
+	b.recordStateWriteLocked(stateWrite{kind: writeMentionCursor, ts: ts})
 }

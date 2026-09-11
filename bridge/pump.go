@@ -33,6 +33,16 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 	reactions := reactionsOf(stream)
 
 	for {
+		// Messages first, always. The sweep is bounded, so a channel refilled
+		// as fast as it is emptied leaves some behind — and if a reaction were
+		// taken while a mention was still sitting there, it would be judged
+		// against a conversation that had not opened yet. Going round again
+		// instead means the reactions are only reached when nothing is waiting
+		// ahead of them.
+		if b.applyReadyEvents(events, reactions) == maxSweep {
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
 			// The session ended, or this connection was replaced. Either way
@@ -66,6 +76,24 @@ func (b *Bridge) pump(ctx context.Context, stream Stream) {
 	}
 }
 
+// applyReadyEvents applies every message already waiting, with any reactions
+// that are ready behind them, and reports how many messages it took. Reaching
+// the bound is how the caller knows there may be more.
+func (b *Bridge) applyReadyEvents(events <-chan StreamEvent, reactions <-chan Reaction) int {
+	b.mu.Lock()
+	applied := 0
+	drainLocked(events, maxSweep, func(evt StreamEvent) {
+		b.absorbLocked(evt)
+		applied++
+	})
+	if applied > 0 {
+		drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	}
+	b.mu.Unlock()
+
+	return applied
+}
+
 // applyEvent applies one message together with any reactions already on the
 // wire.
 //
@@ -86,10 +114,7 @@ func (b *Bridge) applyEvent(evt StreamEvent, events <-chan StreamEvent, reaction
 	// unapplied — and judged against a conversation that has not opened yet.
 	drainLocked(events, maxSweep, b.absorbLocked)
 	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
-	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()
-
-	b.persistThreadOpens(opens)
 }
 
 // applyReaction queues one reaction, applying the messages ahead of it first.
@@ -108,10 +133,7 @@ func (b *Bridge) applyReaction(events <-chan StreamEvent, r Reaction) {
 	b.mu.Lock()
 	drainLocked(events, maxSweep, b.absorbLocked)
 	b.absorbReactionLocked(r)
-	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()
-
-	b.persistThreadOpens(opens)
 }
 
 // endStream takes what the dying connection had already delivered, and then
@@ -136,10 +158,7 @@ func (b *Bridge) endStream(stream Stream, events <-chan StreamEvent, clicks <-ch
 	drainLocked(events, maxSweep, b.absorbLocked)
 	drainLocked(clicks, maxSweep, b.deliverInteraction)
 	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
-	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()
-
-	b.persistThreadOpens(opens)
 	b.noteStreamClosed(stream)
 }
 

@@ -468,8 +468,9 @@ interface.
 Every write wakes the subscribers, so a call blocked on an empty queue hears
 about what another call's connection just received.
 
-**Ordering.** The pump applies a message and a reaction that are ready together
-as one step, under one lock, messages first. Both directions matter: whichever
+**Ordering.** Messages first, always: the pump applies everything waiting on the
+events channel before it will take a reaction at all, and it applies the pair it
+does take as one step, under one lock. Both directions matter: whichever
 channel the select happens to pick, the other is already there, so a delivery
 that has both hands over both instead of splitting them across two calls on a
 coin toss. The ordering rule already existed, but it could not be relied upon
@@ -481,22 +482,31 @@ arrived before it has not been.
 nothing moved a message off it until a call asked. The pump moves every one, so
 the bound lives on the queue instead. What is already queued stays: the newest
 message is refused and a catch-up asked for, and since no cursor has moved,
-history still has it. Refusing rather than discarding matters because the queue
-holds replies from conversations outside the home channel, and that catch-up is
-best effort — it stands down entirely when a scope is missing — so a reply
-dropped from the queue might never come back.
+history still has it. The home channel and the conversations outside it are
+counted apart, so a flood in one cannot crowd out the other — and the replies
+outside the home channel are the ones that matter most here, because that
+catch-up is best effort and stands down entirely when a scope is missing.
 
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again
 since it started; otherwise a reconnect, or a message refused for want of room,
 would be answered by a fetch that never knew about it.
 
-**Writes off the path.** Registering a conversation persists it to the state
-file, and that write happens on neither `b.mu` nor the pump. A state file is a
-read and a write of the whole thing, so on a slow disk it is both the lock every
-tool call shares and the only socket reader, stopped for the duration. The open
-is recorded in memory and handed to a writer goroutine of its own, which keeps
-the writes in order and flushes what it has when the session ends.
+**One writer for the state file.** Every cursor the bridge keeps — how far the
+home channel has been read, how far each conversation outside it has, how far
+the search for mentions has looked, and that a conversation is open at all — is
+recorded in memory and handed to a writer goroutine. Nothing writes that file
+from under `b.mu`. It is read and rewritten whole, and `b.mu` is the lock the
+pump holds while it applies what the socket delivered, so a slow disk beneath it
+stops the only reader the connection has and the click and reaction buffers
+behind it are the ones nothing can recover. One writer keeps the changes in the
+order they were made, and flushes what it has when the session ends — after the
+pump has stopped, so a cursor being recorded as the session ends still reaches
+the file.
+
+What a lost cursor costs is work repeated after a restart: a window read again,
+a conversation mentioned into again. Never a message, which is in Slack either
+way.
 
 **Lifetime.** A connection gets a context of its own, bounded by the session's.
 Cancelling it stops everything that connection started — the pump, and the

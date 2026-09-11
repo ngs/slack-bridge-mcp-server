@@ -58,11 +58,6 @@ const (
 // disagreed and the process exited mid-cleanup.
 const shutdownIndicatorWait = indicatorRequestTimeout + indicatorDeleteTimeout + 2*time.Second
 
-// threadWriteFlushWait is how long Close waits for the state-file writer to
-// finish what it has. It is short: the writes are small and local, and a disk
-// that cannot manage them in this long is one the process should not hang on.
-const threadWriteFlushWait = 2 * time.Second
-
 // Bridge owns the Slack connection and the message cursors. Every MCP tool
 // goes through it.
 type Bridge struct {
@@ -123,18 +118,21 @@ type Bridge struct {
 	// from the state file on connect, so a restart resumes a conversation
 	// instead of waiting to be mentioned again.
 	threads map[threadKey]bool
-	// threadOpens are conversations registered in memory and not yet handed to
-	// the state-file writer. The hand-off happens off b.mu, because the pump
-	// holds it and a slow disk under it would stall the connection.
-	threadOpens []threadKey
-	// threadWrites carries them to the writer that owns the state file, and
-	// threadWritesDone closes when that writer has drained and stopped.
-	threadWrites chan threadKey
-	// stopThreadWrites tells that writer to flush and stop, and
-	// threadWritesDone closes once it has.
-	stopThreadWrites chan struct{}
-	threadWritesDone chan struct{}
-	threadCursors    map[threadKey]string
+	// pendingFull keeps the overflow notice to one line per episode.
+	pendingFull bool
+	// pumpDone closes when the current connection's pump has stopped. Close
+	// waits on it before the state writer is stopped, so a cursor the pump was
+	// in the middle of recording still reaches the file.
+	pumpDone chan struct{}
+	// stateWrites carries cursor changes to the goroutine that owns the state
+	// file. Nothing writes that file from under b.mu: it is the lock the pump
+	// holds while it applies what the socket delivered, and a slow disk beneath
+	// it stops the only reader the connection has. stopStateWrites tells the
+	// writer to flush and stop; stateWritesDone closes once it has.
+	stateWrites     chan stateWrite
+	stopStateWrites chan struct{}
+	stateWritesDone chan struct{}
+	threadCursors   map[threadKey]string
 	// mentionCursor is how far through time the search for missed mentions has
 	// looked.
 	mentionCursor string
@@ -249,6 +247,25 @@ func (b *Bridge) requestCatchUpLocked() {
 	b.notifyPendingLocked()
 }
 
+// waitForPump waits for a pump to finish, briefly. Nothing about shutdown
+// should hang on it: the wait exists so a cursor being recorded reaches the
+// writer before the writer is told to stop, and that is the work of a moment.
+func waitForPump(done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	timeout := time.NewTimer(pumpStopWait)
+	defer timeout.Stop()
+	select {
+	case <-done:
+	case <-timeout.C:
+		log.Printf("gave up waiting for the connection reader to stop")
+	}
+}
+
+// pumpStopWait is how long shutdown waits for the pump to notice it is over.
+const pumpStopWait = 2 * time.Second
+
 // stopConnectionLocked ends the connection being replaced, if there is one: its
 // pump, and the Socket Mode goroutines under it. The caller must hold b.mu.
 //
@@ -317,8 +334,7 @@ func (b *Bridge) Close() error {
 	// Nothing is listening after this, so nothing should be reading the socket
 	// either — nor holding it open.
 	b.stopConnectionLocked()
-	stopWrites, writesDone := b.stopThreadWrites, b.threadWritesDone
-	b.stopThreadWrites = nil
+	pumpStopped := b.pumpDone
 	b.stopIndicatorLocked()
 	done := b.indicatorDone
 	lock := b.lock
@@ -333,20 +349,12 @@ func (b *Bridge) Close() error {
 
 	b.writePresence(presence)
 
-	// The conversations opened but not yet written are worth the wait: without
-	// them a restart makes the owner mention the bot again in a thread it was
-	// already in. The wait is short because the alternative to a slow disk here
-	// is a process that will not exit.
-	if stopWrites != nil {
-		close(stopWrites)
-		timeout := time.NewTimer(threadWriteFlushWait)
-		defer timeout.Stop()
-		select {
-		case <-writesDone:
-		case <-timeout.C:
-			log.Printf("gave up waiting for the open conversations to reach the state file")
-		}
-	}
+	// The pump first, then the writer it hands cursors to. In that order,
+	// because a pump still running can record one more — and a writer already
+	// stopped would leave it in a queue nobody is reading, which is a
+	// conversation the owner has to open again after a restart.
+	waitForPump(pumpStopped)
+	b.stopStateWriter()
 
 	if done != nil {
 		timeout := time.NewTimer(shutdownIndicatorWait)
@@ -432,7 +440,12 @@ func (b *Bridge) ensure() error {
 	// context rather than a call's, so a wait that is cancelled does not take
 	// the connection down with it — and it stops when the connection does, so
 	// two pumps can never write into the same queues.
-	go b.pump(connCtx, stream)
+	pumpDone := make(chan struct{})
+	b.pumpDone = pumpDone
+	go func() {
+		defer close(pumpDone)
+		b.pump(connCtx, stream)
+	}()
 	// A fresh connection is the one moment the scopes can have changed, so the
 	// catch-up outside the home channel is offered another go — and anything the
 	// old connection is still doing no longer speaks for this one.
@@ -644,10 +657,7 @@ func (b *Bridge) noteStreamClosed(stream Stream) {
 func (b *Bridge) absorb(evt StreamEvent) {
 	b.mu.Lock()
 	b.absorbLocked(evt)
-	opens := b.takeThreadOpensLocked()
 	b.mu.Unlock()
-
-	b.persistThreadOpens(opens)
 }
 
 // absorbLocked is absorb for a caller that already holds b.mu, which is how a
@@ -662,27 +672,35 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		if !ok {
 			return
 		}
-		if len(b.pending)+len(b.pendingThreads) >= maxPendingMessages {
-			// The socket's buffer used to be the limit, because nothing moved
-			// a message off it until a call asked; the pump moves every one, so
-			// the limit has to be here instead.
-			//
-			// What is already queued stays. Dropping it would throw away
-			// messages that were received, and the replies in conversations
-			// outside the home channel are the ones history is least able to
-			// give back — that catch-up is best effort and stands down
-			// entirely when a scope is missing. So the newest message is
-			// refused instead, and catch-up asked for: no cursor has moved, so
-			// history still has it.
+		// The socket's buffer used to be the limit, because nothing moved a
+		// message off it until a call asked; the pump moves every one, so the
+		// limit has to be here instead.
+		//
+		// What is already queued stays. Dropping it would throw away messages
+		// that were received, and the newest is the one history is most
+		// certain to still have. The two queues are counted apart so that a
+		// flood in the home channel cannot crowd out a reply in a conversation
+		// elsewhere: those are the ones history is least able to give back,
+		// since that catch-up is best effort and stands down entirely when a
+		// scope is missing.
+		home := msg.Channel == "" || msg.Channel == b.cfg.Channel
+		queue := &b.pendingThreads
+		if home {
+			queue = &b.pending
+		}
+		if len(*queue) >= maxPendingMessages {
 			b.requestCatchUpLocked()
-			log.Printf("the pending message queue is full at %d; the newest message will be re-read from history", maxPendingMessages)
+			// One line per episode, not one per message. This runs under the
+			// lock the pump holds, and a flood that logged every refusal would
+			// turn the overflow into the thing that stopped the socket.
+			if !b.pendingFull {
+				b.pendingFull = true
+				log.Printf("the pending message queue is full at %d; further messages will be re-read from history", maxPendingMessages)
+			}
 			return
 		}
-		if msg.Channel == "" || msg.Channel == b.cfg.Channel {
-			b.pending = append(b.pending, msg)
-		} else {
-			b.pendingThreads = append(b.pendingThreads, msg)
-		}
+		b.pendingFull = false
+		*queue = append(*queue, msg)
 		b.notifyPendingLocked()
 	case StreamConnected, StreamDropped:
 		// Both mean the live stream may have a hole in it. History is the
@@ -710,7 +728,12 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	owner := b.cfg.Owner
 	b.mu.Unlock()
 
-	var fetched, conversations []Message
+	var (
+		fetched, conversations []Message
+		// seeding marks the first run against a channel, where the cursor is
+		// being established rather than read from.
+		seeding bool
+	)
 	if needCatchUp {
 		if lastTS == "" {
 			// First run against this channel: seeding from the newest
@@ -721,6 +744,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 				return nil, err
 			}
 			lastTS = seeded
+			seeding = true
 		} else {
 			var err error
 			fetched, err = catchUp(ctx, api, channel, owner, lastTS)
@@ -759,7 +783,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 
 	// Live events and history overlap around a reconnect; merging deduplicates
 	// by timestamp and drops anything at or before the cursor.
-	home := mergeMessages(b.lastTS, fetched, b.pending)
+	//
+	// Except on the run that establishes the cursor. The seed is the newest
+	// message the channel already had, and a message the pump took from the
+	// socket while history was being read is in that window too — so filtering
+	// against the seed would discard the very messages the owner sent after
+	// the session started. Those were received live, which is what makes them
+	// new whatever the seed says.
+	cursor := b.lastTS
+	if seeding {
+		cursor = ""
+	}
+	home := mergeMessages(cursor, fetched, b.pending)
 	b.pending = nil
 
 	threads := b.mergeThreadMessagesLocked(conversations, b.pendingThreads)
