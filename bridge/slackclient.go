@@ -65,6 +65,7 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 		interactions: make(chan Interaction, liveInteractionBuffer),
 		reactions:    make(chan Reaction, liveReactionBuffer),
 		owner:        cfg.Owner,
+		botUserID:    auth.UserID,
 	}
 
 	go stream.consume(ctx, client)
@@ -440,6 +441,12 @@ type socketModeStream struct {
 	interactions chan Interaction
 	reactions    chan Reaction
 	owner        string
+	// botUserID is this app's own user ID, learned when the connection opened.
+	// It is here, rather than only on the bridge, so the receipt reactions the
+	// bridge itself adds are discarded before they take space in the queue: a
+	// catch-up can auto-ack hundreds of messages at once, and a colleague's
+	// vote arriving behind that backlog would be the one that did not fit.
+	botUserID string
 	// dropped is set when an event could not be queued. It is sticky rather
 	// than an event of its own because the queue being full is exactly when
 	// a StreamDropped event would not fit either; the flag is converted into
@@ -511,7 +518,12 @@ func (s *socketModeStream) handle(ack acker, evt socketmode.Event) {
 		}
 
 		if reaction, ok := toReaction(api.InnerEvent.Data); ok {
-			s.emitReaction(reaction)
+			// The bridge's own receipts are its own echo, and dropping them
+			// here keeps them out of the queue entirely rather than only out
+			// of the delivery.
+			if reaction.User == "" || reaction.User != s.botUserID {
+				s.emitReaction(reaction)
+			}
 			return
 		}
 

@@ -70,7 +70,7 @@ settings:
       - app_mention
       # Emoji put on or taken off a message the session can see, which is how
       # the agent learns that somebody answered a post it asked people to react
-      # to. Unlike messages, these are relayed whoever reacted.
+      # to. Unlike messages, these are relayed no matter who reacted.
       - reaction_added
       - reaction_removed
   interactivity:

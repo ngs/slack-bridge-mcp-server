@@ -455,10 +455,17 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 				reactions = nil
 				continue
 			}
+			// Messages first: a reaction on the message that opens a
+			// conversation must not be judged before that message has opened
+			// it.
+			if err := b.drainStreamEvents(stream); err != nil {
+				return WaitResult{}, err
+			}
 			b.absorbReaction(r)
 
 		case in, ok := <-clicks:
 			if !ok {
+				b.drainStreamReactions(reactions)
 				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
@@ -469,6 +476,10 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 		case evt, ok := <-stream.Events():
 			if !ok {
+				// Whatever emoji are still buffered were received before the
+				// socket died, so they are kept for the next call rather than
+				// dying with the connection.
+				b.drainStreamReactions(reactions)
 				b.noteStreamClosed(stream)
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}

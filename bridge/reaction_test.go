@@ -410,3 +410,105 @@ type olderConnector struct {
 func (c olderConnector) Connect(context.Context, Config) (API, Stream, error) {
 	return c.api, c.stream, nil
 }
+
+// Messages and reactions arrive on channels of their own, and a select picks
+// between two ready channels at random. A reaction on the very message that
+// opens a conversation must not be judged before that message has opened it:
+// Socket Mode delivered the mention first, and classifying the reaction ahead
+// of it would drop a vote that was never anybody's to lose.
+//
+// The race is a coin flip per attempt, so the scenario is run enough times that
+// the old ordering could not have survived it.
+func TestAReactionOnTheOpeningMentionIsNotDropped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for attempt := 0; attempt < 10; attempt++ {
+		b, _, stream := mentionBridge(ctx, t)
+
+		// Both are already on the wire when the wait starts, which is what a
+		// colleague reacting the moment the owner asks looks like.
+		send(stream, otherChannel, "200.000100", "", mention("ship it?"))
+		react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
+
+		var (
+			messages  []Message
+			reactions []Reaction
+		)
+		// Two waits: the message and the reaction need not come back in the
+		// same delivery, only both.
+		for i := 0; i < 2; i++ {
+			result := waitOnce(ctx, t, b)
+			messages = append(messages, result.Messages...)
+			reactions = append(reactions, result.Reactions...)
+		}
+
+		if len(messages) != 1 {
+			t.Fatalf("attempt %d: delivered %v, want the mention", attempt, texts(messages))
+		}
+		if len(reactions) != 1 {
+			t.Fatalf("attempt %d: delivered %d reactions, want the vote on the message that opened the conversation", attempt, len(reactions))
+		}
+		if err := b.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}
+}
+
+// The bridge puts a receipt on every message it delivers, and a catch-up can
+// deliver hundreds at once. Those echoes are dropped at the socket rather than
+// at the delivery, so they never take the space a colleague's vote needs.
+func TestTheBridgesOwnReceiptsNeverEnterTheQueue(t *testing.T) {
+	stream := newTestStream(4)
+	stream.botUserID = testBotUser
+
+	stream.handle(func(socketmode.Request) {}, reactionEnvelope(t, "reaction_added", testBotUser, "eyes"))
+	if len(stream.reactions) != 0 {
+		t.Errorf("queued %d reactions, want 0: the bridge's own receipt is its own echo", len(stream.reactions))
+	}
+
+	// Somebody else's reaction still gets through.
+	stream.handle(func(socketmode.Request) {}, reactionEnvelope(t, "reaction_added", colleague, "white_check_mark"))
+	if len(stream.reactions) != 1 {
+		t.Errorf("queued %d reactions, want the colleague's", len(stream.reactions))
+	}
+}
+
+// Reactions that reached the bridge before the socket died are not the loss the
+// live-only limitation describes: they were received. Whether the wait notices
+// the reaction or the closed events channel first is a coin flip, so the
+// promise is the one that holds either way — the reaction is delivered, or it
+// is kept for the next call. What it must never be is gone.
+func TestBufferedReactionsSurviveTheStreamClosing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for attempt := 0; attempt < 10; attempt++ {
+		b, _, stream := mentionBridge(ctx, t)
+
+		react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+		close(stream.events)
+
+		result, err := b.Wait(ctx, 50*time.Millisecond)
+		switch {
+		case err == nil && len(result.Reactions) == 1:
+			// Delivered before the closure was noticed.
+		case err != nil && b.pendingReactionCount() == 1:
+			// The closure was noticed first, and the reaction was kept.
+		default:
+			t.Fatalf("attempt %d: Wait() = %+v, err = %v, pending = %d; the reaction that arrived before the socket died was lost",
+				attempt, result, err, b.pendingReactionCount())
+		}
+		if err := b.Close(); err != nil {
+			t.Fatalf("attempt %d: Close() error = %v", attempt, err)
+		}
+	}
+}
+
+// pendingReactionCount reports how many reactions are waiting to be handed
+// over, for tests that need to see one survive a call that failed.
+func (b *Bridge) pendingReactionCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pendingReactions)
+}

@@ -106,6 +106,58 @@ func (b *Bridge) absorbReaction(r Reaction) {
 	b.notifyPendingLocked()
 }
 
+// drainStreamReactions absorbs every reaction already queued on the stream,
+// without waiting for more.
+//
+// It is called on the way out of a dying connection. The socket closes its
+// three channels together, and a call that notices the events channel first
+// would otherwise abandon whatever emoji were still sitting in the buffer —
+// and those are reactions the bridge did receive, which is not the loss the
+// live-only limitation describes.
+//
+// The closed check is not a formality: a closed channel is permanently ready,
+// so without it this loop would spin instead of reaching its default. Receiving
+// from a closed channel still yields what was buffered first, so nothing that
+// arrived before the close is left behind.
+func (b *Bridge) drainStreamReactions(reactions <-chan Reaction) {
+	for {
+		select {
+		case r, ok := <-reactions:
+			if !ok {
+				return
+			}
+			b.absorbReaction(r)
+		default:
+			return
+		}
+	}
+}
+
+// drainStreamEvents absorbs every message already queued on the stream, without
+// waiting for more.
+//
+// It runs before a reaction is classified. Messages and reactions arrive on
+// channels of their own, and a select picks between two ready channels at
+// random, so a reaction on the very message that opens a conversation could
+// otherwise be judged before the mention that opened it — and dropped for want
+// of a conversation that was already on its way. Socket Mode delivers the
+// mention first; this keeps that order where it matters.
+func (b *Bridge) drainStreamEvents(stream Stream) error {
+	for {
+		select {
+		case evt, ok := <-stream.Events():
+			if !ok {
+				return nil
+			}
+			if err := b.absorb(evt); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 // drainReactions takes everything queued for the next delivery.
 //
 // Reactions have no cursor and no catch-up: they exist only on the live
