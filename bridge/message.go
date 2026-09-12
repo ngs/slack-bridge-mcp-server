@@ -249,6 +249,22 @@ func splitTS(ts string) (seconds, sequence int64, ok bool) {
 // the same reconnect. Deduplicating here means the caller never sees it twice
 // no matter how the two races resolve. When after is empty, nothing is
 // filtered out by age.
+// mergeLive merges what history returned with what the socket delivered, and
+// filters only the first by the cursor.
+//
+// A live message is never filtered, because the cursor does not describe it. It
+// was received by this session, from the socket, and it has not been handed to
+// anybody: a cursor at or past its timestamp means history has been read that
+// far, which says nothing about whether this message was delivered. The case
+// that makes it matter is the seed — the cursor is taken from the newest
+// message in the channel, and a message posted while that read was in flight
+// can be older than it — but the rule holds generally, and a message the owner
+// sent to this session is not the channel's past.
+func mergeLive(after string, fetched, live []Message) []Message {
+	merged := mergeMessages(after, fetched)
+	return mergeMessages("", merged, live)
+}
+
 func mergeMessages(after string, sources ...[]Message) []Message {
 	seen := make(map[string]bool)
 	var merged []Message

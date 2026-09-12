@@ -24,6 +24,12 @@ const maxClosingSweep = 4 * maxSweep
 // cannot hold the lock for ever.
 const maxTeardownSweep = 16 * maxClosingSweep
 
+// overflowPollWait is how often the pump asks a quiet stream whether it has
+// refused a message it could not announce. A refusal happens when the channel
+// is full, and the announcement needs room on that same channel, so a stream
+// that then goes quiet holds the news indefinitely.
+const overflowPollWait = 250 * time.Millisecond
+
 // pump owns the live connection.
 //
 // It is the only goroutine that receives from the stream: messages, clicks and
@@ -49,6 +55,11 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 	// carried holds reactions taken from the socket that are waiting for the
 	// messages ahead of them to be applied.
 	var carried []Reaction
+
+	// The stream's overflow flag is not delivered as anything, so it is looked
+	// at on a timer as well as on every turn the traffic brings round.
+	overflowPoll := time.NewTimer(overflowPollWait)
+	defer overflowPoll.Stop()
 
 	for {
 		// What the stream has lost, and what it is about to say it lost, both
@@ -122,6 +133,13 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			}
 			b.applyClick(generation, in)
 
+		case <-overflowPoll.C:
+			// An overflow is a flag on the stream, not an event: the stream
+			// cannot announce one until the channel that had no room has some,
+			// and if nothing else ever arrives that moment never comes. So the
+			// pump comes back and looks rather than waiting to be woken.
+			overflowPoll.Reset(overflowPollWait)
+
 		case r, ok := <-reactions:
 			if !ok {
 				// The reactions close first of the three, so this is the
@@ -159,11 +177,16 @@ func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if lostReactions {
+		// Before the staleness check, and deliberately. The marker clears when
+		// it is read, so a connection replaced between the question and this
+		// lock would take the answer with it — and a reaction lost on a
+		// connection that has since died is still a reaction the agent's count
+		// is missing.
+		b.noteReactionsDroppedLocked()
+	}
 	if b.stale(generation) {
 		return
-	}
-	if lostReactions {
-		b.noteReactionsDroppedLocked()
 	}
 	if overflow && !b.needCatchUp {
 		// The messages behind it are only recoverable by reading the window

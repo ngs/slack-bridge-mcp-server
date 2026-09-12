@@ -231,6 +231,10 @@ func (b *Bridge) endStateWrite() {
 	b.stateWriting = false
 }
 
+// stateWriteIdlePoll is how often a write already inside the store is checked
+// for having finished.
+const stateWriteIdlePoll = 2 * time.Millisecond
+
 // awaitStateWriteIdle waits for a write already inside the store to finish.
 // Fencing stops the next one; this is for the one that is past the fence.
 func (b *Bridge) awaitStateWriteIdle() bool {
@@ -245,7 +249,7 @@ func (b *Bridge) awaitStateWriteIdle() bool {
 		if !time.Now().Before(deadline) {
 			return false
 		}
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(stateWriteIdlePoll)
 	}
 }
 

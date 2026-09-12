@@ -1594,3 +1594,82 @@ func TestAGappedSeedKeepsTheExemptionForTheQueueItLeftBehind(t *testing.T) {
 		t.Fatal("Wait() never returned")
 	}
 }
+
+// A seed established by a call whose connection was replaced is kept in memory,
+// because that call may not write. The call that takes over may have nothing of
+// its own to record — an empty channel, or replies and no messages — and if the
+// seed went unwritten with it, a restart would seed again and read everything
+// sent while the session was down as the channel's past.
+func TestASeedFromAReplacedCallStillReachesTheStateFile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	api := &fakeAPI{botUserID: testBotUser}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on an empty channel", result)
+	}
+
+	// What a replaced call leaves behind: the seed in memory and the debt for
+	// the write it could not make.
+	b.mu.Lock()
+	b.cursorSeeded = true
+	b.lastTS = "100.000900"
+	b.seedUnwritten = true
+	b.mu.Unlock()
+
+	// A call with nothing at all to hand over.
+	if _, _, err := b.drainCatchUp(ctx, b.currentGeneration(), true, time.Second); err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+
+	eventuallyOnDisk(t, "the seed to reach the state file", func() bool {
+		stored, err := NewStore(cfg.StateDir).LastTS(testChannel)
+		return err == nil && stored == "100.000900"
+	})
+}
+
+// The stream's lost-reaction marker clears when it is read. A connection
+// replaced between the question and the answer would otherwise take the answer
+// with it, and a reaction lost on a connection that has died is still one the
+// agent's count is missing.
+func TestALossReadFromAReplacedStreamIsStillRecorded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	stream.reactionsDropped.Store(true)
+	b.noteStreamLosses(b.currentGeneration()-1, stream)
+
+	if !b.droppedReactionMark() {
+		t.Error("a loss read from a replaced connection was forgotten; the agent's count is wrong and it cannot know")
+	}
+}
+
+// An overflow is a flag on the stream rather than an event, and the stream can
+// only announce one once the channel that had no room has some. A connection
+// that then goes quiet would hold the news for as long as the quiet lasted.
+func TestAQuietStreamsOverflowIsStillNoticed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// Nothing follows it: no message, no click, no reaction.
+	stream.pendingOverflow.Store(true)
+
+	eventually(t, "the refused message to be asked for", func() bool { return b.catchUpDue() })
+}

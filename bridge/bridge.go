@@ -136,6 +136,11 @@ type Bridge struct {
 	// per episode.
 	pendingFull bool
 	threadsFull bool
+	// seedUnwritten marks a seed established in memory by a call that could
+	// not write it — one whose connection was replaced underneath it. The next
+	// call to commit on the live connection writes it, whether or not it has
+	// anything of its own to record.
+	seedUnwritten bool
 	// cursorSeeded records that the home cursor has been established, which an
 	// empty channel does with an empty timestamp.
 	cursorSeeded bool
@@ -441,11 +446,40 @@ func (b *Bridge) Close() error {
 	if !mayReleaseLock {
 		// A write is still inside the store and cannot be called back. The
 		// lock is what keeps the next session from reading a file this one can
-		// still rewrite, so it is kept — the operating system releases it when
-		// this process exits, by which time that write is over.
+		// still rewrite, so it is held until that write is over — and released
+		// from there rather than here, because an open file nobody refers to
+		// any more is closed by the runtime, and closing it releases the very
+		// lock being held.
+		go b.releaseWhenWritesEnd(lock)
 		return nil
 	}
 	return lock.Release()
+}
+
+// lockHoldWait bounds how long a lock is held for a write that will not end.
+// It is generous: the alternative to waiting is another session writing the
+// same file, and a write that takes this long has something worse wrong with
+// it than the wait.
+const lockHoldWait = time.Minute
+
+// releaseWhenWritesEnd holds the single-instance lock until the write that
+// outlasted shutdown has finished, and only then lets it go. The reference
+// matters as much as the timing: an os.File that becomes unreachable is closed
+// by the runtime, and the close releases the lock.
+func (b *Bridge) releaseWhenWritesEnd(lock *Lock) {
+	deadline := time.Now().Add(lockHoldWait)
+	for time.Now().Before(deadline) {
+		b.stateWriteMu.Lock()
+		writing := b.stateWriting
+		b.stateWriteMu.Unlock()
+		if !writing {
+			break
+		}
+		time.Sleep(stateWriteIdlePoll)
+	}
+	if err := lock.Release(); err != nil {
+		log.Printf("could not release the single-instance lock after the last state file write: %s", logSafe(err.Error(), maxLoggedError))
+	}
 }
 
 // ensure performs the lazy connect: validate configuration, take the
@@ -1039,6 +1073,13 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// call that hands the messages over.
 		if seeding && !b.cursorSeeded && !b.closed {
 			b.establishSeedLocked(channel, lastTS, false)
+			// Nothing here may write, and the call that takes over may have
+			// nothing to hand over — an empty home channel, or replies and no
+			// messages — in which case it commits no cursor of its own. The
+			// debt is recorded so that whichever call commits next pays it:
+			// unpaid, a restart seeds again and reads everything sent while
+			// this session was down as the channel's past.
+			b.seedUnwritten = true
 		}
 		return nil, nil, nil
 	}
@@ -1102,12 +1143,17 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// queued, both kinds of them, and the catch-up that has been asked for
 	// reads the window again with them still there. What was fetched is
 	// delivered: that window has no hole in it.
+	// The seed another call established in memory and could not write. Paid
+	// here, where the connection is the live one and the lock is held, and
+	// before any of the early returns below.
+	b.writeSeedDebtLocked(channel)
+
 	live, liveThreads := b.pending, b.pendingThreads
 	if gapped {
 		live, liveThreads = nil, nil
 	}
 
-	home := mergeMessages(cursor, fetched, live)
+	home := mergeLive(cursor, fetched, live)
 	threads := b.mergeThreadMessagesLocked(conversations, liveThreads)
 	if !gapped {
 		b.pending = nil
@@ -1284,6 +1330,29 @@ func (b *Bridge) cursorWouldPassQueuedLocked(delivered []Message) bool {
 		}
 	}
 	return false
+}
+
+// writeSeedDebtLocked records a seed that was established in memory by a call
+// that could not write it. The caller must hold b.mu and must be on the live
+// connection.
+func (b *Bridge) writeSeedDebtLocked(channel string) {
+	if !b.seedUnwritten || b.store == nil || b.closed {
+		return
+	}
+	b.seedUnwritten = false
+
+	if b.lastTS == "" {
+		// An empty channel leaves no cursor, only the mark that says it was
+		// looked at.
+		b.recordStateWriteLocked(stateWrite{
+			stateKey: stateKey{kind: writeSeeded, channel: channel},
+		})
+		return
+	}
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeLastTS, channel: channel},
+		ts:       b.lastTS,
+	})
 }
 
 // establishSeedLocked records where this session found the channel. The caller
