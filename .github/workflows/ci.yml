@@ -54,7 +54,10 @@ jobs:
 
     - name: Run tests
       shell: bash
-      run: go test -v -timeout=30s -coverprofile=coverage.txt -covermode=atomic ./...
+      # The suite spends most of its time waiting on deliberately short
+      # deadlines, and the slowest runner in the matrix takes about twice as
+      # long as the quickest. The timeout is a stuck-test net, not a budget.
+      run: go test -v -timeout=180s -coverprofile=coverage.txt -covermode=atomic ./...
       env:
         CI: true
 

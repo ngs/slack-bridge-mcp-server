@@ -22,7 +22,7 @@ const maxClosingSweep = 4 * maxSweep
 // altogether. The socket is stopping, so the channel empties rather than
 // refills, and this is only the promise that a stream which does neither
 // cannot hold the lock for ever.
-const maxTeardownSweep = 16 * maxClosingSweep
+const maxTeardownSweep = 4 * maxClosingSweep
 
 // overflowPollWait is how often the pump asks a quiet stream whether it has
 // refused a message it could not announce. A refusal happens when the channel
