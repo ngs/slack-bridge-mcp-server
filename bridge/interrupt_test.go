@@ -300,7 +300,7 @@ func TestAskDoesNotDrainWhenTheConnectionCloses(t *testing.T) {
 		for b.pendingAskTS() == "" {
 			time.Sleep(2 * time.Millisecond)
 		}
-		close(stream.events)
+		stream.closeEvents()
 	}()
 
 	result, err := b.Ask(ctx, AskRequest{

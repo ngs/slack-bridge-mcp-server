@@ -383,6 +383,31 @@ type fakeStream struct {
 	reactions    chan Reaction
 	// reactionsDropped stands in for a queue that overflowed.
 	reactionsDropped atomic.Bool
+
+	// closeEventsOnce and friends make closing idempotent: the connector
+	// closes everything when the connection's context is cancelled, the way
+	// the real socket does, and a test may have closed one of them already.
+	closeEventsOnce       sync.Once
+	closeInteractionsOnce sync.Once
+	closeReactionsOnce    sync.Once
+}
+
+// closeEvents ends the message half of the stream.
+func (s *fakeStream) closeEvents() {
+	s.closeEventsOnce.Do(func() { close(s.events) })
+}
+
+// closeInteractions ends the click half.
+func (s *fakeStream) closeInteractions() {
+	s.closeInteractionsOnce.Do(func() { close(s.interactions) })
+}
+
+// closeAll ends the whole stream, in the order the real one does: reactions,
+// then clicks, then the events channel a disconnection is reported from.
+func (s *fakeStream) closeAll() {
+	s.closeReactionsOnce.Do(func() { close(s.reactions) })
+	s.closeInteractions()
+	s.closeEvents()
 }
 
 func newFakeStream() *fakeStream {
@@ -412,7 +437,7 @@ type fakeConnector struct {
 	calls int
 }
 
-func (c *fakeConnector) Connect(context.Context, Config) (API, Stream, error) {
+func (c *fakeConnector) Connect(ctx context.Context, _ Config) (API, Stream, error) {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
@@ -420,6 +445,13 @@ func (c *fakeConnector) Connect(context.Context, Config) (API, Stream, error) {
 	if c.err != nil {
 		return nil, nil, c.err
 	}
+	// The real connector's stream closes its channels when the connection's
+	// context is cancelled, and the pump waits for that on its way out. A fake
+	// that never closed would make every shutdown wait out that deadline.
+	go func() {
+		<-ctx.Done()
+		c.stream.closeAll()
+	}()
 	return c.api, c.stream, nil
 }
 
@@ -860,7 +892,7 @@ func TestWaitFailsWhenTheClickChannelCloses(t *testing.T) {
 	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
 	defer func() { _ = b.Close() }()
 
-	close(stream.interactions)
+	stream.closeInteractions()
 
 	done := make(chan error, 1)
 	go func() {
@@ -928,7 +960,7 @@ func TestWaitFailsWhenTheStreamClosesForGood(t *testing.T) {
 	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
 	defer func() { _ = b.Close() }()
 
-	close(stream.events)
+	stream.closeEvents()
 
 	if _, err := b.Wait(context.Background(), MaxWaitTimeout); err == nil {
 		t.Error("Wait() = nil error after the stream closed, want the disconnection reported")

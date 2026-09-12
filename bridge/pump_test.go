@@ -128,7 +128,7 @@ func TestADisconnectDuringCatchUpStillDeliversWhatWasInHand(t *testing.T) {
 
 	// The socket dies while history is in flight.
 	eventually(t, "catch-up to reach Slack", func() bool { return len(api.calls()) > 0 })
-	close(stream.events)
+	stream.closeEvents()
 	close(gate)
 
 	select {
@@ -313,7 +313,7 @@ func TestAClickThatArrivedWithTheDisconnectionIsStillAnAnswer(t *testing.T) {
 		// Queued, then the socket dies: endStream routes the click and records
 		// the closure, and both reach the question together.
 		stream.interactions <- click(testOwner, askTS, 1)
-		close(stream.events)
+		stream.closeEvents()
 	}()
 
 	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout})
@@ -491,7 +491,7 @@ func TestAReplacedConnectionsPumpAppliesNothingMore(t *testing.T) {
 
 	// The connection dies, its pump records it, and the next call opens the
 	// replacement.
-	close(old.events)
+	old.closeEvents()
 	eventually(t, "the pump to record the disconnection", func() bool { return !b.Status().Connected })
 	if result := waitOnce(ctx, t, b); !result.TimedOut {
 		t.Fatalf("Wait() = %+v, want a timeout on the replacement", result)
@@ -500,16 +500,16 @@ func TestAReplacedConnectionsPumpAppliesNothingMore(t *testing.T) {
 		t.Fatal("the replacement connection was never opened")
 	}
 
-	// Anything still on the old stream belongs to a connection nobody owns.
-	old.reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "tada", Added: true}
+	// The old connection is over: its stream was closed with it, and what
+	// reaches the agent from here is the replacement's.
 	send(connector.streams[1], testChannel, "100.000600", "", "on the live connection")
 
 	result := waitOnce(ctx, t, b)
 	if len(result.Messages) != 1 || result.Messages[0].TS != "100.000600" {
-		t.Fatalf("Wait() returned %v, want only what the live connection delivered", texts(result.Messages))
+		t.Fatalf("Wait() returned %v, want what the live connection delivered", texts(result.Messages))
 	}
 	if len(result.Reactions) != 0 {
-		t.Errorf("Wait() returned %+v from a connection that had been replaced", result.Reactions)
+		t.Errorf("Wait() returned %+v, want nothing from the connection that was replaced", result.Reactions)
 	}
 }
 
@@ -523,7 +523,7 @@ type reconnectingConnector struct {
 	calls int
 }
 
-func (c *reconnectingConnector) Connect(context.Context, Config) (API, Stream, error) {
+func (c *reconnectingConnector) Connect(ctx context.Context, _ Config) (API, Stream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -532,6 +532,11 @@ func (c *reconnectingConnector) Connect(context.Context, Config) (API, Stream, e
 		stream = c.streams[c.calls]
 	}
 	c.calls++
+	// Closed with its connection, as the real one is.
+	go func() {
+		<-ctx.Done()
+		stream.closeAll()
+	}()
 	return c.api, stream, nil
 }
 
@@ -567,8 +572,7 @@ func TestAClickFromAReplacedConnectionIsIgnored(t *testing.T) {
 	// A click arriving from the connection before this one.
 	b.applyClick(b.currentGeneration()-1, click(testOwner, askTS, 0))
 
-	result := <-done
-	if !result.TimedOut {
+	if result := <-done; !result.TimedOut {
 		t.Errorf("Ask() = %+v, want the question to time out: the click belonged to a connection that is over", result)
 	}
 }
@@ -677,7 +681,7 @@ func TestAReplacedConnectionsLostReactionsAreStillReported(t *testing.T) {
 	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "tada", Added: true}
 	stale := b.currentGeneration() - 1
 
-	b.endStream(stale, b.currentStream(), nil, nil, reactions, nil)
+	b.endStream(stale, b.currentStream(), nil, nil, nil, reactions, nil)
 
 	if !b.droppedReactionMark() {
 		t.Error("a reaction received on a replaced connection was dropped with nothing said; the agent's count is wrong and it cannot know")
@@ -845,7 +849,7 @@ func TestAnOrdinaryReconnectReportsNoLoss(t *testing.T) {
 	b.mu.Lock()
 	b.connGeneration++
 	b.mu.Unlock()
-	b.endStream(stale, b.currentStream(), nil, nil, nil, nil)
+	b.endStream(stale, b.currentStream(), nil, nil, nil, nil, nil)
 
 	if b.droppedReactionMark() {
 		t.Error("an ordinary reconnect reported a lost reaction; nothing was in flight to lose")
@@ -955,5 +959,45 @@ func TestAGappedCatchUpKeepsTheLiveBacklog(t *testing.T) {
 	}
 	if b.Status().PendingBacklogCount != 1 {
 		t.Error("the message behind the hole was dropped rather than kept for the catch-up that covers it")
+	}
+}
+
+// A click routed by a connection the question never saw is not its answer. The
+// question is about to be told its own connection is gone; the click belongs to
+// whatever is asked next.
+func TestAClickFromALaterConnectionDoesNotAnswerAnOlderQuestion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := askBridge(ctx, t)
+
+	type outcome struct {
+		result AskResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		// An error is expected and not the point: a question whose connection
+		// is replaced is told so. The point is what it must not return, which
+		// is an answer it never had.
+		result, err := b.Ask(ctx, AskRequest{
+			Question: "Deploy now?", Options: []string{"Yes", "No"},
+			Timeout: 300 * time.Millisecond, InterruptDisabled: true,
+		})
+		done <- outcome{result, err}
+	}()
+	waitForQuestion(b)
+
+	// The connection is replaced, and the replacement routes a click that
+	// matches the question's own message.
+	b.mu.Lock()
+	b.connGeneration++
+	live := b.connGeneration
+	b.mu.Unlock()
+	b.applyClick(live, click(testOwner, askTS, 0))
+
+	got := <-done
+	if got.err == nil && got.result.ChoiceIndex >= 0 {
+		t.Errorf("Ask() = %+v, want no answer: the click came from a connection the question never had", got.result)
 	}
 }

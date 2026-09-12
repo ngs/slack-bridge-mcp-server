@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"time"
 )
 
 // maxSweep bounds one non-blocking drain of a stream channel. It is comfortably
@@ -55,7 +56,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			b.drainReadyClicks(generation, clicks)
 			select {
 			case <-ctx.Done():
-				b.endStream(generation, stream, events, clicks, reactions, carried)
+				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
 				return
 			default:
 			}
@@ -70,12 +71,18 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			// recover — and then the closure is recorded, so a call blocked on
 			// a context of its own is told rather than left waiting on a
 			// stream with no reader.
-			b.endStream(generation, stream, events, clicks, reactions, carried)
+			//
+			// The socket is stopping on the same context, and it can still be
+			// in the middle of handing something over: a last look is taken
+			// once it has closed its channels, or once a short wait says it is
+			// not going to.
+			late := awaitStreamClose(events)
+			b.endStream(generation, stream, late, events, clicks, reactions, carried)
 			return
 
 		case evt, ok := <-events:
 			if !ok {
-				b.endStream(generation, stream, events, clicks, reactions, carried)
+				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
 				return
 			}
 			if b.applyEvent(generation, evt, events, reactions, carried) {
@@ -84,14 +91,14 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 
 		case in, ok := <-clicks:
 			if !ok {
-				b.endStream(generation, stream, events, clicks, reactions, carried)
+				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
 				return
 			}
 			b.applyClick(generation, in)
 
 		case r, ok := <-reactions:
 			if !ok {
-				b.endStream(generation, stream, events, clicks, reactions, carried)
+				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
 				return
 			}
 			// Carried rather than applied. The next turn of the loop applies
@@ -231,6 +238,42 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 	b.deliverInteraction(in)
 }
 
+// awaitStreamClose waits, briefly, for the socket to finish closing its
+// channels after a cancellation.
+//
+// The pump and the socket stop on the same context, and the socket can be
+// between receiving something and enqueueing it when the pump notices. Without
+// this the pump returns first and that last event is neither delivered nor
+// counted as lost — and a reaction has no history to be recovered from. The
+// wait is short because a socket that has not finished in this long is one
+// shutdown should not be held up by; what it was holding is then reported as
+// lost, like anything else abandoned.
+func awaitStreamClose(events <-chan StreamEvent) []StreamEvent {
+	deadline := time.NewTimer(streamCloseWait)
+	defer deadline.Stop()
+
+	var late []StreamEvent
+	for len(late) < maxSweep {
+		select {
+		case evt, ok := <-events:
+			if !ok {
+				return late
+			}
+			// Something was still coming. It is carried to endStream rather
+			// than applied here, so it goes in with the rest of the backlog
+			// and in the order it arrived.
+			late = append(late, evt)
+		case <-deadline.C:
+			return late
+		}
+	}
+	return late
+}
+
+// streamCloseWait is how long a cancelled pump waits for the socket to finish
+// closing its channels.
+const streamCloseWait = 250 * time.Millisecond
+
 // endStream takes what the dying connection had already delivered — including
 // the reactions the pump was carrying, which are as received as anything on the
 // channels — and then records that it is over.
@@ -245,7 +288,7 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 // the conversations that are open. It was all received before the socket died,
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
-func (b *Bridge) endStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
+func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
 	// Asked once, before the lock, and kept whichever branch this takes: it is
 	// a question for somebody else's implementation, and asking clears the
 	// answer, so asking twice would lose it.
@@ -266,7 +309,7 @@ func (b *Bridge) endStream(generation uint64, stream Stream, events <-chan Strea
 		// abandons nothing, and saying otherwise would send the agent to
 		// re-read a tally that was never wrong, every time the socket
 		// reconnected.
-		if len(carried) > 0 || len(reactions) > 0 {
+		if len(carried) > 0 || len(reactions) > 0 || len(late) > 0 {
 			b.reactionsDropped = true
 		}
 		b.mu.Unlock()
@@ -277,6 +320,11 @@ func (b *Bridge) endStream(generation uint64, stream Stream, events <-chan Strea
 	// messages ahead of it share one: a call woken halfway through would hand
 	// over the messages and find the reactions that arrived with them only on
 	// its next turn, which is the split this design exists to remove.
+	// The late ones first: they came off the channel ahead of whatever is
+	// still on it.
+	for _, evt := range late {
+		b.absorbLocked(evt)
+	}
 	drainLocked(events, maxSweep, b.absorbLocked)
 	drainLocked(clicks, maxSweep, b.deliverInteraction)
 	// Carried first: those were taken from the socket before the ones still on

@@ -594,6 +594,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			return WaitResult{}, errors.New("the Slack connection closed")
 		}
 
+		// A loss is news on its own. Without this the wait would go back to
+		// sleep on a full-length deadline, holding a marker that says the
+		// agent's count is wrong and that nothing else is going to mention.
+		if b.takeReactionsDropped(generation) {
+			return WaitResult{Messages: []Message{}, ReactionsDropped: true}, nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return WaitResult{}, ctx.Err()
@@ -863,15 +870,17 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// delivering none of it. Kept in memory only; the write belongs to the
 		// call that hands the messages over.
 		if seeding && !b.cursorSeeded && !b.closed {
-			b.lastTS = lastTS
-			b.cursorSeeded = true
-			// The messages taken while that seed was being read are still
-			// queued, and they are older than it. The next merge has to treat
-			// them as the seeding run would have, or the cursor just set is
-			// what filters them out.
-			b.seedMergePending = true
+			b.establishSeedLocked(channel, lastTS, false)
 		}
 		return nil, nil, nil
+	}
+
+	// Asked whether or not a fetch was due: the pump can raise a request in the
+	// window between this call releasing the lock and taking it again, and a
+	// commit that ignored it would merge the queues and move the cursors
+	// without ever reading the window that request was about.
+	if epoch != b.catchUpEpoch {
+		gapped = true
 	}
 
 	if needCatchUp {
@@ -886,45 +895,14 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// meanwhile would leave the cursor unset, to be seeded again against a
 		// channel that has moved on.
 		if seeding && !b.cursorSeeded {
-			b.cursorSeeded = true
-			switch {
-			case b.preSeedRefused:
-				// The queue overflowed while this seed was being read, so the
-				// seed is not the cursor: it would filter out the refused
-				// messages as older than itself. The batch below sets the
-				// cursor instead, and the catch-up already asked for reads
-				// everything after it.
-				b.preSeedRefused = false
-			case lastTS == "":
-				// An empty channel. Seeded, and the cursor is empty because
-				// there was nothing to point at; nothing to write either.
-				b.lastTS = ""
-			default:
-				b.lastTS = lastTS
-				// Written here rather than where it was read, so it cannot
-				// reach the file ahead of the messages that arrived while it
-				// was being read — those are older than the seed and a restart
-				// would filter them out.
-				b.recordStateWriteLocked(stateWrite{
-					stateKey: stateKey{kind: writeLastTS, channel: channel},
-					ts:       lastTS,
-				})
-			}
+			b.establishSeedLocked(channel, lastTS, true)
 		}
 		// The flag, only if nothing has asked again since this one started. A
 		// reconnect or a refused message that arrived while history was in
 		// flight is a request this catch-up never saw, and clearing it would
 		// answer that request with a window that did not include it.
-		if epoch == b.catchUpEpoch {
+		if !gapped {
 			b.needCatchUp = false
-		} else {
-			// There is a gap, somewhere after what this fetch covered. The
-			// live messages queued behind it are newer than the gap, and
-			// handing them over would move the cursor past it — so they stay
-			// where they are, and the catch-up that has been asked for reads
-			// the window again with them still in the queue. What was fetched
-			// is delivered: that window has no gap in it.
-			gapped = true
 		}
 	}
 
@@ -943,18 +921,23 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		b.seedMergePending = false
 	}
 
-	live := b.pending
+	// A gap means a hole somewhere after the window this fetch covered. The
+	// live messages queued behind it are newer than the hole, and handing them
+	// over would move the cursors past what the hole swallowed — so they stay
+	// queued, both kinds of them, and the catch-up that has been asked for
+	// reads the window again with them still there. What was fetched is
+	// delivered: that window has no hole in it.
+	live, liveThreads := b.pending, b.pendingThreads
 	if gapped {
-		// Left in the queue rather than merged: see above.
-		live = nil
-	}
-	home := mergeMessages(cursor, fetched, live)
-	if !gapped {
-		b.pending = nil
+		live, liveThreads = nil, nil
 	}
 
-	threads := b.mergeThreadMessagesLocked(conversations, b.pendingThreads)
-	b.pendingThreads = nil
+	home := mergeMessages(cursor, fetched, live)
+	threads := b.mergeThreadMessagesLocked(conversations, liveThreads)
+	if !gapped {
+		b.pending = nil
+		b.pendingThreads = nil
+	}
 
 	// Taken here, under the same lock, rather than by a second call. Two waits
 	// running together could otherwise split a pair the pump applied as one:
@@ -974,7 +957,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		return nil, reactions, nil
 	}
 
-	if len(home) > 0 {
+	if len(home) > 0 && !b.cursorWouldPassQueuedLocked(home[len(home)-1].TS) {
 		newest := home[len(home)-1].TS
 		// Never backwards. On the run that seeds the cursor, a message the pump
 		// took while history was being read can be older than the seed, and
@@ -1054,6 +1037,56 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	b.recordStateWriteLocked(stateWrite{
 		stateKey: stateKey{kind: writeThread, channel: m.Channel, threadTS: m.ThreadTS},
 		ts:       m.TS,
+	})
+}
+
+// cursorWouldPassQueuedLocked reports whether moving the home cursor to ts
+// would step over a message still waiting in the queue. The caller must hold
+// b.mu.
+//
+// It only ever says yes behind a gap, where the queue is deliberately left
+// alone: history can return a message newer than one the socket delivered, and
+// a cursor that moved past the queued one would have the next merge filter it
+// out as already seen.
+func (b *Bridge) cursorWouldPassQueuedLocked(ts string) bool {
+	for _, m := range b.pending {
+		if !tsLess(ts, m.TS) {
+			return true
+		}
+	}
+	return false
+}
+
+// establishSeedLocked records where this session found the channel. The caller
+// must hold b.mu.
+//
+// The seed is the cursor, and the messages taken from the socket while it was
+// being read are exempt from it: they arrived after the session started, and
+// they are older than a mark that describes the past. That is what
+// seedMergePending says, and it holds whether the refused ones made the queue
+// or not — without the seed as the cursor, catch-up would have no bound and
+// would read the channel's whole history back as new.
+//
+// commit is false for a call that can no longer deliver: the cursor is kept in
+// memory so a replacement does not seed again against a channel that has moved
+// on, and the write is left to whoever hands the messages over.
+func (b *Bridge) establishSeedLocked(channel, seed string, commit bool) {
+	b.cursorSeeded = true
+	b.lastTS = seed
+	b.seedMergePending = true
+	b.preSeedRefused = false
+
+	if !commit || seed == "" {
+		// Nothing to write: either this call cannot, or the channel was empty
+		// and there is no mark to record.
+		return
+	}
+	// Written here rather than where it was read, so it cannot reach the file
+	// ahead of the messages that arrived while it was being read — those are
+	// older than the seed and a restart would filter them out.
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeLastTS, channel: channel},
+		ts:       seed,
 	})
 }
 

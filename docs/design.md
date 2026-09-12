@@ -562,10 +562,12 @@ prevented by one.
 event takes the bridge lock for the length of a slice append; catch-up, which
 goes to Slack and back, stays in the calling goroutine where it always was, and
 the pump keeps draining the socket while it runs. Both queues are bounded, and what
-happens at the bound is what differs: a reaction past the cap is gone, and the
-agent is told so it can re-read the tally; a message past the cap is not, and
-the whole in-memory backlog is dropped in favour of a catch-up that fetches it
-again.
+happens at the bound is what differs. A reaction past the cap is gone, and the
+agent is told so it can re-read the tally. A message past the cap is not: what
+is already queued stays where it is, the newest is refused, and a catch-up is
+asked for — which, since no cursor has moved, still has it. Refusing rather than
+discarding matters because the queue holds replies from conversations outside
+the home channel, and the catch-up that would find those again is best effort.
 
 **Cancellation before disconnection.** Cancelling a call cancels the session's
 context in the usual arrangement, which ends the pump, which reports that the

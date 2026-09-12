@@ -121,6 +121,9 @@ type AskResult struct {
 // without caring whether the asking goroutine is still there to take it.
 type pendingAsk struct {
 	ts string
+	// generation is the connection the question was asked on. A click routed
+	// by a later one answers a question that connection never saw.
+	generation uint64
 	// channel is where the question was posted, which is where a click has to
 	// come from to be this question's answer.
 	channel string
@@ -169,7 +172,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		return AskResult{}, errors.New("a question is already waiting for an answer; wait for it to be answered or to time out before asking another")
 	}
 	channel := b.channelOr(req.Channel)
-	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel}
+	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel, generation: b.connGeneration}
 	b.ask = ask
 	api, generation := b.api, b.connGeneration
 	b.mu.Unlock()
@@ -511,6 +514,12 @@ func (b *Bridge) routeInteraction(in Interaction) {
 func (b *Bridge) deliverInteraction(in Interaction) {
 	ask := b.ask
 	if ask == nil {
+		return
+	}
+	if ask.generation != b.connGeneration {
+		// The question was asked on a connection that has since been replaced,
+		// and is about to be told so. A click routed by the replacement is not
+		// its answer: it belongs to whatever is asked next.
 		return
 	}
 

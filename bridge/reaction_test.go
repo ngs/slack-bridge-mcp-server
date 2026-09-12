@@ -408,6 +408,9 @@ type olderConnector struct {
 }
 
 func (c olderConnector) Connect(context.Context, Config) (API, Stream, error) {
+	// Deliberately not closed with its connection: this stands in for a
+	// connector written before any of this, and the pump's wait for the close
+	// is bounded precisely so one like it cannot hold shutdown up.
 	return c.api, c.stream, nil
 }
 
@@ -506,7 +509,7 @@ func TestBufferedReactionsSurviveTheStreamClosing(t *testing.T) {
 		b, _, stream := mentionBridge(ctx, t)
 
 		react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
-		close(stream.events)
+		stream.closeEvents()
 
 		// Generous, because both of the outcomes below are reached at once:
 		// a short deadline could fire first on a slow machine and say nothing
@@ -602,14 +605,15 @@ func TestADroppedReactionIsReportedToTheAgent(t *testing.T) {
 	b, _, stream := mentionBridge(ctx, t)
 	stream.reactionsDropped.Store(true)
 
-	// Nothing else to hand over: a timeout is exactly when the loss would
-	// otherwise go unmentioned.
+	// Nothing else to hand over, so the loss is the whole of what there is to
+	// say — and it is said straight away rather than at the end of a poll the
+	// agent is spending on a count it cannot know is wrong.
 	result := waitOnce(ctx, t, b)
-	if !result.TimedOut {
-		t.Fatalf("Wait() = %+v, want a timeout", result)
-	}
 	if !result.ReactionsDropped {
-		t.Error("reactions_dropped = false after the queue overflowed; the agent is left counting a tally it cannot know is wrong")
+		t.Fatalf("Wait() = %+v, want the loss reported", result)
+	}
+	if result.TimedOut {
+		t.Error("Wait() timed out with a loss to report, want it handed over as a delivery")
 	}
 
 	// And it is reported once: the record is cleared by the call that carried
@@ -677,7 +681,7 @@ func TestDrainingAClosedStreamMarksItDisconnected(t *testing.T) {
 	b, _, stream := mentionBridge(ctx, t)
 
 	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
-	close(stream.events)
+	stream.closeEvents()
 
 	_, _ = b.Wait(ctx, 5*time.Second)
 
@@ -695,10 +699,15 @@ func TestADroppedReactionSurvivesTheConnectionItWasLostOn(t *testing.T) {
 	b, _, stream := mentionBridge(ctx, t)
 
 	stream.reactionsDropped.Store(true)
-	close(stream.events)
+	stream.closeEvents()
 
-	_, _ = b.Wait(ctx, 5*time.Second)
-
+	// Whichever the call notices first — the loss or the closure — the loss is
+	// not what goes missing: either it comes back with this result, or it is
+	// still on the bridge for the next call.
+	result, err := b.Wait(ctx, 5*time.Second)
+	if err == nil && result.ReactionsDropped {
+		return
+	}
 	if !b.droppedReactionMark() {
 		t.Error("the record of a lost reaction died with the connection; the agent would never learn its count is wrong")
 	}
@@ -748,12 +757,13 @@ func TestADroppedReactionIsRescuedWhicheverChannelClosesFirst(t *testing.T) {
 	// does: the events channel is the one a disconnection is reported from,
 	// and it is closed last.
 	stream.reactionsDropped.Store(true)
-	close(stream.interactions)
+	stream.closeInteractions()
 
-	if _, err := b.Wait(ctx, 5*time.Second); err == nil {
-		t.Fatal("Wait() = nil error after the click channel closed, want the disconnection reported")
+	result, err := b.Wait(ctx, 5*time.Second)
+	if err == nil && !result.ReactionsDropped {
+		t.Fatal("Wait() = nil error and no loss after the click channel closed, want one or the other")
 	}
-	if !b.droppedReactionMark() {
+	if err != nil && !b.droppedReactionMark() {
 		t.Error("the loss died with the connection because a different channel closed first")
 	}
 }

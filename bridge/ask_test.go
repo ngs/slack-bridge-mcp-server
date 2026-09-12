@@ -539,7 +539,7 @@ func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 
 	go func() {
 		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
-		close(stream.events)
+		stream.closeEvents()
 	}()
 
 	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err == nil {
@@ -603,7 +603,7 @@ func TestAskReportsTheDisconnectionWhenTheClickChannelCloses(t *testing.T) {
 
 	go func() {
 		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
-		close(stream.interactions)
+		stream.closeInteractions()
 	}()
 
 	done := make(chan error, 1)
