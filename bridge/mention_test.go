@@ -739,5 +739,11 @@ func (b *Bridge) forceReconnect() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.stopConnectionLocked()
+	// The generation moves with it, as it does on a real replacement.
+	// Cancelling a pump does not stop it the instant it is called, and without
+	// this the old one could still apply a buffered event afterwards — which
+	// is exactly what the bridge guards against and a test should not pretend
+	// away.
+	b.connGeneration++
 	b.connected = false
 }

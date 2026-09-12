@@ -515,6 +515,14 @@ out rather than a loss. What it would cost if it never landed is work repeated
 after a restart: a window read again, a conversation mentioned into again. Never
 a message, which is in Slack either way.
 
+**The catch-up outside the home channel stages what it finds.** A scan takes as
+long as Slack takes to answer, and it is the one part of catch-up that changes
+the bridge as it goes: a conversation opened by a mention it found, one given up
+on as unreadable, how far it looked. All three are true of the installation it
+ran with — a reinstall is what makes a thread readable or a mention visible — so
+they are collected and committed by the call that delivers, under the same
+generation check as everything else, or dropped with the batch.
+
 **Everything belongs to a connection.** The generation is not only the pump's:
 every call carries the one it started on, and a call whose connection has been
 replaced commits nothing — no cursor, no queue drained, no conversation opened

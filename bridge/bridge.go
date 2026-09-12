@@ -128,6 +128,9 @@ type Bridge struct {
 	// cursorSeeded records that the home cursor has been established, which an
 	// empty channel does with an empty timestamp.
 	cursorSeeded bool
+	// preSeedRefused records that the queue overflowed before the cursor
+	// existed, so the seed read over it must not become the cursor.
+	preSeedRefused bool
 	// seedMergePending marks a seed established by a call that could not commit
 	// it, so the next merge still treats the messages queued during it as new.
 	seedMergePending bool
@@ -735,14 +738,16 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		if home {
 			queue, full = &b.pending, &b.pendingFull
 		}
-		// Only once there is a window to recover from. Before the cursor is
-		// established there is none: a refused message would be filtered out
-		// by the very seed being established, so the short window of the first
-		// connect is one the queue simply holds. An empty channel seeds to an
-		// empty cursor, which is why this asks whether the seeding has
-		// happened rather than whether the cursor has a value.
-		if len(*queue) >= maxPendingMessages && b.cursorSeeded {
+		if len(*queue) >= maxPendingMessages {
 			b.requestCatchUpLocked()
+			if !b.cursorSeeded {
+				// Refused before the cursor exists. The seed about to be
+				// established would filter this message out as older than
+				// itself, so the seed is given up on instead: the cursor is
+				// taken from the messages actually handed over, and catch-up
+				// reads everything after them.
+				b.preSeedRefused = true
+			}
 			// One line per episode, not one per message. This runs under the
 			// lock the pump holds, and a flood that logged every refusal would
 			// turn the overflow into the thing that stopped the socket.
@@ -776,11 +781,16 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 	b.mu.Lock()
 	needCatchUp := b.needCatchUp
 	epoch := b.catchUpEpoch
+	seeded := b.cursorSeeded
 	api := b.api
 	lastTS := b.lastTS
 	channel := b.cfg.Channel
 	owner := b.cfg.Owner
 	b.mu.Unlock()
+
+	// What the scan outside the home channel would change is staged here and
+	// committed below, under the same generation check as everything else.
+	scan := &scanChanges{}
 
 	var (
 		fetched, conversations []Message
@@ -789,7 +799,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		seeding bool
 	)
 	if needCatchUp {
-		if lastTS == "" {
+		if !seeded {
 			// First run against this channel: seeding from the newest
 			// message means a fresh install starts a conversation rather
 			// than replaying the channel's entire history into the agent.
@@ -810,7 +820,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		// Everywhere else: the conversations opened by a mention, and any
 		// mention that opened one while nobody was listening.
 		var err error
-		conversations, err = b.catchUpConversations(ctx, api, owner, generation)
+		conversations, err = b.catchUpConversations(ctx, api, owner, generation, scan)
 		if err != nil {
 			return nil, err
 		}
@@ -836,7 +846,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		// moved on — treating everything sent in between as history and
 		// delivering none of it. Kept in memory only; the write belongs to the
 		// call that hands the messages over.
-		if !b.cursorSeeded && seeding {
+		if seeding && !b.cursorSeeded {
 			b.lastTS = lastTS
 			b.cursorSeeded = true
 			// The messages taken while that seed was being read are still
@@ -849,15 +859,32 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 	}
 
 	if needCatchUp {
+		// What the scan found, under this check like everything else: a
+		// conversation it opened, one it gave up on, and how far it looked are
+		// all true of the installation it ran with.
+		b.commitScanLocked(scan)
+
 		// The cursor first, and whatever else has been asked for since. A seed
 		// is a fact about the channel — where it was when this session found
 		// it — and dropping it because something asked for another catch-up
 		// meanwhile would leave the cursor unset, to be seeded again against a
 		// channel that has moved on.
 		if seeding && !b.cursorSeeded {
-			b.lastTS = lastTS
 			b.cursorSeeded = true
-			if lastTS != "" {
+			switch {
+			case b.preSeedRefused:
+				// The queue overflowed while this seed was being read, so the
+				// seed is not the cursor: it would filter out the refused
+				// messages as older than itself. The batch below sets the
+				// cursor instead, and the catch-up already asked for reads
+				// everything after it.
+				b.preSeedRefused = false
+			case lastTS == "":
+				// An empty channel. Seeded, and the cursor is empty because
+				// there was nothing to point at; nothing to write either.
+				b.lastTS = ""
+			default:
+				b.lastTS = lastTS
 				// Written here rather than where it was read, so it cannot
 				// reach the file ahead of the messages that arrived while it
 				// was being read — those are older than the seed and a restart

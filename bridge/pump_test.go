@@ -827,3 +827,59 @@ func TestAStaleWaitCommitsNoMessages(t *testing.T) {
 		t.Errorf("pending backlog = %d, want the message left for the live call", got)
 	}
 }
+
+// An ordinary reconnect abandons nothing. Saying a reaction was lost every time
+// the socket came back would send the agent to re-read a tally that was never
+// wrong.
+func TestAnOrdinaryReconnectReportsNoLoss(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// A connection replaced with nothing in flight on it.
+	stale := b.currentGeneration()
+	b.mu.Lock()
+	b.connGeneration++
+	b.mu.Unlock()
+	b.endStream(stale, b.currentStream(), nil, nil, nil, nil)
+
+	if b.droppedReactionMark() {
+		t.Error("an ordinary reconnect reported a lost reaction; nothing was in flight to lose")
+	}
+}
+
+// A message the pump was handed and a reaction it was carrying go in under one
+// lock. Left for the next turn, the carried one would arrive a moment after the
+// message, and a call draining between them would see half of it.
+func TestAnEventAppliesTheCarriedReactionWithIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	events := make(chan StreamEvent, 1)
+	carried := []Reaction{{
+		TS: "100.000200", Channel: testChannel, User: colleague, Reaction: "white_check_mark", Added: true,
+	}}
+	evt := StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.000200", Channel: testChannel, User: testOwner, Text: "ship it?",
+	}}
+
+	if !b.applyEvent(generation, evt, events, nil, carried) {
+		t.Fatal("applyEvent() left the carried reaction behind, want it applied with the message")
+	}
+	if got := b.Status().PendingBacklogCount; got != 1 {
+		t.Fatalf("pending messages = %d, want the message applied", got)
+	}
+	if kept := b.drainReactions(generation); len(kept) != 1 {
+		t.Errorf("drainReactions() = %+v, want the carried reaction applied with the message it arrived with", kept)
+	}
+}

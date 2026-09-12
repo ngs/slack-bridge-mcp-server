@@ -160,7 +160,7 @@ func (b *Bridge) openThreads() map[threadKey]string {
 // conversations.replies — so the thread pass has to run after the scan, or a
 // conversation started while the laptop was asleep would arrive with its
 // opening line and nothing else until the next reconnect.
-func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string, generation uint64) ([]Message, error) {
+func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string, generation uint64, scan *scanChanges) ([]Message, error) {
 	if api == nil {
 		return nil, nil
 	}
@@ -180,30 +180,23 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 		return nil, nil
 	}
 
-	// Opening the threads before the walk is what lets the walk find them, and
-	// it records the conversations even if a later step fails, so the owner
-	// does not have to mention the bot twice.
+	// The walk needs to know which conversations to read, including the ones
+	// these mentions open. It is told here, in a map of its own: what the scan
+	// would change about the bridge is staged rather than applied, and handed
+	// back for the call that delivers to commit under its own generation check.
+	// A scan speaks for the installation it ran with, and a reinstall is
+	// exactly what changes which threads are readable and which mentions are
+	// visible.
 	starts := b.openThreads()
-	b.mu.Lock()
-	// A scan that started on a connection since replaced speaks for an
-	// installation that is no longer the one in use: what it found may be
-	// invisible to the replacement, and what it would forget may be readable
-	// there. So it records nothing, and the replacement's own catch-up — which
-	// every new connection asks for — reads the window again.
-	if b.stale(generation) {
-		b.mu.Unlock()
-		return nil, nil
-	}
 	for _, m := range mentions {
-		b.openThreadLocked(m.Channel, m.ThreadTS)
+		scan.opened = append(scan.opened, threadKey{m.Channel, m.ThreadTS})
 		// The opening message is already in hand, so the walk starts just after
 		// it. The thread's own cursor stays where it is: moving it here would
 		// filter out the very message that opened the conversation.
 		starts[threadKey{m.Channel, m.ThreadTS}] = m.TS
 	}
-	b.mu.Unlock()
 
-	replies, err := b.catchUpThreadConversations(ctx, api, owner, generation, starts)
+	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts, scan)
 	if err != nil {
 		if !errors.Is(err, ErrMissingScope) {
 			return nil, err
@@ -215,10 +208,39 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 		replies = nil
 	}
 
-	if cursor != "" {
-		b.noteMentionCursor(generation, cursor)
-	}
+	scan.mentionCursor = cursor
 	return mergeConversations(mentions, replies), nil
+}
+
+// scanChanges is what a catch-up outside the home channel would change about
+// the bridge: the conversations it found, the ones it gave up on, and how far
+// it looked.
+//
+// It is staged rather than applied because the scan takes as long as Slack
+// takes to answer, and the connection can be replaced underneath it. Everything
+// here is true of the installation the scan ran with; a reinstall is what makes
+// a thread readable or a mention visible, so the replacement gets to find out
+// for itself. The call that delivers commits these under its own generation
+// check, or drops them with the batch.
+type scanChanges struct {
+	opened        []threadKey
+	closed        []threadKey
+	mentionCursor string
+}
+
+// commitScanLocked applies what the scan found. The caller must hold b.mu, and
+// must have established that its generation is still the current one.
+func (b *Bridge) commitScanLocked(scan *scanChanges) {
+	if scan == nil {
+		return
+	}
+	for _, key := range scan.opened {
+		b.openThreadLocked(key.channel, key.threadTS)
+	}
+	for _, key := range scan.closed {
+		b.closeThreadLocked(key)
+	}
+	b.advanceMentionCursorLocked(scan.mentionCursor)
 }
 
 // conversationsAreDegraded reports whether the catch-up outside the home
@@ -262,7 +284,7 @@ func (b *Bridge) degradeConversations(generation uint64, err error) {
 
 // catchUpThreadConversations reads every open thread from the point it was
 // last read to.
-func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner string, generation uint64, cursors map[threadKey]string) ([]Message, error) {
+func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner string, cursors map[threadKey]string, scan *scanChanges) ([]Message, error) {
 	if len(cursors) == 0 {
 		return nil, nil
 	}
@@ -291,7 +313,7 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 			// channel. It will be gone next time too, so the conversation is
 			// closed rather than retried forever.
 			log.Printf("closing a conversation thread that cannot be read: %s", logSafe(err.Error(), maxLoggedError))
-			b.closeThread(generation, key)
+			scan.closed = append(scan.closed, key)
 			continue
 		}
 		messages = append(messages, replies...)
@@ -414,17 +436,7 @@ func nowTS() string {
 // Forgetting it only in memory would mean reading it back on the next connect
 // and failing on it again, on every reconnect of every session from then on —
 // the thread is not coming back, and neither should the record of it.
-func (b *Bridge) closeThread(generation uint64, key threadKey) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Unreadable on the connection this ran on, which is not a verdict a
-	// replaced connection gets to pass: a reinstall is exactly what makes a
-	// thread readable again.
-	if b.stale(generation) {
-		return
-	}
-
+func (b *Bridge) closeThreadLocked(key threadKey) {
 	delete(b.threads, key)
 	delete(b.threadCursors, key)
 
@@ -438,19 +450,6 @@ func (b *Bridge) closeThread(generation uint64, key threadKey) {
 }
 
 // noteMentionCursor records how far the search for mentions has looked.
-func (b *Bridge) noteMentionCursor(generation uint64, ts string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// How far a scan looked is only true of the installation it looked with.
-	// Moving the cursor on behalf of a replaced connection would step over
-	// mentions the replacement can see and this one could not.
-	if b.stale(generation) {
-		return
-	}
-	b.advanceMentionCursorLocked(ts)
-}
-
 // advanceMentionCursorLocked moves the mention cursor forward, in memory and on
 // disk. The caller must hold b.mu.
 func (b *Bridge) advanceMentionCursorLocked(ts string) {

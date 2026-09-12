@@ -78,7 +78,9 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 				b.endStream(generation, stream, events, clicks, reactions, carried)
 				return
 			}
-			b.applyEvent(generation, evt, events, reactions)
+			if b.applyEvent(generation, evt, events, reactions, carried) {
+				carried = nil
+			}
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -188,12 +190,12 @@ func (b *Bridge) stale(generation uint64) bool {
 //
 // Messages first within the pair, as always — the mention that opens a
 // conversation has to be applied before a reaction is judged against it.
-func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction) {
+func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (tookCarried bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.stale(generation) {
-		return
+		return false
 	}
 
 	b.absorbLocked(evt)
@@ -201,9 +203,19 @@ func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan St
 	// events channel is in order, so a reaction on a mention two places behind
 	// the one just taken would otherwise be queued while that mention is still
 	// unapplied — and judged against a conversation that has not opened yet.
-	if drainLocked(events, maxSweep, b.absorbLocked) < maxSweep {
-		drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	if drainLocked(events, maxSweep, b.absorbLocked) == maxSweep {
+		return false
 	}
+
+	// The carried ones go in here too, under this lock. Leaving them for the
+	// next turn would let a call drain the message just applied without the
+	// reaction that arrived with it, which is the split this design exists to
+	// remove. Carried before the channel's, because they were taken first.
+	for _, r := range carried {
+		b.absorbReactionLocked(r)
+	}
+	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	return true
 }
 
 // applyClick routes one button click, unless the connection it came from has
@@ -234,19 +246,29 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
 func (b *Bridge) endStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
+	// Asked once, before the lock, and kept whichever branch this takes: it is
+	// a question for somebody else's implementation, and asking clears the
+	// answer, so asking twice would lose it.
+	lost := streamDroppedReactions(stream)
+
 	b.mu.Lock()
+	if lost {
+		b.reactionsDropped = true
+	}
 	if b.stale(generation) {
 		// A connection that has already been replaced hands nothing over:
 		// what is left on its channels belongs to a connection nobody owns,
 		// and the replacement's catch-up covers the window for messages.
 		//
-		// Reactions are the exception, because nothing covers them. Anything
-		// still on this connection was received and will not be delivered,
-		// which is a loss like any other. It is reported without counting
-		// first: the producer may still be enqueueing behind this, so what is
-		// in sight now is not what will be abandoned, and telling the agent to
-		// re-read a tally it did not need to costs nothing.
-		b.reactionsDropped = true
+		// Reactions are the exception, because nothing covers them: anything
+		// still on this connection was received and will not be delivered.
+		// Only when there is something, though — an ordinary reconnect
+		// abandons nothing, and saying otherwise would send the agent to
+		// re-read a tally that was never wrong, every time the socket
+		// reconnected.
+		if len(carried) > 0 || len(reactions) > 0 {
+			b.reactionsDropped = true
+		}
 		b.mu.Unlock()
 		b.noteStreamClosed(generation, stream)
 		return
