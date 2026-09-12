@@ -631,11 +631,13 @@ and its close. The channels closing says it has finished, eventually; a stream
 that implements `StreamFinisher` says it sooner, by closing `Finished()` before
 it closes anything else.
 
-What that buys is time. A stream that says when it stops is waited for as long
-as shutdown waits for the pump itself, because there is something definite to
-wait for; one that says nothing gets a quarter of a second, because there is
-nothing to wait for beyond the channels closing and something has to bound a
-socket that will not. The difference is a reaction queued in that last moment,
+What that buys is time. A stream that says when it stops is waited for a step
+short of the wait shutdown spends on the pump itself — a second and three
+quarters against two seconds — because there is something definite to wait for,
+and because the wait has to end before the shutdown waiting on it gives up, or
+which of the two complains first is a matter of scheduling. One that says
+nothing gets a quarter of a second, because there is nothing to wait for beyond
+the channels closing and something has to bound a socket that will not. The difference is a reaction queued in that last moment,
 which has no history to be recovered from and which nothing else would go back
 for — and if the wait does run out on a stream that was supposed to say, the
 count is reported as short, because a producer still running is one that can

@@ -3441,12 +3441,27 @@ func TestAHungProducerIsReportedThroughTheOrdinaryPaths(t *testing.T) {
 		}
 
 		stream.hang()
+		pumpDone := b.pumpStopped()
 		if err := b.Close(); err != nil {
 			t.Fatalf("Close() error = %v", err)
 		}
+		// Close gives the pump two seconds and does not wait for it beyond
+		// that, so the teardown can still be running when it returns. Waiting
+		// for the pump itself is what makes this about the report rather than
+		// about a quarter of a second of slack.
+		<-pumpDone
 
 		if !b.droppedReactionMark() {
 			t.Error("a shutdown that gave up on the producer said nothing about what it might have been holding")
 		}
 	})
+}
+
+// pumpStopped hands back the channel that closes when the current pump has
+// finished, for a test that has to wait for the teardown rather than for the
+// call that started it.
+func (b *Bridge) pumpStopped() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.pumpDone
 }

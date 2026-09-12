@@ -537,6 +537,12 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// the time a connection is being ended it has been replaced already —
 	// every path that ends one moves the generation before or as it cancels —
 	// so a check below would never run at all.
+	//
+	// On the way out of a session there may be nobody left to read it: Close
+	// is the last thing that happens, and the marker it leaves is for a wait
+	// that will not come. It is set anyway, because the alternative is a rule
+	// with an exception in it — and because a reconnect, which is the other
+	// way here, has a whole session still in front of it.
 	if !closed && streamFinished(stream) != nil {
 		b.reactionsDropped = true
 	}
