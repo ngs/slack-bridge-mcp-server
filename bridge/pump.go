@@ -121,7 +121,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 
 		case evt, ok := <-events:
 			if !ok {
-				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
+				b.endStream(generation, stream, nil, events, clicks, reactions, carried, true)
 				return
 			}
 			carried = b.applyEvent(generation, evt, events, reactions, carried)
@@ -219,8 +219,8 @@ func (b *Bridge) noteOverflowLocked(overflow bool) {
 // the events are waited for rather than taken as they stand: what is on that
 // channel is the owner's messages, and the closure is not going anywhere.
 func (b *Bridge) finishStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
-	late := awaitStreamClose(events)
-	b.endStream(generation, stream, late, events, clicks, reactions, carried)
+	late, closed := awaitStreamClose(events)
+	b.endStream(generation, stream, late, events, clicks, reactions, carried, closed)
 }
 
 // applyReady applies every message already waiting and, once they are
@@ -419,26 +419,25 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 // wait is short because a socket that has not finished in this long is one
 // shutdown should not be held up by; what it was holding is then reported as
 // lost, like anything else abandoned.
-func awaitStreamClose(events <-chan StreamEvent) []StreamEvent {
+func awaitStreamClose(events <-chan StreamEvent) (late []StreamEvent, closed bool) {
 	deadline := time.NewTimer(streamCloseWait)
 	defer deadline.Stop()
 
-	var late []StreamEvent
 	for len(late) < maxSweep {
 		select {
 		case evt, ok := <-events:
 			if !ok {
-				return late
+				return late, true
 			}
 			// Something was still coming. It is carried to endStream rather
 			// than applied here, so it goes in with the rest of the backlog
 			// and in the order it arrived.
 			late = append(late, evt)
 		case <-deadline.C:
-			return late
+			return late, false
 		}
 	}
-	return late
+	return late, false
 }
 
 // streamCloseWait is how long a cancelled pump waits for the socket to finish
@@ -459,7 +458,7 @@ const streamCloseWait = 250 * time.Millisecond
 // the conversations that are open. It was all received before the socket died,
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
-func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
+func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction, closed bool) {
 	// Asked once, before the lock, and kept whichever branch this takes: they
 	// are questions for somebody else's implementation of the stream — asking
 	// one of them clears the answer, so asking twice would lose it, and asking
@@ -545,6 +544,15 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		b.absorbReactionLocked(r)
 	}
 	if len(reactions) > 0 {
+		b.noteReactionsDroppedLocked()
+	}
+
+	// The producer had not finished when the wait for it ran out, so it can
+	// still put a reaction on a channel nobody will read again — and one that
+	// fits sets no marker of its own. The count is reported as short rather
+	// than left to be wrong quietly: re-reading a tally costs a call, and not
+	// knowing a vote was lost costs the vote.
+	if !closed {
 		b.noteReactionsDroppedLocked()
 	}
 

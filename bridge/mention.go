@@ -228,12 +228,30 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 	// exactly what changes which threads are readable and which mentions are
 	// visible.
 	starts := b.openThreads()
+	// The earliest mention in each conversation this scan opens. The opening
+	// message is already in hand, so the walk starts just after it — but only
+	// for a conversation that is new here, and only from the first mention in
+	// it.
+	//
+	// A conversation that was already open keeps the cursor it has. Starting it
+	// at a mention found now would step over every reply between where it had
+	// been read to and that mention, and the walk's own cursor moves past them
+	// when the batch is delivered: they would be skipped for good. And a
+	// conversation with two mentions in one scan starts at the first of them,
+	// or the replies between the two go the same way.
+	opened := make(map[threadKey]string, len(mentions))
 	for _, m := range mentions {
-		scan.opened = append(scan.opened, threadKey{m.Channel, m.ThreadTS})
-		// The opening message is already in hand, so the walk starts just after
-		// it. The thread's own cursor stays where it is: moving it here would
-		// filter out the very message that opened the conversation.
-		starts[threadKey{m.Channel, m.ThreadTS}] = m.TS
+		key := threadKey{m.Channel, m.ThreadTS}
+		scan.opened = append(scan.opened, key)
+		if _, already := starts[key]; already {
+			continue
+		}
+		if first, seen := opened[key]; !seen || tsLess(m.TS, first) {
+			opened[key] = m.TS
+		}
+	}
+	for key, first := range opened {
+		starts[key] = first
 	}
 
 	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts, b.skippedThreadKeys(), scan)

@@ -130,6 +130,10 @@ type heldReaction struct {
 	// at is the number of catch-ups that had completed when this was held. One
 	// more than that is where its wait ends.
 	at uint64
+	// waited marks one delivery gone by. It is the grace for a hole that has
+	// happened but has not been announced yet: with no catch-up outstanding
+	// and one turn already spent, nothing is coming that would explain this.
+	waited bool
 }
 
 // maxHeldReactions bounds the reactions kept back for a catch-up. They are a
@@ -260,15 +264,28 @@ func (b *Bridge) drainReactionsLocked() []Reaction {
 			// the agent has any use for.
 			continue
 		}
+		if h.waited && !b.needCatchUp {
+			// Nothing is coming that could explain it. It has had its look.
+			continue
+		}
+		h.waited = true
 		held = append(held, h)
 	}
 
+	// Everything that matches nothing waits, whether or not a catch-up has
+	// been asked for yet. The reason is the announcement: a socket that has
+	// refused a message says so with an event on the very channel that had no
+	// room for one, so there is a moment where the hole exists and nothing has
+	// been asked for. A reaction judged in that moment is judged against the
+	// conversations a message nobody saw would have opened — so it waits one
+	// turn, by which time the announcement has been applied and the request it
+	// raises is there to wait for.
 	for _, r := range queued {
 		if reaction, ok := b.classifyReactionLocked(r); ok {
 			kept = append(kept, reaction)
 			continue
 		}
-		if b.needCatchUp && len(held) < maxHeldReactions {
+		if len(held) < maxHeldReactions {
 			held = append(held, heldReaction{r: r, at: b.catchUpRuns})
 		}
 	}

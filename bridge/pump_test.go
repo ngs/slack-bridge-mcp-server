@@ -699,7 +699,7 @@ func TestAReplacedConnectionsLostReactionsAreStillReported(t *testing.T) {
 	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "tada", Added: true}
 	stale := b.currentGeneration() - 1
 
-	b.endStream(stale, b.currentStream(), nil, nil, nil, reactions, nil)
+	b.endStream(stale, b.currentStream(), nil, nil, nil, reactions, nil, true)
 
 	if !b.droppedReactionMark() {
 		t.Error("a reaction received on a replaced connection was dropped with nothing said; the agent's count is wrong and it cannot know")
@@ -867,7 +867,7 @@ func TestAnOrdinaryReconnectReportsNoLoss(t *testing.T) {
 	b.mu.Lock()
 	b.connGeneration++
 	b.mu.Unlock()
-	b.endStream(stale, b.currentStream(), nil, nil, nil, nil, nil)
+	b.endStream(stale, b.currentStream(), nil, nil, nil, nil, nil, true)
 
 	if b.droppedReactionMark() {
 		t.Error("an ordinary reconnect reported a lost reaction; nothing was in flight to lose")
@@ -1280,7 +1280,7 @@ func TestReactionsLeftOnAClosingConnectionAreReported(t *testing.T) {
 		}
 	}
 
-	b.endStream(generation, b.currentStream(), nil, nil, nil, reactions, nil)
+	b.endStream(generation, b.currentStream(), nil, nil, nil, reactions, nil, true)
 
 	if !b.droppedReactionMark() {
 		t.Error("reactions were left on a connection that closed with nothing said; the agent's count is wrong and it cannot know")
@@ -1398,7 +1398,7 @@ func TestReactionsAreReportedWhenTheClosingSweepCannotFinish(t *testing.T) {
 		TS: "300.000001", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true,
 	}
 
-	b.endStream(generation, b.currentStream(), nil, events, nil, reactions, nil)
+	b.endStream(generation, b.currentStream(), nil, events, nil, reactions, nil, true)
 
 	if !b.droppedReactionMark() {
 		t.Error("a reaction was judged against a connection whose messages could not all be applied, with nothing said")
@@ -1904,7 +1904,7 @@ func TestAStreamIsNeverAskedAnythingUnderTheLock(t *testing.T) {
 	b.connected = true
 	b.mu.Unlock()
 
-	b.endStream(1, stream, nil, stream.events, stream.interactions, stream.reactions, nil)
+	b.endStream(1, stream, nil, stream.events, stream.interactions, stream.reactions, nil, true)
 
 	if !stream.askedAtAll.Load() {
 		t.Fatal("the closing connection never asked the stream whether it was holding an overflow")
@@ -2230,5 +2230,125 @@ func TestAHeldReactionIsJudgedOnceMoreAndThenDropped(t *testing.T) {
 	}
 	if dropped {
 		t.Error("dropping somebody else's emoji in somebody else's channel told the agent its count was wrong")
+	}
+}
+
+// A connection that has been retired is not the live one, even if the
+// replacement never opens. Cancelling does not stop a pump the instant it is
+// called, and a Connect that fails leaves nothing to take over: between the
+// two, the old pump would have gone on applying events as the live connection.
+func TestAFailedReconnectRetiresTheConnectionItReplaced(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	connector := &failingReconnector{api: &fakeAPI{botUserID: testBotUser}, stream: newFakeStream()}
+	b := New(ctx, cfg, connector)
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	first := b.currentGeneration()
+
+	// The connection drops and the reconnect fails.
+	b.mu.Lock()
+	b.connected = false
+	b.mu.Unlock()
+	connector.fail.Store(true)
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err == nil {
+		t.Fatal("Wait() returned no error, want the failed reconnect reported")
+	}
+
+	if b.currentGeneration() == first {
+		t.Error("the retired connection is still the live one; its pump can apply events and its catch-up can commit")
+	}
+}
+
+// failingReconnector opens once and then refuses, which is what a reconnect
+// against a workspace that has revoked the app looks like.
+type failingReconnector struct {
+	api    API
+	stream *fakeStream
+	fail   atomic.Bool
+	once   sync.Once
+}
+
+func (c *failingReconnector) Connect(ctx context.Context, _ Config) (API, Stream, error) {
+	if c.fail.Load() {
+		return nil, nil, errors.New("cannot open the socket")
+	}
+	c.once.Do(func() {
+		go func() {
+			<-ctx.Done()
+			c.stream.closeAll()
+		}()
+	})
+	return c.api, c.stream, nil
+}
+
+// The wait for a closing socket is bounded, and the producer can still be
+// running when it expires: it can put a reaction on a channel nobody will read
+// again, and one that fits sets no marker of its own. The count is reported as
+// short rather than left to be wrong quietly.
+func TestAStreamThatWillNotCloseReportsItsReactionsAsLost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// Channels of this test's own, and the events one never closes.
+	events := make(chan StreamEvent)
+	b.finishStream(generation, stream, events, nil, nil, nil)
+
+	if !b.droppedReactionMark() {
+		t.Error("the producer was still running when the wait for it expired, and nothing said the count might be short")
+	}
+}
+
+// A socket that has refused a message says so with an event on the very
+// channel that had no room for one, so there is a moment where the hole exists
+// and nothing has been asked for. A reaction judged in that moment is judged
+// against the conversations a message nobody saw would have opened, so it
+// waits a turn.
+func TestAReactionWaitsOutTheMomentBeforeAnOverflowIsAnnounced(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// Nothing has been asked for yet: the refusal has happened on the socket
+	// and the announcement has not arrived.
+	b.mu.Lock()
+	b.absorbReactionLocked(Reaction{
+		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "eyes", Added: true,
+	})
+	b.mu.Unlock()
+
+	if kept := b.drainReactions(generation); len(kept) != 0 {
+		t.Fatalf("drainReactions() = %+v, want it to wait for the announcement", kept)
+	}
+
+	// The announcement, and the mention it was hiding.
+	b.mu.Lock()
+	b.absorbLocked(StreamEvent{Kind: StreamDropped})
+	b.absorbLocked(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "200.000100", Channel: otherChannel, User: testOwner, Text: mention("ship it?"),
+	}})
+	b.mu.Unlock()
+
+	if kept := b.drainReactions(generation); len(kept) != 1 {
+		t.Errorf("drainReactions() = %+v, want the vote on the mention the overflow was hiding", kept)
 	}
 }

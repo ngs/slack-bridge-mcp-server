@@ -677,6 +677,16 @@ func (b *Bridge) ensure() error {
 	// everything it started: the pump here, and the Socket Mode goroutines the
 	// connector runs. Bounded by the session's context, so the session ending
 	// still ends all of it.
+	// The old connection stops being the live one before it is cancelled, not
+	// after the replacement is open. Cancelling does not stop a pump the
+	// instant it is called, and a Connect that fails leaves no replacement to
+	// take over: between the two, an old pump that was still going would have
+	// been applying events as the live connection, and a catch-up in flight on
+	// it would have found itself current and handed back the cancellation of a
+	// connection nobody was waiting on any more.
+	if b.stopConnection != nil {
+		b.connGeneration++
+	}
 	b.stopConnectionLocked()
 	connCtx, stopConnection := context.WithCancel(b.ctx)
 
@@ -1209,7 +1219,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 				//
 				// This is the bound the design has always had on how far back
 				// a single catch-up will go. What is new is saying so.
-				log.Printf("catch-up read the newest %d messages and stopped; anything older in the window was not delivered",
+				log.Printf("catch-up read the newest %d messages and stopped; anything older in the window was not delivered, including messages refused for want of room while the flood lasted",
 					maxHistoryPages*historyPageLimit)
 			}
 		}

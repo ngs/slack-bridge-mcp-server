@@ -760,3 +760,71 @@ func (b *Bridge) forceReconnect() {
 	b.connGeneration++
 	b.connected = false
 }
+
+// A conversation that is already open keeps the cursor it has when a scan
+// finds another mention in it. Starting it at that mention steps over every
+// reply between where it had been read to and the mention — and the walk's own
+// cursor moves past them when the batch is delivered, so they are gone for
+// good.
+func TestAScanKeepsTheCursorOfAConversationAlreadyOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the home cursor: %v", err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatalf("seeding the mention cursor: %v", err)
+	}
+	// Open, and read as far as the message that opened it.
+	if err := store.SetThread(otherChannel, "200.000100", "200.000100"); err != nil {
+		t.Fatalf("seeding the conversation: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		joined:    []string{testChannel, otherChannel},
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "already answered")},
+			// A second mention in the same conversation, found by the scan.
+			otherChannel: {mentionInThread("200.000300", "200.000100", "still there?")},
+		},
+		replies: []candidate{
+			// Said between the cursor and that second mention.
+			replyIn(otherChannel, "200.000200", "200.000100", "the one in between"),
+			mentionInThread("200.000300", "200.000100", "still there?"),
+		},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	msgs := waitFor(ctx, t, b)
+	var seen bool
+	for _, m := range msgs {
+		if m.TS == "200.000200" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("Wait() = %v, want the reply between the conversation's cursor and the mention the scan found", texts(msgs))
+	}
+}
+
+// replyIn is a thread reply in a channel other than the home one.
+func replyIn(channel, ts, threadTS, text string) candidate {
+	c := reply(ts, threadTS, text)
+	c.Channel = channel
+	return c
+}
+
+// mentionInThread is a message in a thread that mentions the bot.
+func mentionInThread(ts, threadTS, text string) candidate {
+	c := reply(ts, threadTS, mention(text))
+	c.Channel = otherChannel
+	return c
+}
