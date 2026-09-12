@@ -121,7 +121,8 @@ func (b *Bridge) takeStateWrites() []stateWrite {
 func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 
-	flush := func() {
+	// flush reports whether everything waiting reached the file.
+	flush := func() bool {
 		writes := b.takeStateWrites()
 		for i, w := range writes {
 			if err := applyStateWrite(store, w); err != nil {
@@ -135,18 +136,29 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 				// rename can be refused for reasons that pass, so a cursor
 				// that did not land waits and goes again.
 				b.requeueStateWrites(writes[i:])
-				return
+				return false
 			}
 			b.noteStateWriteOK()
 		}
+		return true
 	}
 
 	for {
 		select {
 		case <-wake:
 			flush()
+			//nolint:errcheck // a failed flush requeues itself and is woken again
 		case <-stop:
-			flush()
+			// The last flush, with a few attempts: after this there is no
+			// writer left to answer the retry it would otherwise schedule, and
+			// what is left would be lost to a refusal that would have passed.
+			for i := 0; i < stateWriteFinalAttempts; i++ {
+				if flush() {
+					return
+				}
+				time.Sleep(stateWriteRetryWait)
+			}
+			b.reportUnwrittenState()
 			return
 		}
 	}
@@ -213,6 +225,23 @@ func (b *Bridge) noteStateWriteOK() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.stateWriteFailing = false
+}
+
+// stateWriteFinalAttempts is how many times shutdown tries to write what is
+// left. A refusal that passes does so in a moment; one that does not is a disk
+// the process should not hang on.
+const stateWriteFinalAttempts = 3
+
+// reportUnwrittenState says what did not reach the file, so a restart doing the
+// work again is explained rather than mysterious.
+func (b *Bridge) reportUnwrittenState() {
+	b.mu.Lock()
+	left := len(b.stateDirty)
+	b.mu.Unlock()
+
+	if left > 0 {
+		log.Printf("%d cursor(s) never reached the state file; the work they record will be done again after a restart", left)
+	}
 }
 
 // stateWriteRetryWait is how long a refused write waits before going again. It

@@ -97,6 +97,15 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			// to spare — meaning the channel was emptied rather than merely
 			// swept — is this reaction let through. A reaction cannot be put
 			// back on its channel, so this is how it waits.
+			//
+			// It waits behind a bound, though. A flood of messages that never
+			// lets up would otherwise grow this without limit, and a queue
+			// that cannot be emptied is the one place a reaction is better
+			// lost and reported than held for ever.
+			if len(carried) >= maxPendingReactions {
+				b.noteReactionsDropped()
+				continue
+			}
 			carried = append(carried, r)
 		}
 	}
@@ -231,13 +240,13 @@ func (b *Bridge) endStream(generation uint64, stream Stream, events <-chan Strea
 		// what is left on its channels belongs to a connection nobody owns,
 		// and the replacement's catch-up covers the window for messages.
 		//
-		// Reactions are the exception, because nothing covers them. Those
-		// still in hand were received and will not be delivered, which is a
-		// loss like any other and the agent is told so it can re-read the
-		// tally.
-		if len(carried) > 0 || len(reactions) > 0 {
-			b.reactionsDropped = true
-		}
+		// Reactions are the exception, because nothing covers them. Anything
+		// still on this connection was received and will not be delivered,
+		// which is a loss like any other. It is reported without counting
+		// first: the producer may still be enqueueing behind this, so what is
+		// in sight now is not what will be abandoned, and telling the agent to
+		// re-read a tally it did not need to costs nothing.
+		b.reactionsDropped = true
 		b.mu.Unlock()
 		b.noteStreamClosed(generation, stream)
 		return

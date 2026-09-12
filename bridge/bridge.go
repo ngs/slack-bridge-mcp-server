@@ -340,8 +340,12 @@ func (b *Bridge) Close() error {
 	b.mu.Lock()
 	b.connected = false
 	// Nothing is listening after this, so nothing should be reading the socket
-	// either — nor holding it open.
+	// either — nor holding it open. The generation moves with it, so a call
+	// still in flight commits nothing on the way out: its cursor would be
+	// written by a writer that is stopping, and a cursor that moves without
+	// being written is messages skipped after a restart.
 	b.stopConnectionLocked()
+	b.connGeneration++
 	pumpStopped := b.pumpDone
 	b.stopIndicatorLocked()
 	done := b.indicatorDone
@@ -541,7 +545,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		if err != nil {
 			return WaitResult{}, err
 		}
-		drained := b.drainReactions()
+		drained := b.drainReactions(generation)
 		if len(msgs) > 0 || len(drained) > 0 {
 			return b.deliver(ctx, generation, msgs, drained), nil
 		}
@@ -576,7 +580,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if err != nil {
 				return WaitResult{}, err
 			}
-			drained := b.drainReactions()
+			drained := b.drainReactions(generation)
 			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
 				// timed_out of true alongside messages would be read as "call
@@ -712,7 +716,11 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		if home {
 			queue = &b.pending
 		}
-		if len(*queue) >= maxPendingMessages {
+		// Only once there is a cursor to recover from. Before the first one is
+		// established there is no window to re-read: a refused message would
+		// be filtered out by the very seed that is being established, so the
+		// short window of the first connect is one the queue simply holds.
+		if len(*queue) >= maxPendingMessages && b.lastTS != "" {
 			b.requestCatchUpLocked()
 			// One line per episode, not one per message. This runs under the
 			// lock the pump holds, and a flood that logged every refusal would
@@ -800,6 +808,15 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	// The replacement asks for its own catch-up on connect, and that one reads
 	// the window with the installation as it now is.
 	if generation != b.connGeneration {
+		// One exception, and it commits nothing: a cursor that has never been
+		// set. The seed says where this session found the channel, and the
+		// replacement would otherwise seed again against a channel that has
+		// moved on — treating everything sent in between as history and
+		// delivering none of it. Kept in memory only; the write belongs to the
+		// call that hands the messages over.
+		if b.lastTS == "" && lastTS != "" {
+			b.lastTS = lastTS
+		}
 		return nil, nil
 	}
 
@@ -809,8 +826,16 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 		// it — and dropping it because something asked for another catch-up
 		// meanwhile would leave the cursor unset, to be seeded again against a
 		// channel that has moved on.
-		if b.lastTS == "" {
+		if b.lastTS == "" && lastTS != "" {
 			b.lastTS = lastTS
+			// Written here rather than where it was read, so it cannot reach
+			// the file ahead of the messages that arrived while it was being
+			// read — those are older than the seed and a restart would filter
+			// them out.
+			b.recordStateWriteLocked(stateWrite{
+				stateKey: stateKey{kind: writeLastTS, channel: channel},
+				ts:       lastTS,
+			})
 		}
 		// The flag, only if nothing has asked again since this one started. A
 		// reconnect or a refused message that arrived while history was in
@@ -957,20 +982,10 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, generation uint64, cha
 	if ts == "" {
 		return "", nil
 	}
-	if ts != "" {
-		b.mu.Lock()
-		// Only for the connection that asked. A seed that outlives its
-		// connection is not written: the call it belongs to commits nothing,
-		// so persisting the cursor would move a restart past messages the
-		// replacement never handed over.
-		if !b.stale(generation) {
-			b.recordStateWriteLocked(stateWrite{
-				stateKey: stateKey{kind: writeLastTS, channel: channel},
-				ts:       ts,
-			})
-		}
-		b.mu.Unlock()
-	}
+	// Deliberately not written here. State writes are asynchronous, and a seed
+	// that reached the file before the messages queued during it were handed
+	// over would, after a crash, filter exactly those messages out as older
+	// than the cursor. The call that commits the batch writes it.
 	return ts, nil
 }
 

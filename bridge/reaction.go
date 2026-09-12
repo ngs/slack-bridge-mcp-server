@@ -162,13 +162,28 @@ func (b *Bridge) seenReactionLocked(r Reaction) bool {
 	return false
 }
 
+// noteReactionsDropped records that a reaction was received and will not be
+// delivered, so the next result tells the agent to read the tally back.
+func (b *Bridge) noteReactionsDropped() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reactionsDropped = true
+}
+
 // drainReactions takes everything queued for the next delivery.
 //
 // Reactions have no cursor and no catch-up: they exist only on the live
 // connection, so the queue is the whole of what there is to hand over.
-func (b *Bridge) drainReactions() []Reaction {
+func (b *Bridge) drainReactions(generation uint64) []Reaction {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// The queue belongs to whichever connection is current, and a call on one
+	// that has been replaced would be taking the replacement's reactions —
+	// which the call that wants them would then never see.
+	if b.stale(generation) {
+		return nil
+	}
 
 	if len(b.pendingReactions) == 0 {
 		return nil
@@ -220,8 +235,12 @@ func (b *Bridge) takeReactionsDropped(generation uint64) bool {
 
 	// A call on a connection since replaced is about to be told so, and reports
 	// nothing. Clearing the marker here would spend it on that call and leave
-	// the next live wait saying a loss never happened.
+	// the next live wait saying a loss never happened — including the one just
+	// taken off the stream, which is why it is put back rather than dropped.
 	if b.stale(generation) {
+		if dropped {
+			b.reactionsDropped = true
+		}
 		return false
 	}
 

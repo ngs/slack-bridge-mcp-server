@@ -515,6 +515,15 @@ out rather than a loss. What it would cost if it never landed is work repeated
 after a restart: a window read again, a conversation mentioned into again. Never
 a message, which is in Slack either way.
 
+**Everything belongs to a connection.** The generation is not only the pump's:
+every call carries the one it started on, and a call whose connection has been
+replaced commits nothing — no cursor, no queue drained, no conversation opened
+or given up on. `Close` moves the generation too, so a call still in flight at
+shutdown cannot move a cursor that the writer, which is stopping, would no
+longer record. What a replaced call would have delivered, the replacement's own
+catch-up reads again; what it received and cannot pass on — reactions, which
+have no history — is reported as lost.
+
 **Lifetime.** A connection gets a context of its own, bounded by the session's.
 Cancelling it stops everything that connection started — the pump, and the
 Socket Mode goroutines the connector runs — and it is cancelled before a

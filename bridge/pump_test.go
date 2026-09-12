@@ -179,7 +179,7 @@ func TestApplyingAReactionAppliesTheMessagesAheadOfIt(t *testing.T) {
 		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "white_check_mark", Added: true,
 	}})
 
-	if kept := b.drainReactions(); len(kept) != 1 {
+	if kept := b.drainReactions(b.currentGeneration()); len(kept) != 1 {
 		t.Fatalf("drainReactions() = %+v, want the vote: the mention ahead of it opens the conversation it is in", kept)
 	}
 }
@@ -706,5 +706,72 @@ func TestAStaleCallDoesNotConsumeTheLossMarker(t *testing.T) {
 	}
 	if !b.takeReactionsDropped(live) {
 		t.Error("the live call was told nothing was lost; the stale one had spent the marker")
+	}
+}
+
+// The queue a call drains belongs to whichever connection is current. A call on
+// one that has been replaced must not take the replacement's reactions: the
+// call that wants them would never see them.
+func TestAStaleCallDrainsNoReactions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+	eventually(t, "the pump to take the reaction", func() bool { return b.pendingReactionCount() == 1 })
+
+	live := b.currentGeneration()
+	if kept := b.drainReactions(live - 1); len(kept) != 0 {
+		t.Errorf("a stale call drained %+v, which belongs to the connection that replaced it", kept)
+	}
+	if kept := b.drainReactions(live); len(kept) != 1 {
+		t.Errorf("the live call drained %+v, want the reaction still there", kept)
+	}
+}
+
+// A shutdown makes every call in flight stale, so a catch-up that comes back
+// after it commits nothing. Otherwise its cursor moves in memory while the
+// writer that would record it is stopping, and a restart skips the messages
+// between.
+func TestACatchUpThatReturnsAfterCloseCommitsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	gate := make(chan struct{})
+	api := &fakeAPI{
+		botUserID:   testBotUser,
+		historyGate: gate,
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "already answered"), ownerMsg("100.000200", "while it was closing")},
+		},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = b.Wait(ctx, 5*time.Second)
+	}()
+
+	eventually(t, "catch-up to reach Slack", func() bool { return len(api.calls()) > 0 })
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	close(gate)
+	<-done
+
+	if got := b.Status().LastTS; got != "100.000100" {
+		t.Errorf("last_ts = %q, want the cursor left where it was: the catch-up that moved it could no longer record it", got)
 	}
 }
