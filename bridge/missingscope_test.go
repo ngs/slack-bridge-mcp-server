@@ -283,7 +283,7 @@ func TestAStaleDrainDoesNotClearTheNewConnectionsCatchUp(t *testing.T) {
 	b.needCatchUp = true
 	b.mu.Unlock()
 
-	if _, err := b.drainCatchUp(ctx); err != nil {
+	if _, err := b.drainCatchUp(ctx, b.currentGeneration()); err != nil {
 		t.Fatalf("drainCatchUp() error = %v", err)
 	}
 

@@ -238,7 +238,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// answer whatever happened to the socket afterwards.
 			if choice, ok := b.lastChance(ask); ok {
 				return b.answered(ctx, api, answer{
-					channel: channel, threadTS: threadTS, ts: ts,
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation,
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
@@ -246,7 +246,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			return AskResult{}, errors.New("the Slack connection closed")
 		}
 		if !req.InterruptDisabled && b.backlogWaiting() {
-			if msgs := b.backlogWhileAsking(ctx); len(msgs) > 0 {
+			if msgs := b.backlogWhileAsking(ctx, generation); len(msgs) > 0 {
 				return b.interrupted(api, channel, ts, q, msgs), nil
 			}
 			// A reconnect rather than a message, or a drain that failed and
@@ -259,7 +259,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			if req.InterruptDisabled {
 				continue
 			}
-			msgs := b.backlogWhileAsking(ctx)
+			msgs := b.backlogWhileAsking(ctx, generation)
 			if len(msgs) == 0 {
 				continue
 			}
@@ -267,7 +267,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 		case choice := <-ask.answered:
 			return b.answered(ctx, api, answer{
-				channel: channel, threadTS: threadTS, ts: ts,
+				channel: channel, threadTS: threadTS, ts: ts, generation: generation,
 				q: q, labels: labels, options: options, choice: choice,
 			}), nil
 
@@ -276,7 +276,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask); ok {
 				return b.answered(ctx, api, answer{
-					channel: channel, threadTS: threadTS, ts: ts,
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation,
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
@@ -294,7 +294,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// A question nobody answered leaves the agent with nothing to act
 			// on, which is exactly when a message waiting behind it matters
 			// most.
-			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx)}, nil
+			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx, generation)}, nil
 
 		case <-ctx.Done():
 			// The client gave up on the call. Nobody is left to receive an
@@ -334,10 +334,13 @@ type answer struct {
 	channel  string
 	threadTS string
 	ts       string
-	q        Question
-	labels   []string
-	options  []string
-	choice   int
+	// generation is the connection the question was asked on, which is what
+	// decides whether the backlog it collects is still its to collect.
+	generation uint64
+	q          Question
+	labels     []string
+	options    []string
+	choice     int
 }
 
 // answered retires a question the owner clicked, and reports the choice.
@@ -353,7 +356,7 @@ func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
 		ChoiceIndex: a.choice,
 		ChoiceLabel: a.options[a.choice],
 		TS:          a.ts,
-		Messages:    b.backlogWhileAsking(ctx),
+		Messages:    b.backlogWhileAsking(ctx, a.generation),
 	}
 }
 
@@ -393,8 +396,8 @@ func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Mes
 // It is called only once a question has settled. A call abandoned or a socket
 // that closed has no session left to hand a backlog to, and moving the cursor
 // there would consume messages nobody ever received.
-func (b *Bridge) backlogWhileAsking(ctx context.Context) []Message {
-	msgs, err := b.drainCatchUp(ctx)
+func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64) []Message {
+	msgs, err := b.drainCatchUp(ctx, generation)
 	if err != nil {
 		log.Printf("could not collect the messages that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
 		return nil

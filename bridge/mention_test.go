@@ -436,10 +436,10 @@ func TestNoConversationOpensWithoutTheBotID(t *testing.T) {
 	api.botUserID = ""
 	api.mu.Unlock()
 
-	// Reconnecting is what makes the bridge read the ID again.
-	if err := b.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
+	// Reconnecting is what makes the bridge read the ID again. Close would do
+	// it too, but Close is the end of the session rather than the end of a
+	// connection, and nothing opens another one after it.
+	b.forceReconnect()
 
 	send(stream, otherChannel, "200.000100", "", mention("anyone home?"))
 	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
@@ -730,4 +730,14 @@ func storedThreadsEventually(t *testing.T, b *Bridge, want int) bool {
 		time.Sleep(stateFilePollInterval)
 	}
 	return false
+}
+
+// forceReconnect ends the current connection without ending the session, so the
+// next call opens another one. It is what a socket dropping does, without the
+// stream having to die with it.
+func (b *Bridge) forceReconnect() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopConnectionLocked()
+	b.connected = false
 }

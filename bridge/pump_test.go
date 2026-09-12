@@ -775,3 +775,55 @@ func TestACatchUpThatReturnsAfterCloseCommitsNothing(t *testing.T) {
 		t.Errorf("last_ts = %q, want the cursor left where it was: the catch-up that moved it could no longer record it", got)
 	}
 }
+
+// Close is the end of the session, not of a connection. A call still running
+// must not open another one behind it, or a pump would be left reading into a
+// bridge whose state writer has stopped.
+func TestNothingConnectsAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err == nil {
+		t.Error("Wait() = nil error after Close, want it refused rather than opening a connection nothing is winding down")
+	}
+	if b.Status().Connected {
+		t.Error("the bridge reports a connection after Close")
+	}
+}
+
+// A catch-up that commits belongs to the connection its caller started on. A
+// wait whose connection was replaced must not take the replacement's messages:
+// the call that wants them would never see them, and the cursor would move
+// without them being delivered.
+func TestAStaleWaitCommitsNoMessages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	send(stream, testChannel, "100.000200", "", "for the live connection")
+	eventually(t, "the pump to take the message", func() bool { return b.Status().PendingBacklogCount == 1 })
+
+	live := b.currentGeneration()
+	msgs, err := b.drainCatchUp(ctx, live-1)
+	if err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("a stale call drained %v, which belongs to the connection that replaced it", texts(msgs))
+	}
+	if got := b.Status().PendingBacklogCount; got != 1 {
+		t.Errorf("pending backlog = %d, want the message left for the live call", got)
+	}
+}
