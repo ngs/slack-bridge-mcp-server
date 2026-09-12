@@ -2372,10 +2372,11 @@ func TestASlowCloseWithNothingLeftReportsNothing(t *testing.T) {
 	stale := b.currentGeneration() - 1
 
 	// The events channel never closes, and there is nothing left behind on the
-	// others.
+	// others. A stream that never says when it stops, so the wait is the short
+	// one and what it finds is nothing.
 	events := make(chan StreamEvent)
 	reactions := make(chan Reaction)
-	b.finishStream(stale, stream, events, nil, reactions, nil)
+	b.finishStream(stale, silentStream{stream}, events, nil, reactions, nil)
 
 	if b.droppedReactionMark() {
 		t.Error("a slow close told the agent its count might be wrong with nothing missing")
@@ -2936,47 +2937,6 @@ func TestAHelloDuringTheFirstReadAsksForOneMorePass(t *testing.T) {
 	}
 }
 
-// Probe (r7): with the fake connector's hello sent inside Connect, how often
-// does the first session read history once (hello consumed) vs twice (hello
-// after the read)? Informational: the real socket is slower than history.
-func TestProbeHowOftenTheHelloBeatsTheFirstRead(t *testing.T) {
-	once, twice, other := 0, 0, 0
-	for i := 0; i < 30; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		cfg := testConfig(t)
-		cfg.IndicatorDisabled = true
-		cfg.AutoAckDisabled = true
-		if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
-			t.Fatalf("seeding the cursor: %v", err)
-		}
-		api := &fakeAPI{
-			botUserID:      testBotUser,
-			channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
-		}
-		b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
-		waitOnce(ctx, t, b)
-		// Settle any second pass.
-		waitOnce(ctx, t, b)
-		n := 0
-		for _, c := range api.calls() {
-			if c.Channel == testChannel {
-				n++
-			}
-		}
-		switch n {
-		case 1:
-			once++
-		case 2:
-			twice++
-		default:
-			other++
-		}
-		_ = b.Close()
-		cancel()
-	}
-	t.Logf("home-channel history reads on first connect over 30 sessions: once=%d twice=%d other=%d", once, twice, other)
-}
-
 // Conversations left unread are news for whoever is already waiting. A wait
 // blocked on a long timeout has nothing in either queue to wake it, so without
 // this the replies those conversations hold sit there until it gives up.
@@ -3041,10 +3001,20 @@ func TestAWalkThatRanOutOfBudgetWakesTheWaitingCall(t *testing.T) {
 	}
 }
 
+// silentStream is a stream that never says when it has stopped, which is what
+// a Stream written before StreamFinisher looks like. A nil channel is the
+// answer "this one does not say".
+type silentStream struct {
+	*fakeStream
+}
+
+func (s silentStream) Finished() <-chan struct{} { return nil }
+
 // A connection that is still the live one, closing slowly with a reaction in
 // its buffer: the reaction is delivered, not mourned. Saying the count might
 // be short over something that was handed over is the false positive the
-// marker cannot afford.
+// marker cannot afford — and a stream that never says when it stops has been
+// waited for as long as it can be.
 func TestASlowCloseDeliversTheReactionsItIsHolding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -3060,7 +3030,7 @@ func TestASlowCloseDeliversTheReactionsItIsHolding(t *testing.T) {
 	reactions := make(chan Reaction, 1)
 	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true}
 
-	b.finishStream(generation, stream, events, nil, reactions, nil)
+	b.finishStream(generation, silentStream{stream}, events, nil, reactions, nil)
 
 	if kept := b.drainReactions(generation); len(kept) != 1 {
 		t.Errorf("drainReactions() = %+v, want the reaction the closing connection was holding", kept)
@@ -3374,4 +3344,39 @@ func TestTheHomeCursorFollowsWhatWasReadAndStopsAtWhatWasNot(t *testing.T) {
 			t.Error("the message was taken from the queue by a pass that was thrown away")
 		}
 	})
+}
+
+// A stream that says when it has stopped is waited for. The point of saying so
+// is the reaction queued between the last send and the close, and a wait that
+// gave up after a quarter of a second would leave it on a channel nobody reads
+// again — with nothing said, because a reaction that fits sets no marker.
+func TestAStreamThatSaysWhenItStopsIsWaitedFor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	events := make(chan StreamEvent)
+	reactions := make(chan Reaction, 1)
+
+	// The producer takes longer than the short wait to finish, and queues a
+	// reaction on its way out.
+	go func() {
+		time.Sleep(2 * streamCloseWait)
+		reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true}
+		stream.noteFinished()
+	}()
+
+	b.finishStream(generation, stream, events, nil, reactions, nil)
+
+	if kept := b.drainReactions(generation); len(kept) != 1 {
+		t.Errorf("drainReactions() = %+v, want the reaction the producer queued as it stopped", kept)
+	}
+	if b.droppedReactionMark() {
+		t.Error("a producer that said it had finished was reported as a loss")
+	}
 }

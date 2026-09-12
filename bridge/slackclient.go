@@ -498,7 +498,12 @@ func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Clien
 	// after the bridge has stopped looking.
 	defer close(s.finished)
 
-	ack := func(req socketmode.Request) { _ = client.Ack(req) }
+	// Acknowledged on the connection's context. slack-go's Ack uses a context
+	// of its own and blocks on a queue the sender goroutine drains — which has
+	// already stopped by the time this is being told to stop, so an Ack in
+	// that moment would never return and this loop would never close the
+	// channels it owns.
+	ack := func(req socketmode.Request) { _ = client.AckCtx(ctx, req.EnvelopeID, nil) }
 
 	for {
 		s.flushDropped()
@@ -518,13 +523,20 @@ func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Clien
 // flushDropped turns a recorded overflow into a StreamDropped event once the
 // consumer has made room, so the bridge still learns it needs to catch up.
 func (s *socketModeStream) flushDropped() {
-	if !s.dropped.Load() {
+	// Cleared before the send, not after it. The bridge asks this flag as well
+	// as reading the announcement, and between a successful send and a later
+	// clear it would see both — one refusal counted twice, and then a flag
+	// left standing that swallows the next announcement whole.
+	//
+	// Put back if the send does not land, which is the only thing the flag was
+	// ever for.
+	if !s.dropped.CompareAndSwap(true, false) {
 		return
 	}
 	select {
 	case s.events <- StreamEvent{Kind: StreamDropped}:
-		s.dropped.Store(false)
 	default:
+		s.dropped.Store(true)
 	}
 }
 

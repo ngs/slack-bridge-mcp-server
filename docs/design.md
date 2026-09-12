@@ -629,11 +629,21 @@ it duplicated never emptied.
 cancelled, and the producer behind it is then somewhere between its last send
 and its close. The channels closing says it has finished, eventually; a stream
 that implements `StreamFinisher` says it sooner, by closing `Finished()` before
-it closes anything else. The bridge waits on that where it is offered and on a
-short timer where it is not — and the difference is a reaction queued in that
-last moment, which has no history to be recovered from and which nothing else
-would go back for. Implementing it is optional, as with the reaction half and
-the overflow report: a stream that does not is waited for exactly as before.
+it closes anything else.
+
+What that buys is time. A stream that says when it stops is waited for as long
+as shutdown waits for the pump itself, because there is something definite to
+wait for; one that says nothing gets a quarter of a second, because there is
+nothing to wait for beyond the channels closing and something has to bound a
+socket that will not. The difference is a reaction queued in that last moment,
+which has no history to be recovered from and which nothing else would go back
+for — and if the wait does run out on a stream that was supposed to say, the
+count is reported as short, because a producer still running is one that can
+still be holding something.
+
+Implementing it is optional, as with the reaction half and the overflow report:
+a stream that does not is waited for on the short timer, and a slow close there
+says nothing at all.
 
 **One writer for the state file.** Every cursor the bridge keeps — how far the
 home channel has been read, how far each conversation outside it has, how far

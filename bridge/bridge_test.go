@@ -460,7 +460,13 @@ func (s *fakeStream) sayHello() {
 
 // closeInteractions ends the click half.
 func (s *fakeStream) closeInteractions() {
-	s.closeInteractionsOnce.Do(func() { close(s.interactions) })
+	s.closeInteractionsOnce.Do(func() {
+		// Any channel closing means the real stream's consumer has returned,
+		// so the fake says so too. A test that closes one channel is
+		// describing a producer that has stopped.
+		s.noteFinished()
+		close(s.interactions)
+	})
 }
 
 // closeAll ends the whole stream, in the order the real one does: reactions,

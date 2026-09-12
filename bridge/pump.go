@@ -435,7 +435,19 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 // shutdown should not be held up by; what it was holding is then reported as
 // lost, like anything else abandoned.
 func awaitStreamClose(events <-chan StreamEvent, finished <-chan struct{}) (late []StreamEvent, closed bool) {
-	deadline := time.NewTimer(streamCloseWait)
+	// A stream that says when it has stopped is worth waiting for: that is the
+	// whole point of saying so, and what it is waited for is the reaction
+	// queued between its last send and its close. A stream that says nothing
+	// gets the short wait, because there is nothing to wait for beyond the
+	// channels closing and something has to bound a socket that will not.
+	//
+	// The longer wait is the one shutdown already spends on the pump, so
+	// waiting it out here cannot make a shutdown slower than it was.
+	wait := streamCloseWait
+	if finished != nil {
+		wait = pumpStopWait
+	}
+	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 
 	for len(late) < maxSweep {
@@ -468,6 +480,11 @@ func awaitStreamClose(events <-chan StreamEvent, finished <-chan struct{}) (late
 			return late, true
 		}
 		late = append(late, evt)
+	default:
+	}
+	select {
+	case <-finished:
+		return late, true
 	default:
 	}
 	return late, false
@@ -594,6 +611,15 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		b.absorbReactionLocked(r)
 	}
 	if len(reactions) > 0 {
+		b.noteReactionsDroppedLocked()
+	}
+
+	// A producer that had not finished when the wait for it ran out can still
+	// put a reaction on a channel nobody will read again, and one that fits
+	// sets no marker of its own. Only for a stream that says when it stops:
+	// one that does not has been waited for as long as it can be, and calling
+	// every slow close a loss is how the marker stops meaning anything.
+	if !closed && streamFinished(stream) != nil {
 		b.noteReactionsDroppedLocked()
 	}
 
