@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -279,7 +280,7 @@ func TestAStaleDrainDoesNotClearTheNewConnectionsCatchUp(t *testing.T) {
 	b.needCatchUp = true
 	b.mu.Unlock()
 
-	if _, _, err := b.drainCatchUp(ctx, b.currentGeneration(), true); err != nil {
+	if _, _, err := b.drainCatchUp(ctx, b.currentGeneration(), true, time.Second); err != nil {
 		t.Fatalf("drainCatchUp() error = %v", err)
 	}
 

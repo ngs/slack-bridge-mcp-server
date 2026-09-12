@@ -238,3 +238,63 @@ func TestThreadCursorsOnlyMoveForward(t *testing.T) {
 		t.Errorf("MentionCursor() = %q (err %v), want it never to go backwards", got, err)
 	}
 }
+
+// A removal that does not reach the disk still has to happen once the
+// conversation is opened again. The reopen was recorded while the removal was
+// in flight, so it carries no mark of its own: if the failed removal is simply
+// dropped, SetThread leaves the cursor of the conversation that was meant to be
+// forgotten, and the bridge comes back reading a dead thread from the middle.
+func TestAFailedRemovalIsCarriedIntoTheReopenBehindIt(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeThread, channel: "C1", threadTS: "100.000100"}
+
+	// The reopen was queued while the removal was being written.
+	b.stateDirty[key] = stateWrite{stateKey: key}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, remove: true}})
+
+	b.mu.Lock()
+	got, ok := b.stateDirty[key]
+	b.mu.Unlock()
+	if !ok {
+		t.Fatalf("stateDirty lost the conversation entirely")
+	}
+	if got.remove {
+		t.Errorf("stateDirty holds a removal, want the later reopen to stand")
+	}
+	if !got.reopened {
+		t.Errorf("stateDirty = %+v, want the reopen marked so the failed removal still happens", got)
+	}
+}
+
+// A failed write with nothing newer behind it goes back as it was.
+func TestAFailedWriteWithNothingNewerIsQueuedAgain(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeLastTS, channel: "C1"}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, ts: "100.000100"}})
+
+	b.mu.Lock()
+	got, ok := b.stateDirty[key]
+	b.mu.Unlock()
+	if !ok || got.ts != "100.000100" {
+		t.Errorf("stateDirty = %+v (present %v), want the failed cursor queued again", got, ok)
+	}
+}
+
+// A cursor that was overtaken while it was being written is not put back: the
+// later one covers it.
+func TestAFailedWriteOvertakenByANewerOneIsDropped(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeLastTS, channel: "C1"}
+	b.stateDirty[key] = stateWrite{stateKey: key, ts: "100.000200"}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, ts: "100.000100"}})
+
+	b.mu.Lock()
+	got := b.stateDirty[key]
+	b.mu.Unlock()
+	if got.ts != "100.000200" {
+		t.Errorf("stateDirty cursor = %q, want the newer one to stand", got.ts)
+	}
+}

@@ -154,6 +154,9 @@ type Bridge struct {
 	stateDirty map[stateKey]stateWrite
 	// stateWriteFailing keeps a failing state file to one line per episode.
 	stateWriteFailing bool
+	// stateWriting marks a write that is inside the store right now, so
+	// shutdown can wait out the one the fence was too late for.
+	stateWriting atomic.Bool
 	// stateFenced stops the writer for good, whatever it is in the middle of.
 	// It is set when shutdown has waited as long as it can and is about to
 	// release the lock that keeps another session off this file.
@@ -515,6 +518,12 @@ func (b *Bridge) ensure() error {
 	return nil
 }
 
+// lastLookSlotWait is how long the drain at the deadline will wait for its turn
+// at catch-up. The deadline has already passed by then, so this is a courtesy
+// rather than a budget: long enough for a slot that is about to come free,
+// short enough that the answer is still prompt.
+const lastLookSlotWait = 250 * time.Millisecond
+
 // maxPendingMessages bounds the messages waiting to be handed over. What it
 // protects against is a session left working for hours while a busy channel
 // fills the heap behind it.
@@ -578,6 +587,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	waitEnds := time.Now().Add(timeout)
 
 	for {
 		// Before anything is taken off a queue. A caller that has given up
@@ -591,7 +601,9 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		// new, and on a reconnect it is the only place missed messages are.
 		// Everything the socket has delivered is already in the queues, put
 		// there by the pump, so there is nothing to sweep here.
-		msgs, drained, err := b.drainCatchUp(ctx, generation, true)
+		// The slot is waited for only as long as this call has left: another
+		// call's slow request must not make this one answer late.
+		msgs, drained, err := b.drainCatchUp(ctx, generation, true, time.Until(waitEnds))
 		if err != nil {
 			return WaitResult{}, err
 		}
@@ -635,7 +647,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if err := ctx.Err(); err != nil {
 				return WaitResult{}, err
 			}
-			msgs, drained, err := b.drainCatchUp(ctx, generation, true)
+			msgs, drained, err := b.drainCatchUp(ctx, generation, true, lastLookSlotWait)
 			if err != nil {
 				return WaitResult{}, err
 			}
@@ -817,7 +829,7 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 // The cursor is advanced and persisted only once the messages are about to be
 // returned, so a failure anywhere earlier leaves the bridge ready to fetch
 // them again on the next call rather than skipping past them.
-func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReactions bool) ([]Message, []Reaction, error) {
+func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReactions bool, slotWait time.Duration) ([]Message, []Reaction, error) {
 	// One at a time. Two calls reading the same window would both fetch it and,
 	// behind a gap — where the cursor deliberately stays put — both deliver it,
 	// handing the owner's messages over twice. The wait costs nothing that was
@@ -827,10 +839,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	//
 	// A caller that gives up while waiting says so rather than waiting out
 	// somebody else's slow request: its own deadline is the one it promised.
+	wait := time.NewTimer(slotWait)
+	defer wait.Stop()
 	select {
 	case b.catchUpSlot <- struct{}{}:
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
+	case <-wait.C:
+		// Somebody else's request is still out, and this call has its own
+		// deadline to keep. It hands back what that deadline asked for —
+		// nothing — rather than answering late on the strength of a fetch it
+		// never made.
+		return nil, nil, nil
 	}
 	defer func() { <-b.catchUpSlot }()
 
@@ -850,9 +870,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 
 	// gapped marks a catch-up that was asked for again while this one was in
 	// flight, which means there is a hole somewhere after the window it read.
-	// more marks one that ran out of pages, or threads, before it ran out of
-	// window: what it did not reach is still there to be read.
-	var gapped, more bool
+	var gapped bool
 
 	var (
 		fetched, conversations []Message
@@ -881,10 +899,15 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 				return nil, nil, err
 			}
 			if truncated {
-				// More window than one pass can read. The cursor moves through
-				// what was delivered, so the next pass picks up from there —
-				// but only if something asks for one.
-				more = true
+				// More window than one pass can read, and the pages it read
+				// are the newest of it: what was not reached is older than
+				// everything delivered, so no later pass can get back to it —
+				// asking for one would only read these same pages again.
+				//
+				// This is the bound the design has always had on how far back
+				// a single catch-up will go. What is new is saying so.
+				log.Printf("catch-up read the newest %d messages and stopped; anything older in the window was not delivered",
+					maxHistoryPages*historyPageLimit)
 			}
 		}
 
@@ -952,7 +975,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// The epoch is compared again here, not just at the top: establishing a
 		// seed over a refusal asks for another pass of its own, and clearing
 		// the flag on the way past would answer that request with this window.
-		if !gapped && !more && !scan.skipped && epoch == b.catchUpEpoch {
+		if !gapped && !scan.skipped && epoch == b.catchUpEpoch {
 			b.needCatchUp = false
 		}
 	}

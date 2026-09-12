@@ -322,6 +322,11 @@ func callerGone(call, session context.Context) error {
 	return session.Err()
 }
 
+// backlogSlotWait is how long collecting the backlog will wait for its turn at
+// catch-up. A settled question is answering the owner, so it waits a while, but
+// not on a request that has clearly gone wrong.
+const backlogSlotWait = 5 * time.Second
+
 // backlogWaiting reports whether there is anything for a question to be
 // interrupted by: messages the pump has queued, or a catch-up that has not run
 // and may find some.
@@ -400,7 +405,7 @@ func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Mes
 // that closed has no session left to hand a backlog to, and moving the cursor
 // there would consume messages nobody ever received.
 func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64) []Message {
-	msgs, _, err := b.drainCatchUp(ctx, generation, false)
+	msgs, _, err := b.drainCatchUp(ctx, generation, false, backlogSlotWait)
 	if err != nil {
 		log.Printf("could not collect the messages that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
 		return nil

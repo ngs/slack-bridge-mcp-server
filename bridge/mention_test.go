@@ -633,7 +633,8 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 	// The state file is written by a goroutine of its own, off the paths that
 	// must not wait for a disk, so what is on disk arrives a moment later.
 	eventuallyOnDisk(t, "the conversation to reach the state file", func() bool {
-		return len(storedThreads(b)) == 1
+		threads, ok := storedThreads(b)
+		return ok && len(threads) == 1
 	})
 
 	// The thread has been deleted since.
@@ -647,7 +648,8 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 	}
 
 	if !storedThreadsEventually(t, b, 0) {
-		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", storedThreads(b))
+		threads, _ := storedThreads(b)
+		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", threads)
 	}
 }
 
@@ -715,12 +717,12 @@ func storedMentionCursor(dir string) string {
 // A read that fails is a read to try again, not a test failure: the file is
 // replaced by a rename, and on Windows a read landing in the middle of one is
 // refused outright. The caller is polling.
-func storedThreads(b *Bridge) []ThreadState {
+func storedThreads(b *Bridge) ([]ThreadState, bool) {
 	threads, err := NewStore(b.cfg.StateDir).Threads()
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return threads
+	return threads, true
 }
 
 // storedThreadsEventually waits for the state file to hold want conversations.
@@ -732,7 +734,10 @@ func storedThreadsEventually(t *testing.T, b *Bridge, want int) bool {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(storedThreads(b)) == want {
+		// The read has to have succeeded first: a refused one comes back empty,
+		// and an empty answer would satisfy a want of zero without proving that
+		// anything was ever written.
+		if threads, ok := storedThreads(b); ok && len(threads) == want {
 			return true
 		}
 		time.Sleep(stateFilePollInterval)

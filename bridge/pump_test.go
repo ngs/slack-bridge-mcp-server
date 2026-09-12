@@ -820,7 +820,7 @@ func TestAStaleWaitCommitsNoMessages(t *testing.T) {
 	eventually(t, "the pump to take the message", func() bool { return b.Status().PendingBacklogCount == 1 })
 
 	live := b.currentGeneration()
-	msgs, _, err := b.drainCatchUp(ctx, live-1, true)
+	msgs, _, err := b.drainCatchUp(ctx, live-1, true, time.Second)
 	if err != nil {
 		t.Fatalf("drainCatchUp() error = %v", err)
 	}
@@ -932,7 +932,7 @@ func TestAGappedCatchUpKeepsTheLiveBacklog(t *testing.T) {
 	}
 	done := make(chan batch, 1)
 	go func() {
-		msgs, _, err := b.drainCatchUp(ctx, generation, true)
+		msgs, _, err := b.drainCatchUp(ctx, generation, true, time.Second)
 		done <- batch{msgs, err}
 	}()
 
@@ -1073,10 +1073,11 @@ func TestARefusalBeforeTheFirstCursorKeepsTheWindow(t *testing.T) {
 
 }
 
-// A catch-up that runs out of pages before it runs out of window has not
-// finished. The cursor moves through what it delivered, and it asks to come
-// back — without which the middle of a long backlog is never read.
-func TestATruncatedCatchUpAsksToComeBack(t *testing.T) {
+// A window bigger than one catch-up can read is read as far as it goes, and
+// said so. The pages it reads are the newest of the window, so what it did not
+// reach is older than everything delivered: no later pass can get back to it,
+// and asking for one would only read the same pages again.
+func TestACatchUpBiggerThanOnePassDeliversWhatItReached(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1093,17 +1094,22 @@ func TestATruncatedCatchUpAsksToComeBack(t *testing.T) {
 		history = append(history, ownerMsg(fmt.Sprintf("100.%06d", i+1), "backlog"))
 	}
 	api := &fakeAPI{
-		botUserID:       testBotUser,
-		repliesPageSize: historyPageLimit,
-		channelHistory:  map[string][]candidate{testChannel: history},
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: history},
 	}
 	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
 	t.Cleanup(func() { _ = b.Close() })
 
-	if msgs := waitOnce(ctx, t, b).Messages; len(msgs) == 0 {
-		t.Fatal("Wait() returned nothing, want the first pass of the backlog")
+	msgs := waitOnce(ctx, t, b).Messages
+	if len(msgs) != maxHistoryPages*historyPageLimit {
+		t.Fatalf("Wait() returned %d messages, want the %d one pass reads", len(msgs), maxHistoryPages*historyPageLimit)
 	}
-	if !b.catchUpDue() {
-		t.Error("the catch-up stopped at its page bound without asking to come back; the rest of the backlog is never read")
+	// The newest of the window, and the cursor with them: the next call starts
+	// from there rather than reading the same pages again for ever.
+	if got := b.Status().LastTS; got != msgs[len(msgs)-1].TS {
+		t.Errorf("last_ts = %q, want the newest message handed over (%q)", got, msgs[len(msgs)-1].TS)
+	}
+	if b.catchUpDue() {
+		t.Error("another catch-up was asked for, which would read the same newest pages again and make no progress")
 	}
 }

@@ -135,6 +135,15 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 	defer close(done)
 
 	// flush reports whether everything waiting reached the file.
+	write := func(w stateWrite) error {
+		// Marked around the call, so shutdown can tell a writer between writes
+		// from one inside the store: the fence stops the next write, and this
+		// is how the lock waits out the one already past it.
+		b.stateWriting.Store(true)
+		defer b.stateWriting.Store(false)
+		return applyStateWrite(store, w)
+	}
+
 	flush := func() bool {
 		writes := b.takeStateWrites()
 		for i, w := range writes {
@@ -145,7 +154,7 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 				b.requeueStateWrites(writes[i:])
 				return false
 			}
-			if err := applyStateWrite(store, w); err != nil {
+			if err := write(w); err != nil {
 				b.noteStateWriteError(err)
 				// The batch stops here. What follows was ordered behind this
 				// write for a reason — a conversation is recorded before the
@@ -192,6 +201,19 @@ func (b *Bridge) fenceStateWriter() {
 	b.stateFenced.Store(true)
 }
 
+// awaitStateWriteIdle waits for a write already inside the store to finish.
+// Fencing stops the next one; this is for the one that is past the fence.
+func (b *Bridge) awaitStateWriteIdle() bool {
+	deadline := time.Now().Add(stateWriteFenceWait)
+	for time.Now().Before(deadline) {
+		if !b.stateWriting.Load() {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
 func applyStateWrite(store *Store, w stateWrite) error {
 	var err error
 	switch {
@@ -224,13 +246,18 @@ func (b *Bridge) requeueStateWrites(failed []stateWrite) {
 		return
 	}
 	for _, w := range failed {
-		if _, newer := b.stateDirty[w.stateKey]; !newer {
-			if previous, ok := b.stateDirty[w.stateKey]; ok && previous.remove && !w.remove {
-				// Given up on and opened again before either reached the file. The
-				// later one wins, as always, but it has to undo the first as well.
-				w.reopened = true
-			}
+		newer, taken := b.stateDirty[w.stateKey]
+		if !taken {
 			b.stateDirty[w.stateKey] = w
+			continue
+		}
+		if w.remove && !newer.remove {
+			// Given up on and opened again before the removal reached the file.
+			// The later write wins, as always, but it has to undo the first as
+			// well: on its own it is a plain open, and SetThread would leave the
+			// cursor of the conversation that was meant to be forgotten.
+			newer.reopened = true
+			b.stateDirty[w.stateKey] = newer
 		}
 	}
 	wake := b.stateWake
@@ -318,13 +345,15 @@ func (b *Bridge) stopStateWriter() bool {
 	// already in flight.
 	b.fenceStateWriter()
 
-	settle := time.NewTimer(stateWriteFenceWait)
-	defer settle.Stop()
-	select {
-	case <-done:
-	case <-settle.C:
+	// The fence stops the next write; this waits out the one that may already
+	// be inside the store, because the lock that keeps another session off
+	// this file is about to be let go and a rename landing after that would
+	// overwrite what that session has recorded.
+	if b.awaitStateWriteIdle() {
+		log.Printf("gave up waiting for the cursors to reach the state file; what is left will be read again after a restart")
+	} else {
+		log.Printf("a state file write is still running after being told to stop; another session started now could have its own writes overwritten")
 	}
-	log.Printf("gave up waiting for the cursors to reach the state file")
 	return false
 }
 
