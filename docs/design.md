@@ -599,22 +599,34 @@ looks for what came after it before putting another up beside it — the bridge'
 own message, in the window since that moment, in the channel or in the
 conversation when the question was asked inside one.
 
-The window is what identifies it, not the text. The bridge posted nothing else
-in that stretch, because the post it gave up on was the last thing it tried; and
-what Slack stores is not what was sent — an ampersand becomes an entity, a bare
-link grows angle brackets — so a comparison that looked exact would quietly find
-nothing at all. A question already retired is passed over, by the mark written
-under it when it was.
+What identifies it is the block the bridge puts its buttons in, inside a window
+around the attempt. Not the text: what Slack stores is not what was sent — an
+ampersand becomes an entity, a bare link grows angle brackets — so a comparison
+that looked exact would quietly find nothing at all. And not "the newest thing
+this app posted" either, because after a post that failed the bridge posts other
+things: the indicator saying it is working, the reply to whatever prompted the
+question. The block id is on the question's buttons and nowhere else, and
+retiring a question replaces the block list — so it says both "mine" and "still
+live" in one look.
+
+The window has both ends and a margin at each. The moment of the attempt comes
+from this machine's clock and the timestamps come from Slack's, and both ends of
+a history window are exclusive, so a question posted in the same instant would
+fall outside a window cut to it. The far end is as long after the attempt as the
+post could have taken: history comes back newest first and counts its limit from
+that end, so a channel that has been busy since would otherwise fill the page
+with what came after.
 
 The search and the retirement that follows are one budget between them, inside
 the new question's timeout like everything else, and they can spend the whole of
 a short one: a call left with nothing does not post at all, and says it timed
 out. A question whose buttons are in the channel for a call that is already over
-is worse than a question never asked. If there is not enough left, or Slack will
-not take the retirement, the question goes back on the shelf and the next call
-tries again — which is what makes this different from retiring a question the
-call owns, where nothing else will ever go back for it and the request gets a
-floor of a second and a half.
+is worse than a question never asked. If there is not enough left the question goes
+back on the shelf and the next call tries again, three times over before it is
+let go of; a Slack that refuses the retirement outright is not tried again at
+all. That is what makes this different from retiring a question the call owns,
+where nothing else will ever go back for it and the request gets a floor of a
+second and a half.
 
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again

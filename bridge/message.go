@@ -99,6 +99,11 @@ type candidate struct {
 	// Files are the attachments the message carries, already narrowed to the
 	// fields the bridge reports.
 	Files []File
+	// HasAskButtons marks a message carrying the bridge's own question block:
+	// the buttons of a slack_ask, identified by the block id it puts on them.
+	// It is what the search for a question abandoned mid-post goes by, since
+	// the text cannot be relied on and the bridge posts other things.
+	HasAskButtons bool
 }
 
 // accept reports whether the candidate is owner text worth relaying, returning

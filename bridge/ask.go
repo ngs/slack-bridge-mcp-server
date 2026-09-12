@@ -522,17 +522,28 @@ type orphanQuestion struct {
 	// threadTS is set for a question asked inside a conversation, which is
 	// where it has to be looked for: a thread reply is in no channel history.
 	threadTS string
-	// since is when the post was attempted, as a Slack timestamp. It is what
-	// identifies the message: anything the bridge posted after it, and nothing
-	// before.
+	// since and until are the window the question can be in, as Slack
+	// timestamps. The first is the attempt, less a margin: the clock here is
+	// not Slack's, and both ends of a history window are exclusive. The second
+	// is as long after it as the post could possibly have taken, which keeps
+	// the page from filling with a busy channel's later traffic.
 	since string
+	until string
+	// attempts is how many calls have tried to retire it. A question that
+	// cannot be reached is not worth every later question's budget.
+	attempts int
 }
 
 // noteOrphanQuestion remembers a post that was given up on.
 func (b *Bridge) noteOrphanQuestion(channel, threadTS string, attempted time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.orphan = &orphanQuestion{channel: channel, threadTS: threadTS, since: slackTS(attempted)}
+	b.orphan = &orphanQuestion{
+		channel:  channel,
+		threadTS: threadTS,
+		since:    slackTS(attempted.Add(-orphanClockSlack)),
+		until:    slackTS(attempted.Add(askPostTimeout + orphanClockSlack)),
+	}
 }
 
 // slackTS renders a moment the way Slack timestamps one, which is what the
@@ -582,6 +593,11 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 		return
 	}
 	if found == "" {
+		// Either it never landed, or it is outside the window, or somebody has
+		// taken it away already. Said plainly, because the one case that
+		// matters — a question standing in the channel that nothing will ever
+		// retire — looks exactly like the other two from here.
+		log.Printf("found no question to retire from a post that was given up on; if one did land, its buttons are still there")
 		return
 	}
 	// What is left of the budget, not what it was: the search has just spent
@@ -592,7 +608,15 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 	// the next one tries again — which is the difference between a message
 	// somebody else will go back for and one nobody will.
 	if err := b.tryResolve(api, orphan.channel, found, orphanExpiredText, time.Until(ends)); err != nil {
-		log.Printf("could not retire a question whose post was given up on, and will try again: %s", logSafe(err.Error(), maxLoggedError))
+		if !errors.Is(err, context.DeadlineExceeded) || orphan.attempts >= maxOrphanAttempts {
+			// Slack refused it rather than running out of time, or it has been
+			// tried often enough. Either way the next question is not the one
+			// to keep paying for this: said plainly and let go of.
+			log.Printf("could not retire a question whose post was given up on, and will not try again: %s", logSafe(err.Error(), maxLoggedError))
+			return
+		}
+		log.Printf("ran out of time retiring a question whose post was given up on; the next question will try again: %s", logSafe(err.Error(), maxLoggedError))
+		orphan.attempts++
 		b.mu.Lock()
 		if b.orphan == nil {
 			b.orphan = orphan
@@ -623,6 +647,7 @@ func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphan
 			Channel:  orphan.channel,
 			ThreadTS: orphan.threadTS,
 			Oldest:   orphan.since,
+			Latest:   orphan.until,
 			Limit:    orphanSearchLimit,
 		})
 		if err != nil {
@@ -630,9 +655,14 @@ func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphan
 		}
 		messages = replies.Messages
 	} else {
+		// Both ends of the window. History comes back newest first and the
+		// limit counts from that end, so a channel that has been busy since
+		// would otherwise fill the page with what came after and leave the
+		// question outside it.
 		page, err := api.History(ctx, HistoryRequest{
 			Channel: orphan.channel,
 			Oldest:  orphan.since,
+			Latest:  orphan.until,
 			Limit:   orphanSearchLimit,
 		})
 		if err != nil {
@@ -643,10 +673,13 @@ func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphan
 
 	found := ""
 	for _, c := range messages {
-		if c.User != me || c.TS == "" || !tsLess(orphan.since, c.TS) {
-			continue
-		}
-		if retiredQuestion(c.Text) {
+		// The bridge's own question, with its buttons still on it. The block
+		// id says both: nobody else posts it, and retiring a question takes
+		// the block away. Without this the newest thing the bridge posted in
+		// the window would do — and after a post that failed, that is the
+		// indicator saying "Working…", or the reply to the message that
+		// prompted the question.
+		if c.User != me || c.TS == "" || !c.HasAskButtons {
 			continue
 		}
 		// The newest of them: history comes back newest first and replies
@@ -658,12 +691,6 @@ func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphan
 	return found, nil
 }
 
-// retiredQuestion reports whether this is a question that has already been
-// taken away: an answer or an expiry is written under the text when it is.
-func retiredQuestion(text string) bool {
-	return strings.Contains(text, "\n\n✅ ") || strings.Contains(text, "\n\n⌛ ")
-}
-
 // orphanSearchLimit is how far back the search for an abandoned question
 // looks. It ran moments ago, so this is generous.
 const orphanSearchLimit = 20
@@ -671,6 +698,18 @@ const orphanSearchLimit = 20
 // orphanExpiredText is what an abandoned question is retired with. Its own
 // text is not repeated: what Slack stored may not be what was sent.
 const orphanExpiredText = "⌛ expired"
+
+// maxOrphanAttempts is how many questions will pay for retiring an earlier
+// one that could not be reached.
+const maxOrphanAttempts = 3
+
+// orphanClockSlack is how far either side of the attempt the window reaches.
+// The moment is taken from this machine's clock and the timestamps come from
+// Slack's, and both ends of a window are exclusive — so a question posted in
+// the same second could sit just outside a window cut to the instant. Being
+// generous costs nothing now that the block id says which message is the
+// question.
+const orphanClockSlack = 5 * time.Second
 
 // orphanSearchWait bounds the search itself. It is one request, and the call
 // that pays for it is about to ask a question of its own.

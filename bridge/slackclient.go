@@ -203,17 +203,18 @@ func toCandidate(channel string, m slack.Message) candidate {
 	}
 
 	return candidate{
-		Channel:     channel,
-		User:        m.User,
-		BotID:       m.BotID,
-		SubType:     m.SubType,
-		Text:        m.Text,
-		TS:          m.Timestamp,
-		ThreadTS:    m.ThreadTimestamp,
-		Username:    username,
-		ReplyCount:  m.ReplyCount,
-		LatestReply: m.LatestReply,
-		Files:       toFiles(m.Files),
+		Channel:       channel,
+		User:          m.User,
+		BotID:         m.BotID,
+		SubType:       m.SubType,
+		Text:          m.Text,
+		TS:            m.Timestamp,
+		ThreadTS:      m.ThreadTimestamp,
+		Username:      username,
+		ReplyCount:    m.ReplyCount,
+		LatestReply:   m.LatestReply,
+		Files:         toFiles(m.Files),
+		HasAskButtons: hasAskButtons(m.Blocks),
 	}
 }
 
@@ -716,6 +717,23 @@ func reactionFromItem(user, emoji, eventTS string, item slackevents.Item, added 
 		Added:    added,
 		EventTS:  eventTS,
 	}, true
+}
+
+// hasAskButtons reports whether these blocks are a question of the bridge's
+// with its buttons still on it.
+//
+// The block id is the bridge's own, put there when the question is posted, and
+// retiring a question replaces the block list — so a question that has been
+// taken away no longer has one. That makes this both "mine" and "still live"
+// in a single look, without reading a word of the text.
+func hasAskButtons(blocks slack.Blocks) bool {
+	for _, block := range blocks.BlockSet {
+		action, ok := block.(*slack.ActionBlock)
+		if ok && action.BlockID == askBlockID {
+			return true
+		}
+	}
+	return false
 }
 
 // filesFromEnvelope recovers a message's attachments from the raw Socket Mode

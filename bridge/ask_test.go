@@ -1020,7 +1020,7 @@ func TestAQuestionWhosePostWasAbandonedIsRetiredLater(t *testing.T) {
 	api.channelHistory = map[string][]candidate{testChannel: {
 		// Older than the attempt, and answered: not this call's business.
 		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: "100.000300"},
-		{Channel: testChannel, User: testBotUser, Text: "ship it? see &amp; &lt;https://example.com&gt;", TS: landed},
+		{Channel: testChannel, User: testBotUser, Text: "ship it? see &amp; &lt;https://example.com&gt;", TS: landed, HasAskButtons: true},
 	}}
 	api.mu.Unlock()
 
@@ -1239,6 +1239,7 @@ func TestAnAbandonedQuestionInAThreadIsLookedForInTheThread(t *testing.T) {
 	}
 	api.replies = append(api.replies, candidate{
 		Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, ThreadTS: "100.000500",
+		HasAskButtons: true,
 	})
 	api.mu.Unlock()
 	b.noteOrphanQuestion(testChannel, "100.000500", attempted)
@@ -1334,7 +1335,7 @@ func TestRetiringAnAbandonedQuestionIsInsideTheSameBudget(t *testing.T) {
 	defer close(resolve)
 	api.mu.Lock()
 	api.channelHistory = map[string][]candidate{testChannel: {
-		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS},
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
 	}}
 	api.historyGate = history
 	api.resolveGate = resolve
@@ -1368,5 +1369,161 @@ func TestRetiringAnAbandonedQuestionIsInsideTheSameBudget(t *testing.T) {
 		}
 	case <-time.After(6 * time.Second):
 		t.Fatal("Ask() never came back: retiring the abandoned question is not inside the budget the search shares")
+	}
+}
+
+// What identifies an abandoned question is the block the bridge puts its
+// buttons in, not "the newest thing I posted". After a post that failed the
+// bridge posts other things — the indicator saying it is working, the reply to
+// whatever prompted the question — and expiring one of those rewrites a message
+// the owner is reading.
+func TestOnlyAQuestionIsRetiredAsAnAbandonedOne(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	laterTS := slackTS(attempted.Add(2 * time.Millisecond))
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+		// Posted after it, by the bridge, and not a question: the indicator,
+		// or an answer the agent gave.
+		{Channel: testChannel, User: testBotUser, Text: "⏳ Working… (0s)", TS: laterTS},
+	}}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	var retiredOrphan bool
+	for _, r := range api.resolutions {
+		switch r.TS {
+		case orphanTS:
+			retiredOrphan = true
+		case laterTS:
+			t.Error("a message the bridge posted after the question was rewritten as an expired question")
+		}
+	}
+	if !retiredOrphan {
+		t.Error("the abandoned question was not retired")
+	}
+}
+
+// The moment of the attempt is this machine's clock and the timestamps are
+// Slack's, and both ends of a window are exclusive. A question posted in the
+// same instant must not fall outside a window cut to it.
+func TestAnAbandonedQuestionIsFoundDespiteTheClocksDisagreeing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack's clock is a moment behind this one: the question it stored is
+	// stamped before the attempt was made.
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(-200 * time.Millisecond))
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	var retired bool
+	api.mu.Lock()
+	for _, r := range api.resolutions {
+		if r.TS == orphanTS {
+			retired = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("a question stamped a moment before the attempt was outside the window; the clocks are not the same one")
+	}
+}
+
+// A channel that has been busy since the attempt fills the newest end of the
+// page, which is the end history counts its limit from. The window has an
+// upper end for that: as long after the attempt as the post could have taken,
+// and no longer.
+func TestAnAbandonedQuestionIsFoundBehindABusyChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	history := []candidate{
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}
+	// Twenty-five messages from everybody else, after it and well past the
+	// window's far end.
+	for i := 0; i < 25; i++ {
+		history = append(history, candidate{
+			Channel: testChannel, User: colleague, Text: "chatter",
+			TS: slackTS(attempted.Add(askPostTimeout + orphanClockSlack + time.Duration(i+1)*time.Second)),
+		})
+	}
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: history}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	var retired bool
+	api.mu.Lock()
+	for _, r := range api.resolutions {
+		if r.TS == orphanTS {
+			retired = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("the abandoned question was behind a busy channel's later traffic; the window has to have a far end as well as a near one")
 	}
 }
