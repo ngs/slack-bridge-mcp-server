@@ -524,7 +524,7 @@ func TestFirstWaitReturnsTheBacklogMissedWhileDown(t *testing.T) {
 	}
 	// The state file is written by a goroutine of its own, off the paths that
 	// must not wait for a disk, so it catches up a moment after the delivery.
-	eventually(t, "the cursor to reach the state file", func() bool {
+	eventuallyOnDisk(t, "the cursor to reach the state file", func() bool {
 		got, _ := store.LastTS(testChannel)
 		return got == "100.000300"
 	})

@@ -636,7 +636,7 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 
 	// The state file is written by a goroutine of its own, off the paths that
 	// must not wait for a disk, so what is on disk arrives a moment later.
-	eventually(t, "the conversation to reach the state file", func() bool {
+	eventuallyOnDisk(t, "the conversation to reach the state file", func() bool {
 		return len(storedThreads(t, b)) == 1
 	})
 
@@ -722,12 +722,12 @@ func storedThreads(t *testing.T, b *Bridge) []ThreadState {
 func storedThreadsEventually(t *testing.T, b *Bridge, want int) bool {
 	t.Helper()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(storedThreads(t, b)) == want {
 			return true
 		}
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(stateFilePollInterval)
 	}
 	return false
 }

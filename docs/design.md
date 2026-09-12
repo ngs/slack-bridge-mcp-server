@@ -508,9 +508,12 @@ order they were made, and flushes what it has when the session ends — after th
 pump has stopped, so a cursor being recorded as the session ends still reaches
 the file.
 
-What a lost cursor costs is work repeated after a restart: a window read again,
-a conversation mentioned into again. Never a message, which is in Slack either
-way.
+A cursor that does not land is kept and tried again. The file is replaced by a
+rename, and a rename can be refused for reasons that pass — another process
+holding it open, which on Windows is enough — so a refusal is a moment to wait
+out rather than a loss. What it would cost if it never landed is work repeated
+after a restart: a window read again, a conversation mentioned into again. Never
+a message, which is in Slack either way.
 
 **Lifetime.** A connection gets a context of its own, bounded by the session's.
 Cancelling it stops everything that connection started — the pump, and the

@@ -122,8 +122,21 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 	defer close(done)
 
 	flush := func() {
+		var failed []stateWrite
 		for _, w := range b.takeStateWrites() {
-			applyStateWrite(store, w)
+			if err := applyStateWrite(store, w); err != nil {
+				b.noteStateWriteError(err)
+				failed = append(failed, w)
+				continue
+			}
+			b.noteStateWriteOK()
+		}
+		if len(failed) > 0 {
+			// Kept, not dropped. The file is replaced by a rename, and a
+			// rename can be refused for reasons that pass — another process
+			// reading it on Windows, most of all — so a cursor that did not
+			// land waits and goes again rather than being lost to a moment.
+			b.requeueStateWrites(failed)
 		}
 	}
 
@@ -138,7 +151,7 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 	}
 }
 
-func applyStateWrite(store *Store, w stateWrite) {
+func applyStateWrite(store *Store, w stateWrite) error {
 	var err error
 	switch {
 	case w.kind == writeThread && w.remove:
@@ -150,13 +163,61 @@ func applyStateWrite(store *Store, w stateWrite) {
 	case w.kind == writeMentionCursor:
 		err = store.SetMentionCursor(w.ts)
 	}
-	if err != nil {
-		// What a lost cursor costs is work repeated after a restart: a window
-		// read again, a conversation mentioned into again. Never a message the
-		// owner sent, which is in Slack either way.
-		log.Printf("could not persist a cursor to the state file: %v", err)
+	return err
+}
+
+// requeueStateWrites puts back what did not land, unless something newer has
+// taken its place, and asks for another attempt after a pause.
+func (b *Bridge) requeueStateWrites(failed []stateWrite) {
+	b.mu.Lock()
+	if b.stateDirty == nil {
+		// The writer is on its way out and nobody will read this again.
+		b.mu.Unlock()
+		return
+	}
+	for _, w := range failed {
+		if _, newer := b.stateDirty[w.stateKey]; !newer {
+			b.stateDirty[w.stateKey] = w
+		}
+	}
+	wake := b.stateWake
+	b.mu.Unlock()
+
+	time.AfterFunc(stateWriteRetryWait, func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	})
+}
+
+// noteStateWriteError keeps a failing state file to one line per episode. The
+// retry means a disk that has stopped answering would otherwise say so for
+// every cursor, for as long as it lasted.
+func (b *Bridge) noteStateWriteError(err error) {
+	b.mu.Lock()
+	first := !b.stateWriteFailing
+	b.stateWriteFailing = true
+	b.mu.Unlock()
+
+	if first {
+		// What a cursor that never lands costs is work repeated after a
+		// restart: a window read again, a conversation mentioned into again.
+		// Never a message the owner sent, which is in Slack either way.
+		log.Printf("could not persist a cursor to the state file, and will keep trying: %v", err)
 	}
 }
+
+func (b *Bridge) noteStateWriteOK() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stateWriteFailing = false
+}
+
+// stateWriteRetryWait is how long a refused write waits before going again. It
+// is long enough that a reader holding the file has let go, and short enough
+// that a cursor is not left behind for a session's worth of work.
+const stateWriteRetryWait = 200 * time.Millisecond
 
 // stopStateWriter tells the writer to flush what it has and stop, and waits
 // briefly for it. It must be called without b.mu held.

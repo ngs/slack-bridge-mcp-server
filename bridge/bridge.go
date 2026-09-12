@@ -132,6 +132,8 @@ type Bridge struct {
 	// there is something to take, stopStateWrites tells it to flush and stop,
 	// and stateWritesDone closes once it has.
 	stateDirty map[stateKey]stateWrite
+	// stateWriteFailing keeps a failing state file to one line per episode.
+	stateWriteFailing bool
 	// stateClosed marks the writer as flushed and stopped, so a call still
 	// running at shutdown does not start another one behind it.
 	stateClosed     bool

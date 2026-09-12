@@ -38,6 +38,29 @@ func (f *fakeAPI) snapshotDeletes() []deleteCall {
 
 // eventually polls because the indicator's Slack calls happen on its own
 // goroutine: the tool call that starts or stops it returns first, by design.
+// stateFilePollInterval is how often a test may look at the state file while
+// the bridge's writer is replacing it.
+//
+// The store writes by rename, and Windows refuses to rename over a file another
+// handle has open — so a test reading it every couple of milliseconds is not
+// merely impatient, it is what stops the write from landing. This is slow
+// enough to leave the writer room.
+const stateFilePollInterval = 50 * time.Millisecond
+
+// eventuallyOnDisk is eventually for a condition that reads the state file.
+func eventuallyOnDisk(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(stateFilePollInterval)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 

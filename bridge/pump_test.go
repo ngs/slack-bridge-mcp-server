@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -619,4 +621,40 @@ func (b *Bridge) activeWaitCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.activeWaits
+}
+
+// The state file is replaced by a rename, and a rename can be refused for
+// reasons that pass — another process reading it, most of all. A cursor that
+// did not land waits and goes again rather than being lost to a moment.
+func TestARefusedStateWriteIsTriedAgain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	b := New(ctx, cfg, &fakeConnector{api: &fakeAPI{}, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// A file where the store needs a directory, so every attempt is refused.
+	blocked := filepath.Join(cfg.StateDir, "blocked")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("blocking the state directory: %v", err)
+	}
+
+	b.mu.Lock()
+	b.store = NewStore(filepath.Join(blocked, "state"))
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeLastTS, channel: testChannel},
+		ts:       "100.000200",
+	})
+	b.mu.Unlock()
+
+	eventually(t, "the refused cursor to be waiting for another attempt", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		_, kept := b.stateDirty[stateKey{kind: writeLastTS, channel: testChannel}]
+		return kept
+	})
 }
