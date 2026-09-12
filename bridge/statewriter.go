@@ -122,21 +122,22 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 	defer close(done)
 
 	flush := func() {
-		var failed []stateWrite
-		for _, w := range b.takeStateWrites() {
+		writes := b.takeStateWrites()
+		for i, w := range writes {
 			if err := applyStateWrite(store, w); err != nil {
 				b.noteStateWriteError(err)
-				failed = append(failed, w)
-				continue
+				// The batch stops here. What follows was ordered behind this
+				// write for a reason — a conversation is recorded before the
+				// cursor that moves past the mention which opened it — and
+				// carrying on would persist the second without the first.
+				//
+				// Kept, not dropped: the file is replaced by a rename, and a
+				// rename can be refused for reasons that pass, so a cursor
+				// that did not land waits and goes again.
+				b.requeueStateWrites(writes[i:])
+				return
 			}
 			b.noteStateWriteOK()
-		}
-		if len(failed) > 0 {
-			// Kept, not dropped. The file is replaced by a rename, and a
-			// rename can be refused for reasons that pass — another process
-			// reading it on Windows, most of all — so a cursor that did not
-			// land waits and goes again rather than being lost to a moment.
-			b.requeueStateWrites(failed)
 		}
 	}
 

@@ -55,7 +55,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			b.drainReadyClicks(generation, clicks)
 			select {
 			case <-ctx.Done():
-				b.endStream(generation, events, clicks, reactions, carried)
+				b.endStream(generation, stream, events, clicks, reactions, carried)
 				return
 			default:
 			}
@@ -70,26 +70,26 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			// recover — and then the closure is recorded, so a call blocked on
 			// a context of its own is told rather than left waiting on a
 			// stream with no reader.
-			b.endStream(generation, events, clicks, reactions, carried)
+			b.endStream(generation, stream, events, clicks, reactions, carried)
 			return
 
 		case evt, ok := <-events:
 			if !ok {
-				b.endStream(generation, events, clicks, reactions, carried)
+				b.endStream(generation, stream, events, clicks, reactions, carried)
 				return
 			}
 			b.applyEvent(generation, evt, events, reactions)
 
 		case in, ok := <-clicks:
 			if !ok {
-				b.endStream(generation, events, clicks, reactions, carried)
+				b.endStream(generation, stream, events, clicks, reactions, carried)
 				return
 			}
 			b.applyClick(generation, in)
 
 		case r, ok := <-reactions:
 			if !ok {
-				b.endStream(generation, events, clicks, reactions, carried)
+				b.endStream(generation, stream, events, clicks, reactions, carried)
 				return
 			}
 			// Carried rather than applied. The next turn of the loop applies
@@ -224,13 +224,22 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 // the conversations that are open. It was all received before the socket died,
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
-func (b *Bridge) endStream(generation uint64, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
+func (b *Bridge) endStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
 	b.mu.Lock()
 	if b.stale(generation) {
-		// A connection that has already been replaced has nothing to hand
-		// over: what is left on its channels belongs to a connection nobody
-		// owns, and the replacement's catch-up covers the window anyway.
+		// A connection that has already been replaced hands nothing over:
+		// what is left on its channels belongs to a connection nobody owns,
+		// and the replacement's catch-up covers the window for messages.
+		//
+		// Reactions are the exception, because nothing covers them. Those
+		// still in hand were received and will not be delivered, which is a
+		// loss like any other and the agent is told so it can re-read the
+		// tally.
+		if len(carried) > 0 || len(reactions) > 0 {
+			b.reactionsDropped = true
+		}
 		b.mu.Unlock()
+		b.noteStreamClosed(generation, stream)
 		return
 	}
 	// One lock for the whole backlog, for the same reason a reaction and the
@@ -247,7 +256,7 @@ func (b *Bridge) endStream(generation uint64, events <-chan StreamEvent, clicks 
 	}
 	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
 	b.mu.Unlock()
-	b.noteStreamClosed(generation)
+	b.noteStreamClosed(generation, stream)
 }
 
 // drainLocked applies everything already queued on one channel, without waiting

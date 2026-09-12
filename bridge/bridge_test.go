@@ -905,14 +905,14 @@ func TestAStaleStreamClosingDoesNotInvalidateTheReplacement(t *testing.T) {
 	b.mu.Unlock()
 
 	// The straggler now notices the old connection closing.
-	b.noteStreamClosed(stale)
+	b.noteStreamClosed(stale, old)
 
 	if !b.Status().Connected {
 		t.Error("Status() reports disconnected after a stale connection closed, which would open a second socket alongside the live one")
 	}
 
 	// The live one closing is a different matter.
-	b.noteStreamClosed(live)
+	b.noteStreamClosed(live, b.currentStream())
 	if b.Status().Connected {
 		t.Error("Status() still reports connected after the current stream closed")
 	}
@@ -1022,4 +1022,12 @@ func TestWaitHonoursContextCancellation(t *testing.T) {
 	if _, err := b.Wait(ctx, MaxWaitTimeout); !errors.Is(err, context.Canceled) {
 		t.Errorf("Wait() error = %v, want context.Canceled", err)
 	}
+}
+
+// currentStream reports the stream the bridge is on, for tests that drive the
+// disconnect notice directly.
+func (b *Bridge) currentStream() Stream {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stream
 }

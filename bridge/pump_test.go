@@ -658,3 +658,53 @@ func TestARefusedStateWriteIsTriedAgain(t *testing.T) {
 		return kept
 	})
 }
+
+// A connection that has already been replaced still lost what it lost. Its
+// reactions are in no history and will not be delivered by anybody, so the
+// agent is told to read the tally rather than left with a count it cannot know
+// is wrong.
+func TestAReplacedConnectionsLostReactionsAreStillReported(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// A reaction still in the hands of a connection nobody owns any more.
+	reactions := make(chan Reaction, 1)
+	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "tada", Added: true}
+	stale := b.currentGeneration() - 1
+
+	b.endStream(stale, b.currentStream(), nil, nil, reactions, nil)
+
+	if !b.droppedReactionMark() {
+		t.Error("a reaction received on a replaced connection was dropped with nothing said; the agent's count is wrong and it cannot know")
+	}
+}
+
+// A call on a connection since replaced is about to be told so, and reports
+// nothing. Spending the loss marker on it would leave the next live wait saying
+// a loss never happened.
+func TestAStaleCallDoesNotConsumeTheLossMarker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	b.mu.Lock()
+	b.reactionsDropped = true
+	live := b.connGeneration
+	b.mu.Unlock()
+
+	if b.takeReactionsDropped(live - 1) {
+		t.Error("a stale call reported the loss, which is not its to report")
+	}
+	if !b.takeReactionsDropped(live) {
+		t.Error("the live call was told nothing was lost; the stale one had spent the marker")
+	}
+}

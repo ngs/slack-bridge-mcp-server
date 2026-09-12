@@ -645,21 +645,18 @@ func (b *Bridge) deliver(ctx context.Context, generation uint64, msgs []Message,
 // second then cleared the flag unconditionally, the next call would open a
 // third connection while the replacement was still consuming events, and the
 // owner's messages would arrive on a socket nobody reads.
-func (b *Bridge) noteStreamClosed(generation uint64) {
+func (b *Bridge) noteStreamClosed(generation uint64, stream Stream) {
 	// Whatever this connection lost is still the agent's to hear about, and the
 	// stream that recorded it is going away. It is taken here rather than in
 	// any one caller because the socket closes its channels together and a call
 	// can notice any of them first: this is the one place every disconnect
 	// passes through. It is taken even when the stream has already been
 	// replaced — the loss happened either way.
-	b.mu.Lock()
-	stream := b.stream
-	current := !b.stale(generation)
-	b.mu.Unlock()
-
-	// Asked outside the lock: it is a question for the stream, and the stream
-	// is somebody else's implementation.
-	dropped := current && streamDroppedReactions(stream)
+	// The stream that is closing, not the one the bridge holds: a connection
+	// that has already been replaced still lost what it lost, and its marker
+	// has nowhere else to go. Asked outside the lock, because it is a question
+	// for somebody else's implementation.
+	dropped := streamDroppedReactions(stream)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -766,7 +763,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 			// First run against this channel: seeding from the newest
 			// message means a fresh install starts a conversation rather
 			// than replaying the channel's entire history into the agent.
-			seeded, err := b.seedCursor(ctx, api, channel)
+			seeded, err := b.seedCursor(ctx, api, generation, channel)
 			if err != nil {
 				return nil, err
 			}
@@ -792,12 +789,21 @@ func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// A drain that started on a connection since replaced does not get to say
-	// the replacement has caught up: what it read came from the installation as
-	// it was, and the new connection has its own catch-up to run — the one that
-	// finds what a reinstall has just made readable. The messages it did read
-	// are still handed over; only the flag is left alone.
-	if needCatchUp && generation == b.connGeneration {
+	// A drain that started on a connection since replaced commits nothing at
+	// all. What it read came from the installation as it was, and the queues it
+	// would merge are being filled by the connection that replaced it: taking
+	// them here hands the new connection's messages to a call that is about to
+	// be told its own connection is gone, and leaves the cursor where it was so
+	// they come back twice. Worse for a reply in a conversation outside the
+	// home channel, where the catch-up that would find it again is best effort.
+	//
+	// The replacement asks for its own catch-up on connect, and that one reads
+	// the window with the installation as it now is.
+	if generation != b.connGeneration {
+		return nil, nil
+	}
+
+	if needCatchUp {
 		// The cursor first, and whatever else has been asked for since. A seed
 		// is a fact about the channel — where it was when this session found
 		// it — and dropping it because something asked for another catch-up
@@ -931,7 +937,7 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 // hand the owner's own history back to them as if it were new. So the seed is
 // the newest timestamp anywhere in the scanned window — surface messages and
 // their latest replies alike.
-func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (string, error) {
+func (b *Bridge) seedCursor(ctx context.Context, api API, generation uint64, channel string) (string, error) {
 	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
 		return "", err
@@ -953,10 +959,16 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 	}
 	if ts != "" {
 		b.mu.Lock()
-		b.recordStateWriteLocked(stateWrite{
-			stateKey: stateKey{kind: writeLastTS, channel: channel},
-			ts:       ts,
-		})
+		// Only for the connection that asked. A seed that outlives its
+		// connection is not written: the call it belongs to commits nothing,
+		// so persisting the cursor would move a restart past messages the
+		// replacement never handed over.
+		if !b.stale(generation) {
+			b.recordStateWriteLocked(stateWrite{
+				stateKey: stateKey{kind: writeLastTS, channel: channel},
+				ts:       ts,
+			})
+		}
 		b.mu.Unlock()
 	}
 	return ts, nil

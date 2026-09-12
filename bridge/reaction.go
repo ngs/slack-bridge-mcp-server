@@ -218,6 +218,13 @@ func (b *Bridge) takeReactionsDropped(generation uint64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// A call on a connection since replaced is about to be told so, and reports
+	// nothing. Clearing the marker here would spend it on that call and leave
+	// the next live wait saying a loss never happened.
+	if b.stale(generation) {
+		return false
+	}
+
 	dropped = dropped || b.reactionsDropped
 	b.reactionsDropped = false
 	return dropped
