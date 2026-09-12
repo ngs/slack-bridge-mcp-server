@@ -116,6 +116,11 @@ type Bridge struct {
 	// that owns its stream, and the goroutines the connector runs behind it. It
 	// is replaced with each connection and called before the next one starts.
 	stopConnection context.CancelFunc
+	// connCtx is what stopConnection ends. A catch-up follows it as well as its
+	// own caller, so a fetch left behind by a connection that has been replaced
+	// gives up instead of holding the catch-up slot until the tool call that
+	// started it times out.
+	connCtx context.Context
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -157,6 +162,10 @@ type Bridge struct {
 	// stateWriting marks a write that is inside the store right now, so
 	// shutdown can wait out the one the fence was too late for.
 	stateWriting atomic.Bool
+	// stateWriteAttempts counts the writes handed to the store, retries
+	// included. It exists so that a refused write can be seen to have been
+	// tried again rather than merely still queued.
+	stateWriteAttempts atomic.Uint64
 	// stateFenced stops the writer for good, whatever it is in the middle of.
 	// It is set when shutdown has waited as long as it can and is about to
 	// release the lock that keeps another session off this file.
@@ -486,6 +495,7 @@ func (b *Bridge) ensure() error {
 		return err
 	}
 	b.stopConnection = stopConnection
+	b.connCtx = connCtx
 
 	b.api = api
 	// Its own user ID is how the bridge recognises a mention. Without it the
@@ -862,7 +872,32 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	lastTS := b.lastTS
 	channel := b.cfg.Channel
 	owner := b.cfg.Owner
+	connCtx := b.connCtx
 	b.mu.Unlock()
+
+	// The fetch follows the connection as well as its caller. What it reads on
+	// a connection that has been replaced is committed nowhere — the check
+	// below throws all of it away — and until it returns it holds the slot the
+	// new connection's own catch-up is waiting for. Ending it with the
+	// connection is what keeps one slow request on a dead connection from
+	// standing in front of the live one.
+	ctx, endFetch := context.WithCancel(ctx)
+	defer endFetch()
+	if connCtx != nil {
+		defer context.AfterFunc(connCtx, endFetch)()
+	}
+
+	// A fetch that was cut short this way has nothing to report: the caller's
+	// own context is still good, and the answer to a connection that ended
+	// underneath it is the empty one its replacement will fill in.
+	abandoned := func(err error) bool {
+		if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
+			return false
+		}
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.stale(generation)
+	}
 
 	// What the scan outside the home channel would change is staged here and
 	// committed below, under the same generation check as everything else.
@@ -885,6 +920,9 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 			// than replaying the channel's entire history into the agent.
 			seeded, err := b.seedCursor(ctx, api, generation, channel)
 			if err != nil {
+				if abandoned(err) {
+					return nil, nil, nil
+				}
 				return nil, nil, err
 			}
 			lastTS = seeded
@@ -896,6 +934,9 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 			)
 			fetched, truncated, err = catchUp(ctx, api, channel, owner, lastTS)
 			if err != nil {
+				if abandoned(err) {
+					return nil, nil, nil
+				}
 				return nil, nil, err
 			}
 			if truncated {
@@ -916,6 +957,9 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		var err error
 		conversations, err = b.catchUpConversations(ctx, api, owner, generation, scan)
 		if err != nil {
+			if abandoned(err) {
+				return nil, nil, nil
+			}
 			return nil, nil, err
 		}
 	}

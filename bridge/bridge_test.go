@@ -141,7 +141,7 @@ func (f *fakeAPI) historyForLocked(channel string) []candidate {
 	return f.channelHistory[channel]
 }
 
-func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, error) {
+func (f *fakeAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, error) {
 	f.mu.Lock()
 	// Recorded before the gate, so a test holding catch-up open can see that it
 	// has started.
@@ -150,8 +150,14 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 	f.mu.Unlock()
 	if gate != nil {
 		// Held open so a test can make something happen while catch-up is in
-		// flight, which is otherwise a window too small to aim at.
-		<-gate
+		// flight, which is otherwise a window too small to aim at. The context
+		// still ends it, as the real request would: a caller that has given up
+		// — or a connection that has been replaced — is not waiting on Slack.
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return HistoryPage{}, ctx.Err()
+		}
 	}
 
 	f.mu.Lock()

@@ -655,12 +655,18 @@ func TestARefusedStateWriteIsTriedAgain(t *testing.T) {
 	})
 	b.mu.Unlock()
 
-	eventually(t, "the refused cursor to be waiting for another attempt", func() bool {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		_, kept := b.stateDirty[stateKey{kind: writeLastTS, channel: testChannel}]
-		return kept
+	// Two attempts, not one: the cursor being in the map proves nothing on its
+	// own, since that is where it was put before the writer ever saw it. What
+	// is being tested is that a refusal is tried again.
+	eventually(t, "the refused cursor to be written a second time", func() bool {
+		return b.stateWriteAttempts.Load() >= 2
 	})
+	b.mu.Lock()
+	_, kept := b.stateDirty[stateKey{kind: writeLastTS, channel: testChannel}]
+	b.mu.Unlock()
+	if !kept {
+		t.Error("the refused cursor was dropped rather than kept for another attempt")
+	}
 }
 
 // A connection that has already been replaced still lost what it lost. Its
@@ -1111,5 +1117,78 @@ func TestACatchUpBiggerThanOnePassDeliversWhatItReached(t *testing.T) {
 	}
 	if b.catchUpDue() {
 		t.Error("another catch-up was asked for, which would read the same newest pages again and make no progress")
+	}
+}
+
+// A catch-up whose connection is replaced under it is reading an installation
+// that no longer exists, and nothing it finds will be committed. Until it
+// returns it holds the catch-up slot, which is what the connection that
+// replaced it is waiting for before it can read its own backlog — so it ends
+// with the connection rather than with the tool call that started it.
+func TestACatchUpEndsWithTheConnectionItStartedOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// Held open for the rest of the test: what ends the fetch has to be the
+	// connection, not the gate.
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.historyGate = gate
+	calls := len(api.historyCalls)
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	generation := b.currentGeneration()
+	type batch struct {
+		msgs []Message
+		err  error
+	}
+	done := make(chan batch, 1)
+	go func() {
+		// A generous slot wait: the point is that the fetch itself gives up,
+		// not that somebody timed out waiting for a turn.
+		msgs, _, err := b.drainCatchUp(context.Background(), generation, true, 10*time.Second)
+		done <- batch{msgs, err}
+	}()
+
+	eventually(t, "the catch-up to be in flight", func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		return len(api.historyCalls) > calls
+	})
+
+	b.forceReconnect()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Errorf("drainCatchUp() error = %v, want the abandoned fetch to report nothing", got.err)
+		}
+		if len(got.msgs) != 0 {
+			t.Errorf("drainCatchUp() = %v, want nothing from a connection that has been replaced", texts(got.msgs))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the catch-up is still holding the slot after its connection was replaced")
 	}
 }

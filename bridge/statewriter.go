@@ -141,6 +141,7 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 		// is how the lock waits out the one already past it.
 		b.stateWriting.Store(true)
 		defer b.stateWriting.Store(false)
+		b.stateWriteAttempts.Add(1)
 		return applyStateWrite(store, w)
 	}
 
