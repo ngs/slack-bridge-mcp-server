@@ -3205,3 +3205,173 @@ func TestTheCursorMovesPastAPageOfOtherPeoplesMessages(t *testing.T) {
 		t.Errorf("last_ts = %q, want the newest message the read looked at", got)
 	}
 }
+
+// An invariant, stated as a table: whatever the pump is working through, the
+// clicks behind it are taken. They are the only thing on the three channels
+// with no history to be recovered from — a question whose answer is lost times
+// out — and the buffer they wait in is the smallest, so a sweep that leaves it
+// alone is a sweep that can lose one.
+//
+// It pins one turn of the pump: the sweep, then the clicks. The loop's own
+// ordering cannot be pinned from outside, because a select with a ready click
+// and a ready reaction picks between them at random — which is why the sweep
+// is the thing that has to empty the buffer rather than the select.
+func TestTheClicksAreTakenWhateverElseIsArriving(t *testing.T) {
+	flood := []struct {
+		name     string
+		messages int
+		reaction int
+	}{
+		{name: "nothing else at all"},
+		{name: "a sweep's worth of messages", messages: maxSweep},
+		{name: "reactions and nothing else", reaction: 600},
+		{name: "both at once", messages: maxSweep, reaction: 600},
+	}
+
+	for _, f := range flood {
+		t.Run(f.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			b, _, _ := askBridge(ctx, t)
+			if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+				t.Fatalf("Wait() error = %v", err)
+			}
+			generation := b.currentGeneration()
+
+			events := make(chan StreamEvent, f.messages+1)
+			for i := 0; i < f.messages; i++ {
+				events <- StreamEvent{Kind: StreamMessage, Message: Message{
+					TS: fmt.Sprintf("600.%06d", i+1), Channel: testChannel, User: testOwner, Text: "flood",
+				}}
+			}
+			reactions := make(chan Reaction, f.reaction+1)
+			for i := 0; i < f.reaction; i++ {
+				reactions <- Reaction{
+					TS: "600.000001", Channel: testChannel, User: colleague, Reaction: "eyes",
+					Added: true, EventTS: fmt.Sprintf("%d", i),
+				}
+			}
+
+			// More clicks than the buffer the socket gives them, arriving
+			// while all of that is waiting.
+			clicks := make(chan Interaction, liveInteractionBuffer)
+			for i := 0; i < liveInteractionBuffer; i++ {
+				clicks <- click(testOwner, askTS, 0)
+			}
+
+			// One turn of the pump, in the order the loop does it.
+			b.applyReady(generation, events, reactions, nil)
+			b.drainReadyClicks(generation, clicks)
+
+			if left := len(clicks); left != 0 {
+				t.Errorf("%d clicks left waiting after a turn of the pump; the buffer they queue in holds %d", left, liveInteractionBuffer)
+			}
+		})
+	}
+}
+
+// The other half of the same invariant, in both directions: the home cursor
+// follows what a pass read, and it never steps over something that has not been
+// handed over. Reading is what moves it — a colleague's message, or one that
+// was delivered from the queue before this pass found it in history, has been
+// read — and a message still waiting to be handed over is what stops it.
+func TestTheHomeCursorFollowsWhatWasReadAndStopsAtWhatWasNot(t *testing.T) {
+	t.Run("past what was read but not delivered", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cfg := testConfig(t)
+		cfg.IndicatorDisabled = true
+		cfg.AutoAckDisabled = true
+		if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+			t.Fatalf("seeding the cursor: %v", err)
+		}
+
+		api := &fakeAPI{
+			botUserID: testBotUser,
+			channelHistory: map[string][]candidate{testChannel: {
+				ownerMsg("100.000100", "already answered"),
+				ownerMsg("100.000200", "for the agent"),
+				// Read, and not for the agent.
+				{Channel: testChannel, User: colleague, Text: "not for us", TS: "100.000300"},
+			}},
+		}
+		b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+		t.Cleanup(func() { _ = b.Close() })
+
+		msgs := waitOnce(ctx, t, b).Messages
+		if len(msgs) != 1 || msgs[0].TS != "100.000200" {
+			t.Fatalf("Wait() = %v, want the owner's message alone", texts(msgs))
+		}
+		if got := b.Status().LastTS; got != "100.000300" {
+			t.Errorf("last_ts = %q, want the newest message the pass read", got)
+		}
+	})
+
+	t.Run("and not past what is still waiting", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cfg := testConfig(t)
+		cfg.IndicatorDisabled = true
+		cfg.AutoAckDisabled = true
+		if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+			t.Fatalf("seeding the cursor: %v", err)
+		}
+
+		api := &fakeAPI{
+			botUserID:      testBotUser,
+			channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+		}
+		stream := newFakeStream()
+		b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
+		t.Cleanup(func() { _ = b.Close() })
+
+		if result := waitOnce(ctx, t, b); !result.TimedOut {
+			t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+		}
+
+		// Queued and not yet handed over.
+		send(stream, testChannel, "100.000400", "", "still waiting")
+		eventually(t, "the pump to take it", func() bool { return b.pendingHomeCount() == 1 })
+
+		// A pass that goes to Slack, and a hole that opens while it is there:
+		// nobody knows where that hole is, so nothing this pass read can be
+		// placed and the cursor may not move over what is waiting.
+		gate := make(chan struct{})
+		api.mu.Lock()
+		api.historyGate = gate
+		calls := len(api.historyCalls)
+		api.mu.Unlock()
+
+		b.mu.Lock()
+		b.needCatchUp = true
+		b.mu.Unlock()
+
+		type batch struct {
+			msgs []Message
+			err  error
+		}
+		done := make(chan batch, 1)
+		go func() {
+			msgs, _, err := b.drainCatchUp(ctx, b.currentGeneration(), true, 2*time.Second)
+			done <- batch{msgs, err}
+		}()
+		eventually(t, "the pass to reach Slack", func() bool { return len(api.calls()) > calls })
+		b.absorb(StreamEvent{Kind: StreamDropped})
+		close(gate)
+
+		if got := <-done; got.err != nil {
+			t.Fatalf("drainCatchUp() error = %v", got.err)
+		} else if len(got.msgs) != 0 {
+			t.Fatalf("drainCatchUp() = %v, want nothing: the pass was thrown away", texts(got.msgs))
+		}
+		if got := b.Status().LastTS; got != "100.000100" {
+			t.Errorf("last_ts = %q, want it behind the message still waiting to be handed over", got)
+		}
+		if b.pendingHomeCount() != 1 {
+			t.Error("the message was taken from the queue by a pass that was thrown away")
+		}
+	})
+}

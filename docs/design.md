@@ -471,6 +471,18 @@ interface.
 Every write wakes the subscribers, so a call blocked on an empty queue hears
 about what another call's connection just received.
 
+Two invariants hold across all of it, whatever is arriving:
+
+- **The clicks are taken every turn.** They keep no order with anything, they
+  are the one thing no history can give back — a question whose answer is lost
+  times out — and the buffer they wait in is the smallest of the three. The
+  sweep empties it rather than leaving it to the select.
+- **The home cursor follows what a pass read, and stops at what it did not hand
+  over.** Every message in every page counts towards how far a read got, so a
+  page of somebody else's conversation moves the cursor past itself; a message
+  still waiting to be handed over stops it, and a pass thrown away by a hole
+  moves it nowhere at all.
+
 An overflow is the one thing the stream cannot simply hand over: it is announced
 as an event on the channel that had no room for one. So the pump asks the stream
 each time round whether it is holding a refusal it has not been able to report,
