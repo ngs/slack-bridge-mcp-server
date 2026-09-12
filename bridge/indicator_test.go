@@ -643,3 +643,34 @@ func TestIndicatorSettingsFromTheEnvironment(t *testing.T) {
 		}
 	})
 }
+
+// Close is the end of the session, and nothing starts after it. A call that
+// had already taken a batch can still be handing it over as Close returns, and
+// an indicator started there is a goroutine and a message in the channel that
+// outlive the shutdown that waited for everything else.
+func TestNoIndicatorStartsAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	posts := len(indicatorPosts(api))
+
+	// What a delivery in flight does on its way out.
+	b.mu.Lock()
+	b.startIndicatorLocked(time.Now(), testChannel, "")
+	running := b.indicator != nil
+	b.mu.Unlock()
+
+	if running {
+		t.Error("an indicator started after the session ended")
+	}
+	time.Sleep(5 * testGrace)
+	if got := len(indicatorPosts(api)); got != posts {
+		t.Errorf("indicator posts = %d after Close, want the %d it had", got, posts)
+	}
+}

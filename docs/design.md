@@ -613,6 +613,16 @@ was absorbing: the queue was kept, so it stayed full, so the next live message
 was refused too, and every pass delivered the same window again while the queue
 it duplicated never emptied.
 
+**A stream says when it has stopped.** A connection ends by having its context
+cancelled, and the producer behind it is then somewhere between its last send
+and its close. The channels closing says it has finished, eventually; a stream
+that implements `StreamFinisher` says it sooner, by closing `Finished()` before
+it closes anything else. The bridge waits on that where it is offered and on a
+short timer where it is not — and the difference is a reaction queued in that
+last moment, which has no history to be recovered from and which nothing else
+would go back for. Implementing it is optional, as with the reaction half and
+the overflow report: a stream that does not is waited for exactly as before.
+
 **One writer for the state file.** Every cursor the bridge keeps — how far the
 home channel has been read, how far each conversation outside it has, how far
 the search for mentions has looked, and that a conversation is open at all — is

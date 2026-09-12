@@ -411,6 +411,10 @@ type fakeStream struct {
 	// eventsClosed marks the message half as closed, so the hello a fresh
 	// connection sends is not sent onto a closed channel.
 	eventsClosed atomic.Bool
+	// finished stands in for the producer having stopped, which the real
+	// stream reports before it closes anything.
+	finished          chan struct{}
+	closeFinishedOnce sync.Once
 
 	// closeEventsOnce and friends make closing idempotent: the connector
 	// closes everything when the connection's context is cancelled, the way
@@ -423,9 +427,19 @@ type fakeStream struct {
 // PendingOverflow reports a refused message the stream has not announced.
 func (s *fakeStream) PendingOverflow() bool { return s.pendingOverflow.Load() }
 
+// Finished closes when the producer has stopped.
+func (s *fakeStream) Finished() <-chan struct{} { return s.finished }
+
+// noteFinished says the producer has stopped, which the real stream does
+// before it closes any channel.
+func (s *fakeStream) noteFinished() {
+	s.closeFinishedOnce.Do(func() { close(s.finished) })
+}
+
 // closeEvents ends the message half of the stream.
 func (s *fakeStream) closeEvents() {
 	s.closeEventsOnce.Do(func() {
+		s.noteFinished()
 		s.eventsClosed.Store(true)
 		close(s.events)
 	})
@@ -452,6 +466,7 @@ func (s *fakeStream) closeInteractions() {
 // closeAll ends the whole stream, in the order the real one does: reactions,
 // then clicks, then the events channel a disconnection is reported from.
 func (s *fakeStream) closeAll() {
+	s.noteFinished()
 	s.closeReactionsOnce.Do(func() { close(s.reactions) })
 	s.closeInteractions()
 	s.closeEvents()
@@ -462,6 +477,7 @@ func newFakeStream() *fakeStream {
 		events:       make(chan StreamEvent, 16),
 		interactions: make(chan Interaction, 16),
 		reactions:    make(chan Reaction, 16),
+		finished:     make(chan struct{}),
 	}
 }
 

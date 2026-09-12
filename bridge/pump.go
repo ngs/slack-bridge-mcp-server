@@ -88,12 +88,21 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 		// of them.
 		applied, keep := b.applyReady(generation, events, reactions, carried)
 		carried = keep
+
+		// Clicks every time round, not only under a flood of messages. They
+		// keep no order with anything, they are the one thing no history can
+		// give back — a question whose answer is lost times out — and the
+		// buffer they wait in is the smallest of the three. A burst of
+		// reactions alone used to leave this untouched: nothing counted them,
+		// so the sweep looked idle while it worked, and the clicks behind them
+		// waited for a message to arrive.
+		b.drainReadyClicks(generation, clicks)
+
 		if applied >= maxSweep {
 			// A flood defers the reactions, and nothing else. Clicks have no
 			// order to keep with messages and no history to be recovered from,
 			// and a shutdown that waited for the flood to end would be a
 			// shutdown that did not happen.
-			b.drainReadyClicks(generation, clicks)
 			select {
 			case <-ctx.Done():
 				b.finishStream(generation, stream, events, clicks, reactions, carried)
@@ -219,7 +228,7 @@ func (b *Bridge) noteOverflowLocked(overflow bool) {
 // the events are waited for rather than taken as they stand: what is on that
 // channel is the owner's messages, and the closure is not going anywhere.
 func (b *Bridge) finishStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
-	late, closed := awaitStreamClose(events)
+	late, closed := awaitStreamClose(events, streamFinished(stream))
 	b.endStream(generation, stream, late, events, clicks, reactions, carried, closed)
 }
 
@@ -425,7 +434,7 @@ func (b *Bridge) applyClick(generation uint64, in Interaction) {
 // wait is short because a socket that has not finished in this long is one
 // shutdown should not be held up by; what it was holding is then reported as
 // lost, like anything else abandoned.
-func awaitStreamClose(events <-chan StreamEvent) (late []StreamEvent, closed bool) {
+func awaitStreamClose(events <-chan StreamEvent, finished <-chan struct{}) (late []StreamEvent, closed bool) {
 	deadline := time.NewTimer(streamCloseWait)
 	defer deadline.Stop()
 
@@ -439,6 +448,11 @@ func awaitStreamClose(events <-chan StreamEvent) (late []StreamEvent, closed boo
 			// than applied here, so it goes in with the rest of the backlog
 			// and in the order it arrived.
 			late = append(late, evt)
+		case <-finished:
+			// The producer has said it has stopped, which it does before it
+			// closes anything. Whatever is on the channels is all there will
+			// ever be, and the sweeps that follow take it.
+			return late, true
 		case <-deadline.C:
 			return late, false
 		}

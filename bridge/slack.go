@@ -212,6 +212,37 @@ type ReactionStream interface {
 	ReactionsDropped() bool
 }
 
+// StreamFinisher is the optional half of Stream that says when its producer
+// has stopped: once Finished is closed, nothing more will be put on any of the
+// stream's channels.
+//
+// It exists for the moment a connection ends. The channels closing says the
+// same thing eventually, but a producer can be between its last send and its
+// close for as long as the socket library takes — and a reaction queued in
+// that moment, on a connection nobody is reading any more, is a vote in no
+// history that nothing would go back for. Waiting on this rather than on a
+// timer is what makes the difference between "it has finished" and "it has
+// not finished yet".
+//
+// Reached by type assertion, like the rest: a stream that does not implement
+// it is waited for on the timer, as before.
+type StreamFinisher interface {
+	// Finished closes when the producer has stopped, before the stream's
+	// channels are closed.
+	Finished() <-chan struct{}
+}
+
+// streamFinished returns a stream's producer-finished channel, or nil if it has
+// none. A nil channel blocks for ever in a select, which is exactly "this
+// stream never says".
+func streamFinished(stream Stream) <-chan struct{} {
+	f, ok := stream.(StreamFinisher)
+	if !ok {
+		return nil
+	}
+	return f.Finished()
+}
+
 // OverflowReporter is the optional half of Stream that says whether it has
 // refused a message it has not yet reported. A stream reports an overflow by
 // putting a StreamDropped event on its events channel — which it can only do

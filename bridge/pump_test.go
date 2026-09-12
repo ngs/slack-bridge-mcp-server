@@ -2848,7 +2848,7 @@ func TestAStreamThatClosedAtTheSweepBoundIsACleanClose(t *testing.T) {
 	}
 	close(events)
 
-	late, closed := awaitStreamClose(events)
+	late, closed := awaitStreamClose(events, nil)
 
 	if len(late) != maxSweep {
 		t.Errorf("awaitStreamClose() took %d events, want the sweep's worth", len(late))
@@ -3067,5 +3067,141 @@ func TestASlowCloseDeliversTheReactionsItIsHolding(t *testing.T) {
 	}
 	if b.droppedReactionMark() {
 		t.Error("the reaction was handed over and reported lost at the same time")
+	}
+}
+
+// Clicks are the one thing no history can give back: a question whose answer
+// is lost times out, and the buffer they wait in is the smallest of the three.
+// The pump empties it every time round now rather than only under a flood of
+// messages — a burst of reactions used to leave it untouched, because nothing
+// counted the reactions and the sweep looked idle while it worked.
+//
+// This is a guard rather than a proof: the select picks between a ready click
+// and a ready reaction at random, so a click already queued arrives either way.
+// What the sweep protects against is the buffer filling while the pump works,
+// which takes a real socket's volumes to show.
+func TestABurstOfReactionsDoesNotHoldUpTheClicks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := askBridge(ctx, t)
+
+	done := make(chan AskResult, 1)
+	go func() {
+		result, err := b.Ask(ctx, AskRequest{
+			Question:          "ship it?",
+			Options:           []string{"yes", "no"},
+			Timeout:           5 * time.Second,
+			InterruptDisabled: true,
+		})
+		if err != nil {
+			t.Errorf("Ask() error = %v", err)
+		}
+		done <- result
+	}()
+	waitForQuestion(b)
+
+	// Other people's reactions, as fast as the socket could deliver them, and
+	// the owner's click behind them.
+	burst := make(chan struct{})
+	burstDone := make(chan struct{})
+	go func() {
+		defer close(burstDone)
+		for i := 0; ; i++ {
+			select {
+			case <-burst:
+				return
+			case stream.reactions <- Reaction{
+				TS: "100.000200", Channel: testChannel, User: colleague, Reaction: "eyes",
+				Added: true, EventTS: fmt.Sprintf("%d", i),
+			}:
+			}
+		}
+	}()
+	// Stopped before the test returns, so it cannot still be sending when the
+	// cleanup closes the stream.
+	defer func() {
+		close(burst)
+		<-burstDone
+	}()
+
+	stream.interactions <- click(testOwner, askTS, 0)
+
+	select {
+	case result := <-done:
+		if result.ChoiceIndex != 0 {
+			t.Errorf("Ask() = %+v, want the answer the owner clicked", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the click waited out the question while the pump worked through reactions")
+	}
+}
+
+// The producer says when it has stopped, before it closes anything. Waiting on
+// that rather than on a timer is what makes a reaction queued between the last
+// send and the close something the bridge still takes.
+func TestAStreamThatSaysItHasFinishedIsNotATimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// Channels of this test's own. The events one never closes — what ends the
+	// wait is the producer saying it has stopped — and a reaction is queued in
+	// that last moment.
+	events := make(chan StreamEvent)
+	reactions := make(chan Reaction, 1)
+	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true}
+	stream.noteFinished()
+
+	started := time.Now()
+	b.finishStream(generation, stream, events, nil, reactions, nil)
+
+	if took := time.Since(started); took >= streamCloseWait {
+		t.Errorf("the teardown waited %v for a producer that had said it was done", took)
+	}
+	if kept := b.drainReactions(generation); len(kept) != 1 {
+		t.Errorf("drainReactions() = %+v, want the reaction queued as the producer stopped", kept)
+	}
+	if b.droppedReactionMark() {
+		t.Error("a stream that said it had finished was reported as a loss")
+	}
+}
+
+// A page of somebody else's conversation has still been read. Leaving the
+// cursor behind it means the next hole fetches the same page to learn the same
+// thing — and with a busy channel that is every hole, for ever.
+func TestTheCursorMovesPastAPageOfOtherPeoplesMessages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {
+			ownerMsg("100.000100", "already answered"),
+			// Said by somebody else: read, and not for the agent.
+			{Channel: testChannel, User: colleague, Text: "not for us", TS: "100.000200"},
+		}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout: nothing there is the owner's", result)
+	}
+
+	if got := b.Status().LastTS; got != "100.000200" {
+		t.Errorf("last_ts = %q, want the newest message the read looked at", got)
 	}
 }

@@ -64,6 +64,7 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 		events:       make(chan StreamEvent, liveEventBuffer),
 		interactions: make(chan Interaction, liveInteractionBuffer),
 		reactions:    make(chan Reaction, liveReactionBuffer),
+		finished:     make(chan struct{}),
 		owner:        cfg.Owner,
 		botUserID:    auth.UserID,
 	}
@@ -440,7 +441,11 @@ type socketModeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
 	reactions    chan Reaction
-	owner        string
+	// finished closes when the consumer has stopped, before the channels it
+	// fills are closed: the bridge waits on it rather than on a timer, so a
+	// reaction queued between the last send and the close is still taken.
+	finished chan struct{}
+	owner    string
 	// reactionsDropped records that a reaction did not fit in the queue. It is
 	// sticky and read by the wait, which passes it to the agent: a lost vote
 	// that nobody is told about is a count quietly wrong, where one that is
@@ -470,6 +475,10 @@ func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
 // to handing a batch over.
 func (s *socketModeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
+// Finished closes when the consumer has stopped, before it closes the channels
+// it fills.
+func (s *socketModeStream) Finished() <-chan struct{} { return s.finished }
+
 // PendingOverflow reports a message refused for want of room and not yet
 // announced. The announcement is a StreamDropped event, and it cannot be made
 // until the channel that had no room has some.
@@ -483,6 +492,11 @@ func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Clien
 	defer close(s.events)
 	defer close(s.interactions)
 	defer close(s.reactions)
+	// Registered last, so it runs first: the bridge learns that nothing more
+	// is coming before the channels start closing. Everything already queued
+	// is still there to be taken — what this rules out is something arriving
+	// after the bridge has stopped looking.
+	defer close(s.finished)
 
 	ack := func(req socketmode.Request) { _ = client.Ack(req) }
 

@@ -1232,6 +1232,13 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 
 	var (
 		fetched, conversations []Message
+		// looked is how far the read of the home channel got, counting every
+		// message in the pages it read rather than only the ones it may hand
+		// over.
+		looked string
+		// truncated marks a read that ran out of pages before it ran out of
+		// window.
+		truncated bool
 		// seeding marks the first run against a channel, where the cursor is
 		// being established rather than read from.
 		seeding bool
@@ -1262,17 +1269,14 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 			lastTS = seeded
 			seeding = true
 		} else {
-			var (
-				err       error
-				truncated bool
-			)
-			fetched, truncated, err = catchUp(ctx, api, channel, owner, lastTS)
+			got, err := catchUp(ctx, api, channel, owner, lastTS)
 			if err != nil {
 				if abandoned(err) {
 					return nil, nil, nil
 				}
 				return nil, nil, err
 			}
+			fetched, looked, truncated = got.messages, got.read, got.truncated
 			if truncated {
 				// More window than one pass can read, and the pages it read
 				// are the newest of it: what was not reached is older than
@@ -1486,6 +1490,12 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	newest := newestTS(home)
 	if last := newestTS(read); tsLess(newest, last) {
 		newest = last
+	}
+	// And past the pages themselves. A read that found only other people's
+	// messages has still read them, and a cursor left behind them is a page
+	// the next hole fetches again to learn the same thing.
+	if tsLess(newest, looked) {
+		newest = looked
 	}
 
 	// The thread cursors, before anything can return. A pass that reads a
@@ -1792,13 +1802,14 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, generation uint64, cha
 // ever returns channel-surface messages, so a reply the owner typed inside a
 // thread while the bridge was away is invisible to it. The second pass goes
 // and finds those.
-func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Message, bool, error) {
+func catchUp(ctx context.Context, api API, channel, owner, after string) (window, error) {
 	if api == nil {
-		return nil, false, errors.New("the bridge is not connected to Slack")
+		return window{}, errors.New("the bridge is not connected to Slack")
 	}
 
 	var (
 		messages []Message
+		read     string
 		cursor   string
 	)
 	for page := 0; page < maxHistoryPages; page++ {
@@ -1809,10 +1820,17 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 			Limit:   historyPageLimit,
 		})
 		if err != nil {
-			return nil, false, err
+			return window{}, err
 		}
 
 		for _, c := range resp.Messages {
+			// Every message counts towards how far this read got, not only the
+			// ones it can hand over. A page of a colleague's messages is a
+			// page that has been looked at: leaving the cursor behind it means
+			// the next hole reads it again to learn the same thing.
+			if c.TS != "" && tsLess(read, c.TS) {
+				read = c.TS
+			}
 			if msg, ok := accept(c, channel, owner); ok {
 				messages = append(messages, msg)
 			}
@@ -1826,7 +1844,7 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 
 	replies, err := catchUpThreads(ctx, api, channel, owner, after)
 	if err != nil {
-		return nil, false, err
+		return window{}, err
 	}
 
 	// A cursor left over means the walk stopped at its page bound with more
@@ -1834,7 +1852,25 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 	// moves only through what was delivered, so another pass continues from
 	// there rather than starting again.
 	// History pages arrive newest-first; mergeMessages sorts and deduplicates.
-	return mergeMessages(after, messages, replies), cursor != "", nil
+	return window{
+		messages:  mergeMessages(after, messages, replies),
+		read:      read,
+		truncated: cursor != "",
+	}, nil
+}
+
+// window is what one read of the home channel found: the messages it may hand
+// over, how far it looked, and whether it ran out of pages before it ran out of
+// window.
+//
+// The two timestamps are not the same. What may be handed over is the owner's
+// messages; how far it looked counts every message in every page it read, so
+// that a page of somebody else's conversation moves the cursor past itself
+// rather than being read again by the next pass that comes along.
+type window struct {
+	messages  []Message
+	read      string
+	truncated bool
 }
 
 // catchUpThreads recovers thread replies newer than the cursor.
@@ -2140,6 +2176,13 @@ func (b *Bridge) startIndicatorAt(startedAt time.Time, channel, threadTS string)
 func (b *Bridge) startIndicatorLocked(startedAt time.Time, channel, threadTS string) {
 	b.stopIndicatorLocked()
 	if b.cfg.IndicatorDisabled || b.api == nil {
+		return
+	}
+	if b.closed {
+		// The session is over. A call that had already taken a batch can still
+		// be handing it over as Close returns, and an indicator started here
+		// would be a goroutine and a message in the channel that outlive the
+		// shutdown that waited for everything else.
 		return
 	}
 
