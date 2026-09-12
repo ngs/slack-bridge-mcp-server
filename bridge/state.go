@@ -19,6 +19,12 @@ type ChannelState struct {
 	// LastTS is the timestamp of the newest message already handed to a
 	// caller. Catch-up asks Slack for everything after it.
 	LastTS string `json:"last_ts"`
+	// Seeded records that this session has established where it found the
+	// channel, which is not the same as having read anything: a channel that
+	// was empty when the bridge first looked has no cursor to write, and
+	// without this mark a restart would treat it as never looked at and take
+	// the first message posted in the meantime for the past.
+	Seeded bool `json:"seeded,omitempty"`
 }
 
 // ThreadState is one conversation thread opened by a mention, and how far
@@ -105,6 +111,41 @@ func (s *Store) LastTS(channel string) (string, error) {
 	return state.Channels[channel].LastTS, nil
 }
 
+// Seeded reports whether this channel has been looked at before, cursor or no
+// cursor.
+func (s *Store) Seeded(channel string) (bool, error) {
+	state, err := s.Load()
+	if err != nil {
+		return false, err
+	}
+	return state.Channels[channel].Seeded, nil
+}
+
+// SetSeeded records that a channel has been looked at. It is for the channel
+// that was empty when the bridge first read it: there is no cursor to write,
+// and the mark is what keeps a restart from treating the next message posted
+// as history.
+func (s *Store) SetSeeded(channel string) error {
+	if channel == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	current := state.Channels[channel]
+	if current.Seeded {
+		return nil
+	}
+	current.Seeded = true
+	state.Channels[channel] = current
+	return s.saveLocked(state)
+}
+
 // SetLastTS advances the cursor for a channel and writes the file. The cursor
 // only ever moves forward: an out-of-order or stale value is ignored rather
 // than rewinding the bridge into replaying messages the caller already has.
@@ -120,10 +161,15 @@ func (s *Store) SetLastTS(channel, ts string) error {
 	if err != nil {
 		return err
 	}
-	if current := state.Channels[channel].LastTS; current != "" && !tsLess(current, ts) {
+	current := state.Channels[channel]
+	if current.LastTS != "" && !tsLess(current.LastTS, ts) {
 		return nil
 	}
-	state.Channels[channel] = ChannelState{LastTS: ts}
+	// A cursor implies the channel has been looked at, and the mark is kept
+	// either way: writing the whole value back would otherwise erase it.
+	current.LastTS = ts
+	current.Seeded = true
+	state.Channels[channel] = current
 	return s.saveLocked(state)
 }
 

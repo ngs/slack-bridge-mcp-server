@@ -661,12 +661,15 @@ func TestARefusedStateWriteIsTriedAgain(t *testing.T) {
 	eventually(t, "the refused cursor to be written a second time", func() bool {
 		return b.stateWriteAttempts.Load() >= 2
 	})
-	b.mu.Lock()
-	_, kept := b.stateDirty[stateKey{kind: writeLastTS, channel: testChannel}]
-	b.mu.Unlock()
-	if !kept {
-		t.Error("the refused cursor was dropped rather than kept for another attempt")
-	}
+	// Polled rather than read once: between being taken from the map and being
+	// put back there is a moment when the cursor is in the writer's hands and
+	// in no queue at all.
+	eventually(t, "the refused cursor to be waiting for another attempt", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		_, kept := b.stateDirty[stateKey{kind: writeLastTS, channel: testChannel}]
+		return kept
+	})
 }
 
 // A connection that has already been replaced still lost what it lost. Its
@@ -1275,5 +1278,183 @@ func TestReactionsLeftOnAClosingConnectionAreReported(t *testing.T) {
 
 	if !b.droppedReactionMark() {
 		t.Error("reactions were left on a connection that closed with nothing said; the agent's count is wrong and it cannot know")
+	}
+}
+
+// A channel that was empty when the bridge first looked leaves no cursor
+// behind: there is no message to point at. That it was looked at is recorded
+// all the same, because without it a restart reads the channel as one it has
+// never seen — and takes the first message posted while it was down for the
+// channel's past, which is exactly the message it was started to deliver.
+func TestAnEmptyChannelIsRememberedAsSeen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	empty := &fakeAPI{botUserID: testBotUser}
+	first := New(ctx, cfg, &fakeConnector{api: empty, stream: newFakeStream()})
+	if result := waitOnce(ctx, t, first); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on an empty channel", result)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if seeded, err := NewStore(cfg.StateDir).Seeded(testChannel); err != nil || !seeded {
+		t.Fatalf("Seeded() = %v (err %v), want the empty channel recorded as looked at", seeded, err)
+	}
+
+	// Posted while the session was down, and the first thing in the channel.
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "are you there?")},
+		},
+	}
+	second := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = second.Close() })
+
+	msgs := waitOnce(ctx, t, second).Messages
+	if len(msgs) != 1 {
+		t.Fatalf("Wait() = %v, want the message posted while the session was down", texts(msgs))
+	}
+}
+
+// A gap in what has been applied is a mention that may not be there yet. A
+// reaction that matches nothing while a catch-up is outstanding is held for it
+// rather than judged against a conversation the session has not read its way
+// into: the catch-up recovers the mention, and nothing recovers the reaction.
+func TestAReactionWaitsForTheCatchUpThatExplainsIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// The socket overflowed: the mention that opened a conversation in the
+	// other channel is in the hole, and this reaction is on a message from it.
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.absorbReactionLocked(Reaction{
+		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "eyes", Added: true,
+	})
+	b.mu.Unlock()
+
+	if kept := b.drainReactions(generation); len(kept) != 0 {
+		t.Fatalf("drainReactions() = %+v, want nothing yet: the conversation it belongs to has not been read in", kept)
+	}
+
+	// The catch-up arrives and opens the conversation.
+	b.mu.Lock()
+	b.absorbLocked(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "200.000100", Channel: otherChannel, User: testOwner, Text: mention("ship it?"),
+	}})
+	b.needCatchUp = false
+	b.mu.Unlock()
+
+	if kept := b.drainReactions(generation); len(kept) != 1 {
+		t.Errorf("drainReactions() = %+v, want the reaction the catch-up explained", kept)
+	}
+}
+
+// The closing sweep of the messages is bounded like every other. A connection
+// that closes with more messages waiting than it can take leaves reactions that
+// would be judged against a connection only half applied — so they are reported
+// as lost instead, which the agent can still read the tally for.
+func TestReactionsAreReportedWhenTheClosingSweepCannotFinish(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// More than both sweeps of the closing path together, so the channel
+	// cannot be emptied and the reactions have messages ahead of them.
+	const sent = maxSweep + maxClosingSweep + 1
+	events := make(chan StreamEvent, sent)
+	for i := 0; i < sent; i++ {
+		events <- StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: fmt.Sprintf("300.%06d", i+1), Channel: testChannel, User: testOwner, Text: "flood",
+		}}
+	}
+	reactions := make(chan Reaction, 1)
+	reactions <- Reaction{
+		TS: "300.000001", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true,
+	}
+
+	b.endStream(generation, b.currentStream(), nil, events, nil, reactions, nil)
+
+	if !b.droppedReactionMark() {
+		t.Error("a reaction was judged against a connection whose messages could not all be applied, with nothing said")
+	}
+}
+
+// The timeout a wait is given is a promise about when it answers, and a catch-up
+// that has its turn but not an answer from Slack must not break it. The fetch
+// is bounded by the same deadline, and a fetch cut short is the ordinary empty
+// answer: nothing is committed until the messages are handed over, so the next
+// call reads the same window.
+func TestAWaitAnswersOnTimeEvenWithSlackNotAnswering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// Slack stops answering, and a catch-up is asked for.
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	type answer struct {
+		result WaitResult
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		result, err := b.Wait(ctx, 200*time.Millisecond)
+		done <- answer{result, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Wait() error = %v, want the ordinary timed-out answer", got.err)
+		}
+		if !got.result.TimedOut {
+			t.Errorf("Wait() = %+v, want it to report the timeout it promised", got.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait() never came back: its own deadline did not bound the fetch it was waiting on")
 	}
 }

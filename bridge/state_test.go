@@ -328,3 +328,28 @@ func TestAFencedWriterStartsNothingMore(t *testing.T) {
 		t.Error("beginStateWrite() = true after the fence; the fence is for good")
 	}
 }
+
+// A reopen that does not reach the disk carries the removal it stood for. If
+// the next cursor for the same conversation simply replaced it, SetThread would
+// run without clearing the old one and a restart would resume in the dead
+// conversation instead of at the start of the new one.
+func TestAFailedReopenIsCarriedIntoTheCursorBehindIt(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeThread, channel: "C1", threadTS: "100.000100"}
+
+	// The first reply in the reopened conversation, queued while the reopen
+	// itself was being written.
+	b.stateDirty[key] = stateWrite{stateKey: key, ts: "100.000200"}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, reopened: true}})
+
+	b.mu.Lock()
+	got := b.stateDirty[key]
+	b.mu.Unlock()
+	if got.ts != "100.000200" {
+		t.Errorf("stateDirty cursor = %q, want the later write to stand", got.ts)
+	}
+	if !got.reopened {
+		t.Errorf("stateDirty = %+v, want the reopen it was queued behind carried into it", got)
+	}
+}

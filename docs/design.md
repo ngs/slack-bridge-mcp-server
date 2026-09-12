@@ -511,10 +511,14 @@ swallowed.
 home channel has been read, how far each conversation outside it has, how far
 the search for mentions has looked, and that a conversation is open at all — is
 recorded in memory and handed to a writer goroutine. Nothing writes that file
-from under `b.mu`. It is read and rewritten whole, and `b.mu` is the lock the
-pump holds while it applies what the socket delivered, so a slow disk beneath it
-stops the only reader the connection has and the click and reaction buffers
-behind it are the ones nothing can recover. One writer keeps the changes in the
+from under `b.mu`, and that is the whole point of the arrangement: the file is
+read and rewritten whole, and `b.mu` is the lock the pump holds while it applies
+what the socket delivered — so a write beneath that lock would stop the only
+reader the connection has for as long as the disk took, and the click and
+reaction buffers behind it are the ones nothing can recover. Recording a cursor
+therefore never waits for a disk. It leaves a change in a map and returns, the
+writer picks it up on its own goroutine, and a write that fails is retried
+there rather than reported to the caller. One writer keeps the changes in the
 order they were made, and flushes what it has when the session ends — after the
 pump has stopped, so a cursor being recorded as the session ends still reaches
 the file.

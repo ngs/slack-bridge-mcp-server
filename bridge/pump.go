@@ -391,7 +391,18 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// reported as lost rather than quietly abandoned.
 	var ready []Reaction
 	drainLocked(reactions, maxClosingSweep, func(r Reaction) { ready = append(ready, r) })
-	drainLocked(events, maxSweep, b.absorbLocked)
+	drainLocked(events, maxClosingSweep, b.absorbLocked)
+
+	// The reactions are judged against the messages that came before them, and
+	// a message still on the channel is one that has not had its say. If the
+	// sweep above could not empty it, the reactions are reported as lost
+	// rather than judged against a connection only half applied — the tally is
+	// still readable, and a reaction dropped as out of scope is not.
+	if len(events) > 0 {
+		b.noteReactionsDroppedLocked()
+		ready, carried = nil, nil
+	}
+
 	for _, r := range carried {
 		b.absorbReactionLocked(r)
 	}

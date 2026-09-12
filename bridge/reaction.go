@@ -220,12 +220,25 @@ func (b *Bridge) drainReactionsLocked() []Reaction {
 	// pump closed that instant, and a reaction still matching nothing is one
 	// Slack genuinely sent before the agent was part of the conversation. Those
 	// are a tally rather than an event, and slack_reactions reads tallies.
+	//
+	// Unless a catch-up is outstanding. Then there is a hole in what has been
+	// applied — a socket that overflowed, or a connection that dropped — and
+	// the mention that would put this reaction in scope may be in it. The
+	// catch-up recovers messages and nothing recovers reactions, so a reaction
+	// that matches nothing waits for it rather than being judged against a
+	// conversation the session has not read its way into yet.
 	kept := make([]Reaction, 0, len(queued))
+	var held []Reaction
 	for _, r := range queued {
 		if reaction, ok := b.classifyReactionLocked(r); ok {
 			kept = append(kept, reaction)
+			continue
+		}
+		if b.needCatchUp && len(held) < maxPendingReactions {
+			held = append(held, r)
 		}
 	}
+	b.pendingReactions = held
 	if len(kept) == 0 {
 		return nil
 	}

@@ -482,7 +482,16 @@ func (b *Bridge) ensure() error {
 			return err
 		}
 		b.lastTS = lastTS
-		b.cursorSeeded = lastTS != ""
+
+		// A cursor is one way of knowing the channel has been looked at; the
+		// mark is the other, and the only one an empty channel leaves. Without
+		// it a restart would seed again and take the first message posted
+		// while the session was down for the channel's past.
+		seeded, err := b.store.Seeded(b.cfg.Channel)
+		if err != nil {
+			return err
+		}
+		b.cursorSeeded = lastTS != "" || seeded
 
 		mentionCursor, err := b.store.MentionCursor()
 		if err != nil {
@@ -546,6 +555,11 @@ func (b *Bridge) ensure() error {
 // rather than a budget: long enough for a slot that is about to come free,
 // short enough that the answer is still prompt.
 const lastLookSlotWait = 250 * time.Millisecond
+
+// lastLookGrace is how long the drain at the deadline may spend on Slack once
+// it has its turn. The deadline has passed by then, so the whole of the last
+// look is a courtesy — bounded here so that it stays one.
+const lastLookGrace = time.Second
 
 // maxPendingMessages bounds the messages waiting to be handed over. What it
 // protects against is a session left working for hours while a busy channel
@@ -612,6 +626,23 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	defer deadline.Stop()
 	waitEnds := time.Now().Add(timeout)
 
+	// drainWithin runs a catch-up that may not outlive this call's own
+	// deadline: neither the wait for its turn, nor the requests it makes once
+	// it has one. A fetch cut short that way is not an error and not a loss —
+	// nothing is committed until the messages are handed over, so the next
+	// call reads the same window — and the empty answer is the one this call
+	// promised by that time.
+	drainWithin := func(budget, slotWait time.Duration) ([]Message, []Reaction, error) {
+		drainCtx, cancelDrain := context.WithTimeout(ctx, budget)
+		defer cancelDrain()
+
+		msgs, reactions, err := b.drainCatchUp(drainCtx, generation, true, slotWait)
+		if err != nil && ctx.Err() == nil && drainCtx.Err() != nil {
+			return nil, nil, nil
+		}
+		return msgs, reactions, err
+	}
+
 	for {
 		// Before anything is taken off a queue. A caller that has given up
 		// should not consume a batch on its way out: those messages are the
@@ -626,7 +657,8 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		// there by the pump, so there is nothing to sweep here.
 		// The slot is waited for only as long as this call has left: another
 		// call's slow request must not make this one answer late.
-		msgs, drained, err := b.drainCatchUp(ctx, generation, true, time.Until(waitEnds))
+		budget := time.Until(waitEnds)
+		msgs, drained, err := drainWithin(budget, budget)
 		if err != nil {
 			return WaitResult{}, err
 		}
@@ -670,7 +702,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			if err := ctx.Err(); err != nil {
 				return WaitResult{}, err
 			}
-			msgs, drained, err := b.drainCatchUp(ctx, generation, true, lastLookSlotWait)
+			msgs, drained, err := drainWithin(lastLookSlotWait+lastLookGrace, lastLookSlotWait)
 			if err != nil {
 				return WaitResult{}, err
 			}
@@ -1279,9 +1311,19 @@ func (b *Bridge) establishSeedLocked(channel, seed string, commit bool) {
 	b.seedMergePending = true
 	b.preSeedRefused = false
 
-	if !commit || seed == "" {
-		// Nothing to write: either this call cannot, or the channel was empty
-		// and there is no mark to record.
+	if !commit {
+		// This call cannot write: what it found is kept in memory, and the
+		// call that hands the messages over records it.
+		return
+	}
+	if seed == "" {
+		// The channel was empty, so there is no cursor to write — but that it
+		// was looked at is worth recording all the same. Without it a restart
+		// would seed again, and the first message posted in the meantime would
+		// be read as the channel's past and never delivered.
+		b.recordStateWriteLocked(stateWrite{
+			stateKey: stateKey{kind: writeSeeded, channel: channel},
+		})
 		return
 	}
 	// Written here rather than where it was read, so it cannot reach the file

@@ -17,6 +17,9 @@ const (
 	writeThread
 	// writeMentionCursor records how far the search for mentions has looked.
 	writeMentionCursor
+	// writeSeeded records that a channel has been looked at, for the channel
+	// that had nothing in it to leave a cursor behind.
+	writeSeeded
 )
 
 // stateKey identifies what a change is about, so that two changes to the same
@@ -264,6 +267,8 @@ func applyStateWrite(store *Store, w stateWrite) error {
 		err = store.SetLastTS(w.channel, w.ts)
 	case w.kind == writeMentionCursor:
 		err = store.SetMentionCursor(w.ts)
+	case w.kind == writeSeeded:
+		err = store.SetSeeded(w.channel)
 	}
 	return err
 }
@@ -283,11 +288,16 @@ func (b *Bridge) requeueStateWrites(failed []stateWrite) {
 			b.stateDirty[w.stateKey] = w
 			continue
 		}
-		if w.remove && !newer.remove {
+		if (w.remove || w.reopened) && !newer.remove {
 			// Given up on and opened again before the removal reached the file.
 			// The later write wins, as always, but it has to undo the first as
 			// well: on its own it is a plain open, and SetThread would leave the
 			// cursor of the conversation that was meant to be forgotten.
+			//
+			// A write that was itself a reopen carries the same debt. The
+			// removal it stood for still has not happened, so a plain cursor
+			// queued behind it would resume the dead conversation from where
+			// the old one had been read to.
 			newer.reopened = true
 			b.stateDirty[w.stateKey] = newer
 		}
