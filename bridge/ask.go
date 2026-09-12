@@ -194,7 +194,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	// standing in the channel with live buttons. Looked for here, before
 	// another one goes up beside it: a click on the old one would answer
 	// nothing.
-	b.retireOrphanQuestion(ctx, api)
+	b.retireOrphanQuestion(ctx, api, time.Until(callEnds))
 
 	if api == nil {
 		return AskResult{}, errors.New("the bridge is not connected to Slack")
@@ -206,14 +206,23 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	// above leaves it alone, since nothing about the agent's work changed.
 	retired := b.stopIndicator()
 
-	ts, err := postQuestion(b.ctx, api, channel, threadTS, q, time.Until(callEnds))
+	budget := time.Until(callEnds)
+	if budget <= 0 {
+		// The time the caller asked for went on getting here — the search for
+		// an abandoned question, most likely. Posting one now would put
+		// buttons in the channel for a call that is already over.
+		b.restoreIndicator(ctx, retired)
+		return AskResult{ChoiceIndex: -1, TimedOut: true}, nil
+	}
+
+	ts, err := postQuestion(b.ctx, api, channel, threadTS, q, budget)
 	if err != nil {
 		// A post given up on can still have landed: the request was
 		// abandoned, not cancelled at Slack. What is lost with it is the ts,
 		// which is the only thing that could take the buttons away — so the
 		// question is remembered instead, and the next one looks for it.
 		if errors.Is(err, context.DeadlineExceeded) {
-			b.noteOrphanQuestion(channel, q.Text)
+			b.noteOrphanQuestion(channel, threadTS, q.Text)
 		}
 		// No question went up, so the agent is still the one working and the
 		// channel should say so again.
@@ -316,7 +325,10 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
-			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			// Within what is left, which by now is the floor: the call is
+			// over either way, and the promise about when it returns outlives
+			// the question it was about.
+			b.resolveWithin(api, channel, ts, q.Text+"\n\n⌛ expired", time.Until(askEnds))
 			// The deadline and the end of the connection can be ready at the
 			// same moment, and a timeout would be the wrong answer to the
 			// second: it says "ask again", which is not what a call does with
@@ -499,49 +511,103 @@ func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64, budg
 // timestamp that would retire it went with the request.
 type orphanQuestion struct {
 	channel string
-	text    string
+	// threadTS is set for a question asked inside a conversation, which is
+	// where it has to be looked for: a thread reply is in no channel history.
+	threadTS string
+	text     string
 }
 
 // noteOrphanQuestion remembers a post that was given up on.
-func (b *Bridge) noteOrphanQuestion(channel, text string) {
+func (b *Bridge) noteOrphanQuestion(channel, threadTS, text string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.orphan = &orphanQuestion{channel: channel, text: text}
+	b.orphan = &orphanQuestion{channel: channel, threadTS: threadTS, text: text}
 }
 
 // retireOrphanQuestion takes away the buttons of a question whose post was
 // abandoned, if it finds one. Best effort by nature: the question may never
 // have landed, and looking costs one history call — so it is looked for once,
 // on the next question, and forgotten either way.
-func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API) {
+func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.Duration) {
 	b.mu.Lock()
 	orphan := b.orphan
 	b.orphan = nil
+	me := b.botUserID
 	b.mu.Unlock()
 
-	if orphan == nil || api == nil {
+	// Without a user ID of its own the bridge cannot tell its message from
+	// anybody else's, and a search that guessed would retire somebody's.
+	if orphan == nil || api == nil || me == "" {
 		return
 	}
+	// Inside the question's own budget, like everything else the call does:
+	// looking for a question that may never have landed is not worth the
+	// timeout the caller was promised.
+	if budget <= 0 {
+		return
+	}
+	if budget > orphanSearchWait {
+		budget = orphanSearchWait
+	}
+	searchCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 
-	page, err := api.History(ctx, HistoryRequest{Channel: orphan.channel, Limit: orphanSearchLimit})
+	found, err := b.findOrphanQuestion(searchCtx, api, orphan, me)
 	if err != nil {
 		log.Printf("could not look for a question whose post was given up on: %s", logSafe(err.Error(), maxLoggedError))
 		return
 	}
-	for _, c := range page.Messages {
-		// The bridge's own message, saying what that question said. Slack
-		// renders the text into blocks, so what comes back starts with it.
-		if c.User != b.botUserID || c.TS == "" || !strings.HasPrefix(c.Text, orphan.text) {
-			continue
-		}
-		b.resolve(api, orphan.channel, c.TS, orphan.text+"\n\n⌛ expired")
+	if found == "" {
 		return
 	}
+	b.resolveWithin(api, orphan.channel, found, orphan.text+"\n\n⌛ expired", budget)
+}
+
+// findOrphanQuestion looks for the message an abandoned post may have left, and
+// reports its timestamp.
+//
+// The match is exact. What Slack shows for such a message is the notification
+// fallback, which is the question's text and nothing else — while a question
+// that has been retired carries what retired it after that text. Matching on a
+// prefix would take the second for the first and expire a question the owner
+// has already answered.
+func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphanQuestion, me string) (string, error) {
+	var messages []candidate
+	if orphan.threadTS != "" {
+		// A reply is in no channel history, so the conversation is where it
+		// has to be looked for.
+		replies, err := api.Replies(ctx, RepliesRequest{
+			Channel:  orphan.channel,
+			ThreadTS: orphan.threadTS,
+			Limit:    orphanSearchLimit,
+		})
+		if err != nil {
+			return "", err
+		}
+		messages = replies.Messages
+	} else {
+		page, err := api.History(ctx, HistoryRequest{Channel: orphan.channel, Limit: orphanSearchLimit})
+		if err != nil {
+			return "", err
+		}
+		messages = page.Messages
+	}
+
+	for _, c := range messages {
+		if c.User == me && c.TS != "" && c.Text == orphan.text {
+			return c.TS, nil
+		}
+	}
+	return "", nil
 }
 
 // orphanSearchLimit is how far back the search for an abandoned question
 // looks. It ran moments ago, so this is generous.
 const orphanSearchLimit = 20
+
+// orphanSearchWait bounds the search itself. It is one request, and the call
+// that pays for it is about to ask a question of its own.
+const orphanSearchWait = 2 * time.Second
 
 // postQuestion posts on a detached context with a deadline of its own.
 //
@@ -554,8 +620,9 @@ const orphanSearchLimit = 20
 func postQuestion(ctx context.Context, api API, channel, threadTS string, q Question, budget time.Duration) (string, error) {
 	// The smaller of the two: a post that outlasts the question's own timeout
 	// has already broken the promise the timeout is, and one that outlasts the
-	// bound below has stopped being worth waiting for either way.
-	if budget <= 0 || budget > askPostTimeout {
+	// bound below has stopped being worth waiting for either way. A caller
+	// with nothing left does not get here at all.
+	if budget > askPostTimeout {
 		budget = askPostTimeout
 	}
 

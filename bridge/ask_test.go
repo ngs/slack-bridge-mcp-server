@@ -1109,3 +1109,178 @@ func TestAQuestionAnsweredAtTheDeadlineStillReturnsOnTime(t *testing.T) {
 		t.Fatal("Ask() never came back: a question with nothing left of its budget still spent a courtesy on Slack")
 	}
 }
+
+// The search for a question an abandoned post may have left is inside the
+// question's own timeout, like everything else the call does: it may never have
+// landed, and looking for it is not worth the promise the caller was given.
+func TestTheSearchForAnAbandonedQuestionIsBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A question was given up on mid-post, and Slack has stopped answering
+	// history — which is where the search for it goes.
+	b.noteOrphanQuestion(testChannel, "", "ship it?")
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	api.mu.Unlock()
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ask() error = %v", err)
+		}
+		if took := time.Since(started); took > 300*time.Millisecond+askLastLookWait {
+			t.Errorf("Ask() took %v for a question given 300ms; the search for the abandoned one is not inside the timeout", took)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ask() never came back: the search for a question that may never have landed is not bounded at all")
+	}
+}
+
+// A question that has already been answered is not an abandoned one. What
+// Slack shows for a live question is its text and nothing else; a retired one
+// carries what retired it after that, so the match is exact.
+func TestAnAnsweredQuestionIsNotMistakenForAnAbandonedOne(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The same question, asked and answered before this one.
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: "100.000800"},
+	}}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", "ship it?")
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  200 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, r := range api.resolutions {
+		if r.TS == "100.000800" {
+			t.Error("a question the owner had already answered was rewritten as expired")
+		}
+	}
+}
+
+// A question asked inside a conversation is looked for there. A reply is in no
+// channel history, so searching the channel would never find it.
+func TestAnAbandonedQuestionInAThreadIsLookedForInTheThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.replies = []candidate{
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: "100.000800", ThreadTS: "100.000500"},
+	}
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	b.noteOrphanQuestion(testChannel, "100.000500", "ship it?")
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  200 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	var retired bool
+	api.mu.Lock()
+	for _, r := range api.resolutions {
+		if r.TS == "100.000800" {
+			retired = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("the question left in a conversation still has its buttons; the search looked in the channel, where a reply never is")
+	}
+}
+
+// Nothing is posted by a call that has already run out of time. The search for
+// an abandoned question can spend the whole of a short timeout, and putting
+// buttons in the channel for a call that is over is worse than not asking.
+func TestNoQuestionIsPostedWithNoTimeLeft(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The search for the abandoned question takes longer than the question
+	// about to be asked has to live.
+	b.noteOrphanQuestion(testChannel, "", "ship it?")
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.historyGate = gate
+	posted := len(api.questions)
+	api.mu.Unlock()
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		close(gate)
+	}()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if !result.TimedOut {
+		t.Errorf("Ask() = %+v, want the timeout it had already spent", result)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.questions) != posted {
+		t.Error("a question went up for a call that was already over; its buttons answer nobody")
+	}
+}

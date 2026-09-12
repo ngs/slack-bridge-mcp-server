@@ -1547,10 +1547,9 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// every reply rather than only the owner's. A conversation where somebody
 	// else has been talking has been read; left behind, it is the same replies
 	// fetched again on every catch-up, for ever.
+	// No need to ask whether the walk reached these: a conversation is either
+	// read or skipped, and only the ones it read are recorded here.
 	for _, mark := range scan.threadsRead {
-		if _, skipped := missed[mark.key]; skipped {
-			continue
-		}
 		b.noteThreadReadLocked(mark.key, mark.read)
 	}
 

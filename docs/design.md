@@ -594,10 +594,18 @@ of time and has nothing else to return.
 
 A post given up on can still land: the request was abandoned, not cancelled at
 Slack, and what is lost with it is the timestamp that could take the buttons
-away. The question is remembered instead, and the next one looks for it — the
-bridge's own message, saying what that question said, in the last twenty of the
-channel — and retires it before putting another up beside it. Once, and best
-effort: it may never have landed at all.
+away. The question is remembered instead, and the next one looks for it before
+putting another up beside it — the bridge's own message, saying exactly what
+that question said, in the last twenty of the channel, or of the conversation
+when the question was asked inside one. Exactly, because a question that has
+been retired carries what retired it after its text, and a question the owner
+has already answered is not an abandoned one.
+
+That search is inside the new question's timeout like everything else, and it
+can spend the whole of a short one: a call left with nothing does not post at
+all, and says it timed out. A question whose buttons are in the channel for a
+call that is already over is worse than a question never asked. The search
+happens once and is best effort throughout — the post may never have landed.
 
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again
