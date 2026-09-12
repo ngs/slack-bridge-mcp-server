@@ -135,27 +135,31 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 	defer close(done)
 
 	// flush reports whether everything waiting reached the file.
-	write := func(w stateWrite) error {
-		// Marked around the call, so shutdown can tell a writer between writes
-		// from one inside the store: the fence stops the next write, and this
-		// is how the lock waits out the one already past it.
-		b.stateWriting.Store(true)
-		defer b.stateWriting.Store(false)
+	write := func(w stateWrite) (error, bool) {
+		// Taking the fence and marking the write in one step is what makes the
+		// fence mean anything: checked and marked separately, shutdown could
+		// see an idle writer, let go of the lock that keeps another session off
+		// this file, and have this write land on top of that session's.
+		if !b.beginStateWrite() {
+			return nil, false
+		}
+		defer b.endStateWrite()
 		b.stateWriteAttempts.Add(1)
-		return applyStateWrite(store, w)
+		return applyStateWrite(store, w), true
 	}
 
 	flush := func() bool {
 		writes := b.takeStateWrites()
 		for i, w := range writes {
-			if b.stateFenced.Load() {
+			err, started := write(w)
+			if !started {
 				// Another session owns the file now. What is left is not
 				// written, and what it would have recorded is work done again
 				// after a restart — which is the smaller of the two costs.
 				b.requeueStateWrites(writes[i:])
 				return false
 			}
-			if err := write(w); err != nil {
+			if err != nil {
 				b.noteStateWriteError(err)
 				// The batch stops here. What follows was ordered behind this
 				// write for a reason — a conversation is recorded before the
@@ -199,20 +203,47 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 // another session is about to own this file, and a write from this one landing
 // afterwards would overwrite what that session has since recorded.
 func (b *Bridge) fenceStateWriter() {
-	b.stateFenced.Store(true)
+	b.stateWriteMu.Lock()
+	defer b.stateWriteMu.Unlock()
+	b.stateFenced = true
+}
+
+// beginStateWrite reports whether a write may start, and marks it as running
+// if it may. The two are one step on purpose: see the comment where it is
+// called.
+func (b *Bridge) beginStateWrite() bool {
+	b.stateWriteMu.Lock()
+	defer b.stateWriteMu.Unlock()
+	if b.stateFenced {
+		return false
+	}
+	b.stateWriting = true
+	return true
+}
+
+// endStateWrite marks the end of a write that beginStateWrite let through.
+func (b *Bridge) endStateWrite() {
+	b.stateWriteMu.Lock()
+	defer b.stateWriteMu.Unlock()
+	b.stateWriting = false
 }
 
 // awaitStateWriteIdle waits for a write already inside the store to finish.
 // Fencing stops the next one; this is for the one that is past the fence.
 func (b *Bridge) awaitStateWriteIdle() bool {
 	deadline := time.Now().Add(stateWriteFenceWait)
-	for time.Now().Before(deadline) {
-		if !b.stateWriting.Load() {
+	for {
+		b.stateWriteMu.Lock()
+		writing := b.stateWriting
+		b.stateWriteMu.Unlock()
+		if !writing {
 			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	return false
 }
 
 func applyStateWrite(store *Store, w stateWrite) error {
@@ -320,7 +351,13 @@ const stateWriteRetryWait = 200 * time.Millisecond
 // stopStateWriter tells the writer to flush what it has and stop, and waits
 // briefly for it. It reports whether the writer actually stopped, and must be
 // called without b.mu held.
-func (b *Bridge) stopStateWriter() bool {
+// stopStateWriter reports whether the writer finished what it had, and whether
+// the single-instance lock may be released. The two are not the same: a writer
+// that has been fenced with nothing in flight is finished as far as the file is
+// concerned, while one still inside the store cannot be interrupted at all —
+// and releasing the lock under it would let the session that takes it next have
+// its state overwritten by a rename from this one.
+func (b *Bridge) stopStateWriter() (stopped, mayRelease bool) {
 	b.mu.Lock()
 	stop, done := b.stopStateWrites, b.stateWritesDone
 	b.stopStateWrites = nil
@@ -328,7 +365,7 @@ func (b *Bridge) stopStateWriter() bool {
 	b.mu.Unlock()
 
 	if stop == nil {
-		return true
+		return true, true
 	}
 	close(stop)
 
@@ -336,7 +373,7 @@ func (b *Bridge) stopStateWriter() bool {
 	defer timeout.Stop()
 	select {
 	case <-done:
-		return true
+		return true, true
 	case <-timeout.C:
 	}
 
@@ -352,10 +389,10 @@ func (b *Bridge) stopStateWriter() bool {
 	// overwrite what that session has recorded.
 	if b.awaitStateWriteIdle() {
 		log.Printf("gave up waiting for the cursors to reach the state file; what is left will be read again after a restart")
-	} else {
-		log.Printf("a state file write is still running after being told to stop; another session started now could have its own writes overwritten")
+		return false, true
 	}
-	return false
+	log.Printf("a state file write has been running for longer than the shutdown could wait; the single-instance lock is being kept so that write cannot land on top of another session's")
+	return false, false
 }
 
 // stateWriteFenceWait is how long shutdown gives a write already in flight to

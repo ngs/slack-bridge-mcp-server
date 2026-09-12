@@ -159,17 +159,23 @@ type Bridge struct {
 	stateDirty map[stateKey]stateWrite
 	// stateWriteFailing keeps a failing state file to one line per episode.
 	stateWriteFailing bool
+	// stateWriteMu guards the fence and the write it fences, so that deciding
+	// a write may start and marking it as started are one step. Held for those
+	// two flags only, never across a write, and never together with b.mu.
+	stateWriteMu sync.Mutex
 	// stateWriting marks a write that is inside the store right now, so
 	// shutdown can wait out the one the fence was too late for.
-	stateWriting atomic.Bool
+	stateWriting bool
 	// stateWriteAttempts counts the writes handed to the store, retries
 	// included. It exists so that a refused write can be seen to have been
 	// tried again rather than merely still queued.
 	stateWriteAttempts atomic.Uint64
 	// stateFenced stops the writer for good, whatever it is in the middle of.
 	// It is set when shutdown has waited as long as it can and is about to
-	// release the lock that keeps another session off this file.
-	stateFenced atomic.Bool
+	// release the lock that keeps another session off this file. Guarded by
+	// stateWriteMu together with stateWriting: a write that has passed the
+	// fence has to be visible to whoever set it.
+	stateFenced bool
 	// stateClosed marks the writer as flushed and stopped, so a call still
 	// running at shutdown does not start another one behind it.
 	stateClosed     bool
@@ -411,7 +417,7 @@ func (b *Bridge) Close() error {
 	// stopped would leave it in a queue nobody is reading, which is a
 	// conversation the owner has to open again after a restart.
 	waitForPump(pumpStopped)
-	writerStopped := b.stopStateWriter()
+	writerStopped, mayReleaseLock := b.stopStateWriter()
 
 	if done != nil {
 		timeout := time.NewTimer(shutdownIndicatorWait)
@@ -431,6 +437,13 @@ func (b *Bridge) Close() error {
 		// holding. Said plainly because what it was holding is now work to be
 		// done again after a restart.
 		log.Printf("the state file writer was stopped before it finished; what it had not written will be read again after a restart")
+	}
+	if !mayReleaseLock {
+		// A write is still inside the store and cannot be called back. The
+		// lock is what keeps the next session from reading a file this one can
+		// still rewrite, so it is kept — the operating system releases it when
+		// this process exits, by which time that write is over.
+		return nil
 	}
 	return lock.Release()
 }
@@ -1078,6 +1091,16 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		return nil, reactions, nil
 	}
 
+	// Behind a gap the queued messages are deliberately still queued, and a
+	// cursor moved past one of them is a message nobody ever receives. So the
+	// cursor stays, and what was fetched is handed over anyway: the window it
+	// came from has no hole in it, and the next catch-up reads that window
+	// again from the same place and delivers it a second time.
+	//
+	// A duplicate, deliberately, and the same bargain the thread cursors make
+	// below: the cost of not moving the cursor is that these messages come
+	// back once more, and the cost of moving it is that the ones behind the
+	// gap never do.
 	heldBack := gapped && b.cursorWouldPassQueuedLocked(home)
 	if len(home) > 0 && !heldBack {
 		newest := home[len(home)-1].TS

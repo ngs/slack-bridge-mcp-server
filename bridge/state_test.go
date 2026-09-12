@@ -298,3 +298,33 @@ func TestAFailedWriteOvertakenByANewerOneIsDropped(t *testing.T) {
 		t.Errorf("stateDirty cursor = %q, want the newer one to stand", got.ts)
 	}
 }
+
+// Deciding that a write may start and marking it as started are one step.
+// Checked apart, shutdown could see an idle writer between the two, let go of
+// the lock that keeps another session off the file, and have that write land on
+// top of the new session's.
+func TestAFencedWriterStartsNothingMore(t *testing.T) {
+	b := &Bridge{}
+
+	if !b.beginStateWrite() {
+		t.Fatal("beginStateWrite() = false on a writer nobody has fenced")
+	}
+
+	// Fenced while that write is running: the fence stops the next one, and
+	// shutdown has to wait this one out rather than declare the file idle.
+	b.fenceStateWriter()
+	if b.awaitStateWriteIdle() {
+		t.Error("awaitStateWriteIdle() = true with a write still inside the store")
+	}
+	if b.beginStateWrite() {
+		t.Error("beginStateWrite() = true after the fence; another session may own the file by now")
+	}
+
+	b.endStateWrite()
+	if !b.awaitStateWriteIdle() {
+		t.Error("awaitStateWriteIdle() = false once the write had finished")
+	}
+	if b.beginStateWrite() {
+		t.Error("beginStateWrite() = true after the fence; the fence is for good")
+	}
+}

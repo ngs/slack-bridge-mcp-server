@@ -883,8 +883,8 @@ func TestAnEventAppliesTheCarriedReactionWithIt(t *testing.T) {
 		TS: "100.000200", Channel: testChannel, User: testOwner, Text: "ship it?",
 	}}
 
-	if !b.applyEvent(generation, evt, events, nil, carried) {
-		t.Fatal("applyEvent() left the carried reaction behind, want it applied with the message")
+	if keep := b.applyEvent(generation, evt, events, nil, carried); len(keep) != 0 {
+		t.Fatalf("applyEvent() carried %+v on, want the reaction applied with the message", keep)
 	}
 	if got := b.Status().PendingBacklogCount; got != 1 {
 		t.Fatalf("pending messages = %d, want the message applied", got)
@@ -1190,5 +1190,90 @@ func TestACatchUpEndsWithTheConnectionItStartedOn(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the catch-up is still holding the slot after its connection was replaced")
+	}
+}
+
+// Sweeping the messages and then the reactions is not by itself an order. One
+// goroutine fills both channels, in the order Slack sent things, so a message
+// handed over between the two sweeps is taken after the reaction that came
+// behind it. A reaction is judged when it is handed over, not when it is taken,
+// so letting one into the queue while the messages it came behind are still on
+// their channel is what splits the pair: the next call drains the reaction,
+// finds no conversation open, and throws it away.
+//
+// So a sweep that runs out of room carries the reactions on instead of queueing
+// them, and they wait for the messages ahead of them.
+func TestAReactionWaitsWhileMessagesAreStillOnTheChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// Channels of this test's own: the window between the two sweeps, with a
+	// mention still waiting and the reaction that came behind it already taken
+	// from the socket.
+	events := make(chan StreamEvent, 2)
+	for i, ts := range []string{"200.000100", "200.000200"} {
+		events <- StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: ts, Channel: otherChannel, User: testOwner, Text: mention(fmt.Sprintf("ship %d?", i)),
+		}}
+	}
+	reactions := make(chan Reaction, 1)
+	reactions <- Reaction{
+		TS: "200.000200", Channel: otherChannel, User: colleague, Reaction: "white_check_mark", Added: true,
+	}
+
+	// Room for one of the two messages, so the sweep ends with the other still
+	// on the channel.
+	b.mu.Lock()
+	applied, keep := b.takeReactionsLocked(events, reactions, nil, 1)
+	b.mu.Unlock()
+
+	if applied != 1 {
+		t.Fatalf("takeReactionsLocked() applied %d messages, want the one it had room for", applied)
+	}
+	if len(keep) != 1 {
+		t.Errorf("takeReactionsLocked() carried %+v, want the reaction to wait for the message still on the channel", keep)
+	}
+	if kept := b.drainReactions(b.currentGeneration()); len(kept) != 0 {
+		t.Errorf("drainReactions() = %+v, want nothing: a reaction queued now is judged against a conversation the message ahead of it has not opened", kept)
+	}
+}
+
+// A reaction left on a channel nobody will read again is in no history, and
+// nobody will deliver it. The last sweep of a closing connection takes more
+// than an ordinary one for that reason, and what it still cannot take is
+// reported so the agent knows to read the tally.
+func TestReactionsLeftOnAClosingConnectionAreReported(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// More than an ordinary sweep takes, which is what an ordinary sweep would
+	// have left behind with nothing said.
+	const sent = maxSweep + 50
+	reactions := make(chan Reaction, sent)
+	for i := 0; i < sent; i++ {
+		reactions <- Reaction{
+			TS:       fmt.Sprintf("100.%06d", i+1),
+			Channel:  testChannel,
+			User:     colleague,
+			Reaction: "eyes",
+			Added:    true,
+		}
+	}
+
+	b.endStream(generation, b.currentStream(), nil, nil, nil, reactions, nil)
+
+	if !b.droppedReactionMark() {
+		t.Error("reactions were left on a connection that closed with nothing said; the agent's count is wrong and it cannot know")
 	}
 }

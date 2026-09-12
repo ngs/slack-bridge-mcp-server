@@ -11,6 +11,13 @@ import (
 // keeps the pump answering its other channels.
 const maxSweep = 512
 
+// maxClosingSweep bounds the last sweep of the reactions channel, the one taken
+// as the connection ends. It is larger than maxSweep — larger than the channel
+// the socket fills, so an ordinary close abandons nothing at all — because
+// there is no next turn for what is left: a reaction on a dead connection is in
+// no history, and nobody will deliver it.
+const maxClosingSweep = 4 * maxSweep
+
 // pump owns the live connection.
 //
 // It is the only goroutine that receives from the stream: messages, clicks and
@@ -44,10 +51,8 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 		// conversation that had not opened yet. Going round again instead
 		// means the reactions are reached only when nothing is waiting ahead
 		// of them.
-		applied, tookCarried := b.applyReady(generation, events, reactions, carried)
-		if tookCarried {
-			carried = nil
-		}
+		applied, keep := b.applyReady(generation, events, reactions, carried)
+		carried = keep
 		if applied == maxSweep {
 			// A flood defers the reactions, and nothing else. Clicks have no
 			// order to keep with messages and no history to be recovered from,
@@ -85,9 +90,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
 				return
 			}
-			if b.applyEvent(generation, evt, events, reactions, carried) {
-				carried = nil
-			}
+			carried = b.applyEvent(generation, evt, events, reactions, carried)
 
 		case in, ok := <-clicks:
 			if !ok {
@@ -111,11 +114,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			// lets up would otherwise grow this without limit, and a queue
 			// that cannot be emptied is the one place a reaction is better
 			// lost and reported than held for ever.
-			if len(carried) >= maxPendingReactions {
-				b.noteReactionsDropped()
-				continue
-			}
-			carried = append(carried, r)
+			carried = b.carryOne(carried, r)
 		}
 	}
 }
@@ -133,27 +132,81 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 // bound the reactions wait, because a reaction applied ahead of a message still
 // on the channel is a reaction judged against a scope that message has not had
 // its say in.
-func (b *Bridge) applyReady(generation uint64, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (applied int, tookCarried bool) {
+func (b *Bridge) applyReady(generation uint64, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (applied int, keep []Reaction) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.stale(generation) {
-		return 0, false
+		return 0, carried
 	}
 
-	drainLocked(events, maxSweep, func(evt StreamEvent) {
-		b.absorbLocked(evt)
-		applied++
-	})
+	applied = drainLocked(events, maxSweep, b.absorbLocked)
 	if applied == maxSweep {
-		return applied, false
+		return applied, carried
 	}
 
+	more, keep := b.takeReactionsLocked(events, reactions, carried, maxSweep-applied)
+	return applied + more, keep
+}
+
+// takeReactionsLocked applies the reactions that are ready, once the messages
+// ahead of them are in. It reports how many more messages it applied on the
+// way, and what has to be carried to the next turn.
+//
+// Sweeping the events channel and then the reactions channel is not by itself
+// an order. Both are filled by the one goroutine that reads the socket, in the
+// order Slack sent things — but a message and its reaction handed over between
+// the two sweeps would leave the reaction taken and the message still on its
+// channel, and a reaction judged before the mention that opens its
+// conversation is a reaction dropped.
+//
+// So the reactions are taken off the channel first and judged last, with
+// another sweep of the events between: anything they came behind is on that
+// channel by the time they are on theirs, and this is where it is applied. The
+// caller must hold b.mu.
+func (b *Bridge) takeReactionsLocked(events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction, room int) (applied int, keep []Reaction) {
+	var ready []Reaction
+	drainLocked(reactions, maxPendingReactions, func(r Reaction) { ready = append(ready, r) })
+
+	applied = drainLocked(events, room, b.absorbLocked)
+	if applied == room && room > 0 {
+		// Messages are still waiting, which is the one thing a reaction may
+		// not be judged in front of. They wait together.
+		return applied, b.carryLocked(carried, ready)
+	}
+
+	// Carried before the channel's, because they were taken first.
 	for _, r := range carried {
 		b.absorbReactionLocked(r)
 	}
-	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
-	return applied, true
+	for _, r := range ready {
+		b.absorbReactionLocked(r)
+	}
+	return applied, nil
+}
+
+// carryOne holds one reaction over to the next turn, within the bound.
+func (b *Bridge) carryOne(carried []Reaction, r Reaction) []Reaction {
+	if len(carried) >= maxPendingReactions {
+		b.noteReactionsDropped()
+		return carried
+	}
+	return append(carried, r)
+}
+
+// carryLocked holds reactions over to the next turn, within the bound. A flood
+// of messages that never lets up would otherwise grow this without limit, and a
+// queue that cannot be emptied is the one place a reaction is better lost and
+// reported than held for ever. The caller must hold b.mu.
+func (b *Bridge) carryLocked(carried, ready []Reaction) []Reaction {
+	for _, r := range ready {
+		if len(carried) >= maxPendingReactions {
+			b.noteReactionsDroppedLocked()
+			continue
+		}
+		carried = append(carried, r)
+	}
+	return carried
 }
 
 // drainReadyClicks routes every click already waiting. Clicks keep no order
@@ -197,12 +250,12 @@ func (b *Bridge) stale(generation uint64) bool {
 //
 // Messages first within the pair, as always — the mention that opens a
 // conversation has to be applied before a reaction is judged against it.
-func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (tookCarried bool) {
+func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (keep []Reaction) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.stale(generation) {
-		return false
+		return carried
 	}
 
 	b.absorbLocked(evt)
@@ -210,19 +263,17 @@ func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan St
 	// events channel is in order, so a reaction on a mention two places behind
 	// the one just taken would otherwise be queued while that mention is still
 	// unapplied — and judged against a conversation that has not opened yet.
-	if drainLocked(events, maxSweep, b.absorbLocked) == maxSweep {
-		return false
+	applied := drainLocked(events, maxSweep, b.absorbLocked)
+	if applied == maxSweep {
+		return carried
 	}
 
 	// The carried ones go in here too, under this lock. Leaving them for the
 	// next turn would let a call drain the message just applied without the
 	// reaction that arrived with it, which is the split this design exists to
-	// remove. Carried before the channel's, because they were taken first.
-	for _, r := range carried {
-		b.absorbReactionLocked(r)
-	}
-	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
-	return true
+	// remove.
+	_, keep = b.takeReactionsLocked(events, reactions, carried, maxSweep-applied)
+	return keep
 }
 
 // applyClick routes one button click, unless the connection it came from has
@@ -327,13 +378,29 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	}
 	drainLocked(events, maxSweep, b.absorbLocked)
 	drainLocked(clicks, maxSweep, b.deliverInteraction)
-	// Carried first: those were taken from the socket before the ones still on
-	// the channel, and they are the whole reason a reaction is carried rather
-	// than dropped when the messages ahead of it are not done.
+
+	// The reactions last, and the messages they came behind swept once more
+	// before they are judged, as everywhere else. Carried first among them:
+	// those were taken from the socket before the ones still on the channel,
+	// and they are the whole reason a reaction is carried rather than dropped
+	// when the messages ahead of it are not done.
+	//
+	// The sweep is bigger here than anywhere else because this is the last
+	// read this connection will ever get. A reaction left on the channel is
+	// in no history and will be delivered by nobody, so what does not fit is
+	// reported as lost rather than quietly abandoned.
+	var ready []Reaction
+	drainLocked(reactions, maxClosingSweep, func(r Reaction) { ready = append(ready, r) })
+	drainLocked(events, maxSweep, b.absorbLocked)
 	for _, r := range carried {
 		b.absorbReactionLocked(r)
 	}
-	drainLocked(reactions, maxSweep, b.absorbReactionLocked)
+	for _, r := range ready {
+		b.absorbReactionLocked(r)
+	}
+	if len(reactions) > 0 {
+		b.noteReactionsDroppedLocked()
+	}
 	b.mu.Unlock()
 	b.noteStreamClosed(generation, stream)
 }

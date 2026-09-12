@@ -168,6 +168,12 @@ func (b *Bridge) noteReactionsDropped() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	b.noteReactionsDroppedLocked()
+}
+
+// noteReactionsDroppedLocked is noteReactionsDropped for a caller that already
+// holds b.mu, which the pump does for everything it applies.
+func (b *Bridge) noteReactionsDroppedLocked() {
 	b.reactionsDropped = true
 	// A loss is something to hear about as much as a reaction is: a wait
 	// blocked on a long timeout would otherwise sit out the whole of it before
