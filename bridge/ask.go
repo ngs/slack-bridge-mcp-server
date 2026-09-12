@@ -40,16 +40,11 @@ const (
 // and leaving live buttons behind is exactly what this call is preventing.
 const askResolveTimeout = 5 * time.Second
 
-// askResolveFloor is the least a retiring question gets, however little of the
-// call's timeout is left. Below this the request would be given up on before
-// Slack could answer it, and the buttons the owner has already clicked would
-// stay in the channel inviting another.
-//
-// It is generous for what it is. A question whose timestamp is in hand is one
-// nothing else will ever go back for: giving its chat.update half a second and
-// then abandoning it leaves those buttons standing for good, which costs the
-// owner more than the call costs by returning a moment later.
-const askResolveFloor = 1500 * time.Millisecond
+// shutdownRetireWait is how long Close waits for a question's buttons to be
+// taken out of the channel. It is the request's own bound and a moment more,
+// so a retirement already in flight finishes rather than being cut off by the
+// process exiting.
+const shutdownRetireWait = askResolveTimeout + time.Second
 
 // askPostTimeout bounds posting the question. It runs detached from the tool
 // call, so this is what keeps a Slack that never answers from holding the call
@@ -75,13 +70,8 @@ type AskRequest struct {
 	Question string
 	Options  []string
 	// Timeout is how long the owner has to answer, and it covers the whole
-	// call: posting the question, waiting for a click, and collecting whatever
-	// was said instead of clicking.
-	//
-	// The call can outrun it by a moment at the end. Taking the buttons away
-	// is a request of its own, and one abandoned before Slack could answer
-	// would leave them standing for good — so it is given a second and a half
-	// even when nothing is left, and the answer comes back after it.
+	// call: posting the question, waiting for a click, collecting whatever was
+	// said instead of clicking, and taking the buttons away afterwards.
 	Timeout time.Duration
 	// ThreadTS asks inside a thread instead of on the channel surface.
 	ThreadTS string
@@ -191,23 +181,34 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		b.mu.Unlock()
 		return AskResult{}, err
 	}
-	if b.ask != nil {
+	if b.ask != nil || b.askReserved {
 		b.mu.Unlock()
 		return AskResult{}, errors.New("a question is already waiting for an answer; wait for it to be answered or to time out before asking another")
 	}
 	channel := b.channelOr(req.Channel)
 	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel, generation: b.connGeneration}
-	b.ask = ask
+	// The reservation only. Refusing a second question is this call's from
+	// here; being the thing a click answers is not, and will not be until
+	// there is a question of its own in the channel.
+	b.askReserved = true
 	api, generation := b.api, b.connGeneration
 	b.mu.Unlock()
 
-	defer b.clearAsk(ask)
+	defer b.releaseAsk(ask)
 
 	// A question from a call that was given up on mid-post may still be
 	// standing in the channel with live buttons. Looked for here, before
 	// another one goes up beside it: a click on the old one would answer
 	// nothing.
 	b.retireOrphanQuestion(ctx, api, time.Until(callEnds))
+
+	// That search is a round trip, and the caller can have given up during it.
+	// Asked before anything goes up, because a question posted for a call that
+	// has already ended is buttons in the channel nobody is waiting on — put
+	// there and taken away again in the same breath.
+	if err := ctx.Err(); err != nil {
+		return AskResult{}, err
+	}
 
 	if api == nil {
 		return AskResult{}, errors.New("the bridge is not connected to Slack")
@@ -227,6 +228,13 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		b.restoreIndicator(ctx, retired)
 		return AskResult{ChoiceIndex: -1, TimedOut: true}, nil
 	}
+
+	// Published here, and not when the call was accepted. From this moment a
+	// click on this block is plausibly this question's answer and is worth
+	// holding; before it, the only question in the channel with these buttons
+	// is an older one the search above was trying to retire, and holding a
+	// click on that would replay it against the message that replaces it.
+	b.publishAsk(ask)
 
 	// Taken before the post, because it is the window the search for an
 	// abandoned one is cut by: anything the bridge posted after this moment.
@@ -298,7 +306,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// answer whatever happened to the socket afterwards.
 			if choice, ok := b.lastChance(ask); ok {
 				return b.answered(ctx, api, answer{
-					channel: channel, threadTS: threadTS, ts: ts, generation: generation, budget: time.Until(askEnds),
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation, ends: askEnds,
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
@@ -308,7 +316,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		if !req.InterruptDisabled && b.backlogWaiting(!skippedLooked) {
 			skippedLooked = true
 			if msgs := b.backlogWhileAsking(ctx, generation, time.Until(askEnds)); len(msgs) > 0 {
-				return b.interrupted(api, channel, ts, q, msgs), nil
+				return b.interrupted(api, channel, ts, q, msgs, askEnds), nil
 			}
 			// A reconnect rather than a message, or a drain that failed and
 			// left the queue where it was. Either way there is nothing to act
@@ -324,11 +332,11 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			if len(msgs) == 0 {
 				continue
 			}
-			return b.interrupted(api, channel, ts, q, msgs), nil
+			return b.interrupted(api, channel, ts, q, msgs, askEnds), nil
 
 		case choice := <-ask.answered:
 			return b.answered(ctx, api, answer{
-				channel: channel, threadTS: threadTS, ts: ts, generation: generation, budget: time.Until(askEnds),
+				channel: channel, threadTS: threadTS, ts: ts, generation: generation, ends: askEnds,
 				q: q, labels: labels, options: options, choice: choice,
 			}), nil
 
@@ -337,7 +345,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask); ok {
 				return b.answered(ctx, api, answer{
-					channel: channel, threadTS: threadTS, ts: ts, generation: generation, budget: time.Until(askEnds),
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation, ends: askEnds,
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
@@ -419,9 +427,12 @@ type answer struct {
 	channel  string
 	threadTS string
 	ts       string
-	// budget is what is left of the question's own timeout, which bounds the
-	// backlog the answer carries with it.
-	budget time.Duration
+	// ends is when the question's own timeout runs out, kept as the moment
+	// rather than as what was left of it at some earlier point. Retiring the
+	// buttons and collecting the backlog both come out of it, one after the
+	// other, and a remainder measured once and used twice would let the second
+	// of them start after the deadline had already passed.
+	ends time.Time
 	// generation is the connection the question was asked on, which is what
 	// decides whether the backlog it collects is still its to collect.
 	generation uint64
@@ -438,13 +449,15 @@ type answer struct {
 // question was asked in, which is where the owner just clicked and where they
 // are watching for what follows.
 func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
-	b.resolveWithin(api, a.channel, a.ts, answeredText(a.q.Text, a.labels[a.choice]), a.budget)
+	b.resolveWithin(api, a.channel, a.ts, answeredText(a.q.Text, a.labels[a.choice]), time.Until(a.ends))
 	b.startIndicator(a.channel, a.threadTS)
 	return AskResult{
 		ChoiceIndex: a.choice,
 		ChoiceLabel: a.options[a.choice],
 		TS:          a.ts,
-		Messages:    b.backlogWhileAsking(ctx, a.generation, a.budget),
+		// Measured again, not reused: retiring the buttons has just spent some
+		// of what was left, and the caller was promised one timeout.
+		Messages: b.backlogWhileAsking(ctx, a.generation, time.Until(a.ends)),
 	}
 }
 
@@ -455,8 +468,11 @@ func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
 // longer the thing being answered. The clock restarts where the owner sent the
 // message rather than where the question was asked, because that message is the
 // new work.
-func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Message) AskResult {
-	b.resolve(api, channel, ts, q.Text+"\n\n⌛ superseded")
+func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Message, ends time.Time) AskResult {
+	// Inside the question's own deadline like every other settled outcome. The
+	// caller is waiting on this one — it has the owner's message in hand — so
+	// the retirement is dispatched and waited for only as long as there is.
+	b.resolveWithin(api, channel, ts, q.Text+"\n\n⌛ superseded", time.Until(ends))
 	b.startIndicator(newestConversation(msgs))
 	return AskResult{
 		ChoiceIndex: -1,
@@ -798,15 +814,28 @@ func (b *Bridge) lastChance(ask *pendingAsk) (int, bool) {
 	}
 }
 
-// clearAsk retires the question from the bridge, leaving a question that
-// replaced it alone. Nothing can replace it while it is pending, so the guard
-// is only there to keep a future change from clearing the wrong one.
-func (b *Bridge) clearAsk(ask *pendingAsk) {
+// publishAsk makes the question the one a click answers. Called once the
+// buttons are about to exist, which is the first moment a click on this block
+// could belong to it.
+func (b *Bridge) publishAsk(ask *pendingAsk) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ask = ask
+}
+
+// releaseAsk gives up both the reservation and the question itself, which is
+// the end of the call either way — whether it ever got as far as posting.
+//
+// The guard on the question is only there to keep a future change from
+// clearing the wrong one: nothing can replace it while the reservation is
+// held, and the reservation outlives it.
+func (b *Bridge) releaseAsk(ask *pendingAsk) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.ask == ask {
 		b.ask = nil
 	}
+	b.askReserved = false
 }
 
 // resolve rewrites the question so it can no longer be clicked. It is best
@@ -816,20 +845,85 @@ func (b *Bridge) resolve(api API, channel, ts, text string) {
 	b.resolveWithin(api, channel, ts, text, askResolveTimeout)
 }
 
-// resolveWithin is resolve with a bound of its own, for the path that has an
-// answer in hand: the buttons have to go, but the owner is waiting for what
-// they clicked and a chat.update that takes its time would hold that up.
-// Whatever is left of the call's own timeout, and never longer than the usual
-// bound.
+// resolveWithin is resolve with a bound on how long the caller waits for it.
+//
+// The request itself always gets the whole of askResolveTimeout, on a detached
+// context and on a goroutine of its own. What budget bounds is the waiting,
+// not the retiring.
+//
+// Splitting the two is what lets both promises stand at once. The buttons have
+// to go — a question this call owns is one nothing else will ever go back for,
+// so a request abandoned because the timeout ran out would leave them standing
+// for good. And the timeout covers the whole call, so waiting the request out
+// past the deadline is the one promise every tool makes, broken at the last
+// step. Neither is necessary once the request outlives the wait: the caller
+// returns on time and the channel is tidied behind it.
+//
+// It is still waited for when there is time, because that is the ordinary
+// case: Slack answers in well under the budget, and the owner sees the answer
+// on the question rather than a moment after it.
 func (b *Bridge) resolveWithin(api API, channel, ts, text string, budget time.Duration) {
-	if budget < askResolveFloor {
-		// Long enough to be worth trying. Below this the request would be
-		// abandoned before Slack could answer, and the buttons would stay —
-		// on a question this call owns, which means for good.
-		budget = askResolveFloor
+	done := b.retireQuestion(api, channel, ts, text)
+	if budget <= 0 {
+		return
 	}
-	if err := b.tryResolve(api, channel, ts, text, budget); err != nil {
-		log.Printf("could not retire the question in the channel: %s", logSafe(err.Error(), maxLoggedError))
+
+	timeout := time.NewTimer(budget)
+	defer timeout.Stop()
+	select {
+	case <-done:
+	case <-timeout.C:
+		// Still in flight, and it will finish on its own. The caller has what
+		// it was waiting for and a deadline it was given.
+	}
+}
+
+// retireQuestion sends the chat.update that takes a question's buttons away,
+// and reports when it is over.
+//
+// On a goroutine because it deliberately outlives the call: see resolveWithin.
+// Counted so Close can wait for it, and not counted once Close has started
+// waiting — a count added behind the wait is the one way a WaitGroup can be
+// misused, and a retirement started that late is one the process is not going
+// to wait for anyway.
+func (b *Bridge) retireQuestion(api API, channel, ts, text string) <-chan struct{} {
+	done := make(chan struct{})
+
+	b.mu.Lock()
+	counted := !b.retireSealed
+	if counted {
+		b.retiring.Add(1)
+	}
+	b.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		if counted {
+			defer b.retiring.Done()
+		}
+		if err := b.tryResolve(api, channel, ts, text, askResolveTimeout); err != nil {
+			log.Printf("could not retire the question in the channel: %s", logSafe(err.Error(), maxLoggedError))
+		}
+	}()
+	return done
+}
+
+// awaitRetirements waits for the question retirements still in flight, so a
+// process on its way out does not leave live buttons behind for the sake of
+// the moment they had left to run.
+func (b *Bridge) awaitRetirements() {
+	done := make(chan struct{})
+	go func() {
+		b.retiring.Wait()
+		close(done)
+	}()
+
+	timeout := time.NewTimer(shutdownRetireWait)
+	defer timeout.Stop()
+	select {
+	case <-done:
+	case <-timeout.C:
+		log.Printf("gave up waiting for a question's buttons to be taken out of the channel")
 	}
 }
 

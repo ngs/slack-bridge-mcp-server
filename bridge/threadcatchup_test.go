@@ -521,3 +521,58 @@ func TestRecoveredReplyIsNotDuplicatedByTheLiveStream(t *testing.T) {
 		t.Errorf("Wait() messages = %v, want %v exactly once each", got, want)
 	}
 }
+
+// colleagueReply is a reply in a thread from somebody who is not the owner.
+func colleagueReply(ts, threadTS, text string) candidate {
+	return candidate{Channel: testChannel, User: "U_COLLEAGUE", Text: text, TS: ts, ThreadTS: threadTS}
+}
+
+// A thread where only a colleague has spoken since the cursor hands nothing
+// over — the owner filter drops the reply — but it has still been read. Left
+// out of how far the pass got, latest_reply goes on saying "news here" for
+// ever: every catch-up walks that thread again, spends a round trip on it, and
+// learns the same thing.
+//
+// Fail-first: without the thread walk's read feeding the cursor, the second
+// catch-up below reads the same thread a second time.
+func TestAThreadReadAndFoundToBeSomebodyElsesIsNotReadAgain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := threadBridge(ctx, t,
+		[]candidate{
+			threadedParent("100.000050", "here is the plan", "100.000400", 1),
+			ownerMsg("100.000100", "already answered"),
+		},
+		[]candidate{
+			colleagueReply("100.000400", "100.000050", "somebody else, thinking out loud"),
+		},
+	)
+
+	first, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if !first.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout; the only new reply is somebody else's", first)
+	}
+	read := len(api.replyCallsSnapshot())
+	if read == 0 {
+		t.Fatal("the thread was never read, so this test is not exercising what it says it is")
+	}
+
+	// A second pass over the same channel, with nothing new in it.
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+	second, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if !second.TimedOut {
+		t.Errorf("second Wait() = %+v, want a timeout", second)
+	}
+	if got := len(api.replyCallsSnapshot()) - read; got != 0 {
+		t.Errorf("the thread was read %d more times; a conversation the owner is not in costs a round trip on every catch-up, for ever", got)
+	}
+}

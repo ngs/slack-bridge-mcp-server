@@ -279,6 +279,24 @@ type Bridge struct {
 	// is outstanding: a second question while one is pending is refused rather
 	// than queued, so a click is never ambiguous.
 	ask *pendingAsk
+	// askReserved says a call is on its way to asking, which is what refuses a
+	// second question. It is held from the moment the call is accepted, while
+	// ask itself is published only once the question is about to exist.
+	//
+	// The two are separate because they answer different questions. "May I
+	// ask?" is answered for the whole call; "is this click my answer?" must be
+	// no until there are buttons of this question's own to click — otherwise a
+	// click on an older question still standing in the channel is held as an
+	// early click and replayed against the message that replaces it.
+	askReserved bool
+	// retiring counts the chat.update calls taking a question's buttons away
+	// that are still in flight. They outlive the call that asked, so Close
+	// waits for them.
+	retiring sync.WaitGroup
+	// retireSealed stops Close's wait from racing a retirement started behind
+	// it. Set under the mutex, so a retirement that got its count in first is
+	// counted and everything after it is not.
+	retireSealed bool
 	// nameCache holds display names resolved for slack_history. It has its own
 	// lock, so a users.info call never happens under b.mu.
 	nameCache *nameCache
@@ -533,6 +551,18 @@ func (b *Bridge) Status() Status {
 func (b *Bridge) Close() error {
 	b.mu.Lock()
 	b.connected = false
+	// A seed established in memory by a call whose connection was replaced is
+	// paid by whichever call commits next — and a session that ends first has
+	// no next call. Paid here instead, while the writer is still running and
+	// before the terminal flag that would refuse it.
+	//
+	// Unpaid it is messages skipped rather than repeated: the file stays
+	// unseeded, so the next process seeds again at whatever the channel's head
+	// is by then and treats everything sent in between as the channel's past.
+	b.writeSeedDebtLocked(b.cfg.Channel)
+	// No more retirements are tracked from here, so the wait below cannot race
+	// a goroutine being started behind it.
+	b.retireSealed = true
 	// Nothing is listening after this, so nothing should be reading the socket
 	// either — nor holding it open. The generation moves with it, so a call
 	// still in flight commits nothing on the way out: its cursor would be
@@ -575,6 +605,12 @@ func (b *Bridge) Close() error {
 			log.Printf("gave up waiting for the processing indicator to clear itself from the channel")
 		}
 	}
+
+	// A question's buttons are taken away by a request that deliberately
+	// outlives the call that asked it, so one can still be in flight here.
+	// Waited for, bounded, because the process is about to exit and a chat.
+	// update that never went out leaves buttons in the channel for good.
+	b.awaitRetirements()
 
 	if lock == nil {
 		return nil
@@ -1665,7 +1701,11 @@ func (b *Bridge) queuedWithoutReading(generation uint64, takeReactions bool) ([]
 	if b.stale(generation) {
 		return nil, nil
 	}
-	if len(b.pending) == 0 && len(b.pendingThreads) == 0 {
+	// The emoji queues count too, for a caller that takes them. A reaction is
+	// delivered on its own, so a wait that gave up its turn at catch-up and
+	// found only reactions waiting would otherwise sit out its whole timeout
+	// with the answer already in the bridge.
+	if len(b.pending) == 0 && len(b.pendingThreads) == 0 && (!takeReactions || !b.reactionsWaitingLocked()) {
 		return nil, nil
 	}
 	msgs, reactions, _ := b.handOverQueuesLocked(takeReactions)
@@ -1889,9 +1929,17 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) (window
 		}
 	}
 
-	replies, err := catchUpThreads(ctx, api, channel, owner, after)
+	replies, readThreads, err := catchUpThreads(ctx, api, channel, owner, after)
 	if err != nil {
 		return window{}, err
+	}
+	// How far the thread walk read counts towards how far this pass read, the
+	// same way a page of somebody else's channel messages does. A thread whose
+	// only newer reply is a colleague's hands nothing over, and a cursor left
+	// behind that reply says the thread has news every time — so the walk goes
+	// back for it on every catch-up, for ever, and learns the same thing.
+	if tsLess(read, readThreads) {
+		read = readThreads
 	}
 
 	// A cursor left over means the walk stopped at its page bound with more
@@ -1937,17 +1985,21 @@ type window struct {
 // rest, so their replies are not recovered later either. Both are logged, and
 // the threads read are the ones nearest the top of the channel, which is where
 // a conversation the owner is actually having will be.
-func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
+// It reports how far it read as well as what it collected. Every reply it saw
+// counts, not only the owner's: a thread the owner has not spoken in since the
+// cursor is still a thread that has been read, and a cursor left behind its
+// newest reply makes latest_reply say "news here" on every later pass.
+func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, string, error) {
 	if after == "" {
 		// A first run seeds the cursor from the newest message instead of
 		// replaying, and reading every thread in the channel would be exactly
 		// the replay that avoids.
-		return nil, nil
+		return nil, "", nil
 	}
 
 	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if page.HasMore {
 		// The channel is busier than the scan window. Threads older than these
@@ -1973,6 +2025,7 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 
 	var (
 		messages []Message
+		read     string
 		walked   int
 		skipped  int
 	)
@@ -1991,7 +2044,7 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 				// whole catch-up is what keeps it retryable: the cursor stays
 				// where it is, and the next attempt asks for the same window
 				// again instead of stepping over replies it never read.
-				return nil, err
+				return nil, "", err
 			}
 			// A thread that no longer exists will not exist next time either,
 			// and failing forever on it would wedge every later message
@@ -2000,6 +2053,9 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 			continue
 		}
 		messages = append(messages, replies...)
+		if tsLess(read, got.read) {
+			read = got.read
+		}
 	}
 
 	if skipped > 0 {
@@ -2008,7 +2064,7 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 		log.Printf("catch-up read %d threads and skipped %d with newer replies; replies in the skipped threads will not be delivered",
 			walked, skipped)
 	}
-	return messages, nil
+	return messages, read, nil
 }
 
 // readThread collects the owner's replies in one thread, newer than after,

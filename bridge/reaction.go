@@ -213,12 +213,23 @@ func (b *Bridge) drainReactions(generation uint64) []Reaction {
 	return kept
 }
 
+// reactionsWaitingLocked reports whether either emoji queue holds anything a
+// hand-over could take. The caller must hold b.mu.
+//
+// Held reactions count. One may turn out to be waiting for a conversation this
+// session is not in, and be held again rather than delivered — but it is still
+// something to look at, and a caller that skipped the look would leave the
+// ones that are ready sitting there.
+func (b *Bridge) reactionsWaitingLocked() bool {
+	return len(b.pendingReactions) > 0 || len(b.heldReactions) > 0
+}
+
 // drainReactionsLocked is drainReactions for a caller that already holds b.mu
 // and has checked its generation — which is how a batch of messages and the
 // reactions that arrived with them leave the queues as one step.
 func (b *Bridge) drainReactionsLocked() []Reaction {
 
-	if len(b.pendingReactions) == 0 && len(b.heldReactions) == 0 {
+	if !b.reactionsWaitingLocked() {
 		return nil
 	}
 	queued := b.pendingReactions

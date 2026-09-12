@@ -110,6 +110,15 @@ scanned window, replies included: the last thing anyone said is often a reply
 in an older thread, and a cursor set to the newest surface message would leave
 those replies looking new to the thread pass below.
 
+The seed is established in memory and written by whichever call commits, which
+leaves one case where nobody does: a call whose connection is replaced
+underneath it may not write, so it records a debt instead, and a session that
+ends before another call commits would take the debt with it. `Close` pays it.
+Left unpaid it is messages skipped rather than repeated — the state file stays
+unseeded, so the next process seeds again at whatever the channel's head is by
+then and treats everything sent in between as the channel's past, which is the
+one loss the seed exists to prevent.
+
 #### Thread replies need a second pass
 
 `conversations.history` returns the channel surface and nothing else: a reply
@@ -480,7 +489,10 @@ Two invariants hold across all of it, whatever is arriving:
 - **Every cursor follows what was read, not only what was handed over.** A page
   of somebody else's conversation has been read, in the home channel and in a
   thread alike, and a cursor left behind it is the same messages fetched again
-  on every catch-up.
+  on every catch-up. The home channel's thread walk counts the same way: a
+  thread whose only newer reply is a colleague's hands nothing over, and left
+  out of how far the pass got, `latest_reply` goes on saying "news here" and
+  every later catch-up spends a round trip learning it again.
 - **The home cursor follows what a pass read, and stops at what it did not hand
   over.** Every message in every page counts towards how far a read got, so a
   page of somebody else's conversation moves the cursor past itself; a message
@@ -587,10 +599,37 @@ history call that hangs would otherwise outlast it; nothing is committed until
 the messages are in hand, so a collection cut short costs a round trip and no
 messages. The whole call is inside that promise: the clock starts before the
 question is posted, because posting is a Slack request like any other, and
-retiring the buttons on the way out is given what is left of it rather than a
-bound of its own. A budget already spent buys nothing — the quarter of a second
+retiring the buttons on the way out is waited for only as long as is left of it.
+What is left is measured again at each step rather than once and reused: a
+settled question retires its buttons and then collects the backlog, and a
+remainder taken before the first would let the second start after the deadline
+had already passed. A budget already spent buys nothing — the quarter of a second
 a timed-out question gets for one last look belongs to the call that has run out
 of time and has nothing else to return.
+
+### Retiring a question outlives the call, so the timeout can be kept
+
+Taking the buttons away is a request of its own, and for a while it was the one
+place a call could outrun its own timeout: the request was made inline and given
+a floor of a second and a half, whatever the caller had left, because a
+chat.update abandoned before Slack answered would leave the buttons standing in
+the channel for good. A question the call owns is one nothing else will ever go
+back for.
+
+The two are not actually in tension once the request stops being the thing that
+is waited for. It is sent on a goroutine of its own, on a detached context, with
+the full bound it needs; the caller waits for it only as long as its own timeout
+allows and returns either way. The buttons go, the deadline holds, and the
+ordinary case is unchanged — Slack answers in well under the budget, so the
+owner still sees the answer written onto the question rather than a moment after
+it. `Close` waits for whatever is still in flight, bounded, so a process on its
+way out does not leave live buttons behind for the sake of the moment they had
+left to run.
+
+That is also what lets the interrupted path keep the promise. It used to retire
+the question on the same detached five seconds, so a slow chat.update held the
+owner's own message back by an order of magnitude more than the timeout they
+had asked for.
 
 A post given up on can still land: the request was abandoned, not cancelled at
 Slack, and what is lost with it is the timestamp that could take the buttons
@@ -630,9 +669,24 @@ One thing it can get wrong, harmlessly: if the post never landed but an earlier
 question of the bridge's is still live inside the window — one whose own
 retirement failed — the search finds that one and expires it. It was a question
 nothing was going to answer either, so what it costs is a message saying it
-expired a little before it would have. That is what makes this different from retiring a question the call owns,
-where nothing else will ever go back for it and the request gets a floor of a
-second and a half.
+expired a little before it would have. That is what makes this different from
+retiring a question the call owns: this one is waited for inside the budget and
+put back on the shelf if it does not fit, because there is a next call to try
+again, and that one is sent whether or not there is time to watch it, because
+there is not.
+
+The search is also the one stretch of a call where the bridge has no question of
+its own. The pending question is published when its buttons are about to exist,
+not when the call is accepted — refusing a second `slack_ask` is a separate
+thing, held for the whole call, and does not have to be the same flag. The
+reason is the search itself: what it is looking for is a question of the
+bridge's own still standing in the channel, with the same block id, in the same
+channel, posted for the same owner. A tap on those buttons while the next
+question is being looked up is not the next question's answer, and the buffer
+that holds clicks through the posting window is small on purpose — stale taps
+filling it cost the owner the click they actually meant. With nothing published,
+those taps are dropped where they arrive. A caller that gives up during the
+search is answered there too, before a question goes up for nobody.
 
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again
@@ -657,6 +711,15 @@ back has been handed over already. That is what the record of delivered
 messages is for, and why the cursor is taken from what a pass *read* rather than
 from what it handed on: a pass that reads only messages it has already
 delivered still moves the cursor past them.
+
+The same hand-over answers a call that could not get its turn at catch-up at
+all. Another call's request is still out, and this one has its own deadline to
+keep; what is already in the queues came off this connection's socket and has
+nothing to do with that request, so it goes out and no cursor moves. The emoji
+queues count towards "already in the queues" as much as the message ones do. A
+reaction is delivered on its own — nobody has to have said anything for an
+emoji to be news — so a hand-over that looked only at the messages would leave
+a call sitting out its whole timeout with the answer already in the bridge.
 
 The conversations outside the home channel keep one more rule of their own. A
 conversation this pass could not reach — the walk ran out of budget before it —

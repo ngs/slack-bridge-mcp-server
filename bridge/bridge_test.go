@@ -29,6 +29,11 @@ type fakeAPI struct {
 	// historyGate, when set, holds every History call open until the test
 	// closes it.
 	historyGate chan struct{}
+	// beforeHistoryReturns runs inside History, once the request has been
+	// recorded and before the page goes back. It is how a test makes something
+	// happen while one particular read is in flight — the search for an
+	// abandoned question, say, which its bounded window identifies.
+	beforeHistoryReturns func(HistoryRequest)
 	// channelHistoryErr fails History for one channel only, which is how a
 	// scope the app has in its home channel and nowhere else behaves.
 	channelHistoryErr map[string]error
@@ -153,7 +158,11 @@ func (f *fakeAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage,
 	// has started.
 	f.historyCalls = append(f.historyCalls, req)
 	gate := f.historyGate
+	hook := f.beforeHistoryReturns
 	f.mu.Unlock()
+	if hook != nil {
+		hook(req)
+	}
 	if gate != nil {
 		// Held open so a test can make something happen while catch-up is in
 		// flight, which is otherwise a window too small to aim at. The context

@@ -1640,6 +1640,52 @@ func TestASeedFromAReplacedCallStillReachesTheStateFile(t *testing.T) {
 	})
 }
 
+// The debt above is paid by whichever call commits next, and a session can end
+// before there is one: the question that replaced the connection is answered,
+// the agent stops, and nothing ever drains again.
+//
+// Left unpaid it is messages skipped rather than repeated. The file stays
+// unseeded, so the next process seeds again at whatever the channel's head is
+// by then and treats everything sent in between as the channel's past — the
+// one loss the seed exists to prevent.
+//
+// Fail-first: without the payment in Close, the state file below has no cursor
+// at all and the assertion fails.
+func TestASeedFromAReplacedCallIsPaidWhenTheSessionEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	api := &fakeAPI{botUserID: testBotUser}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on an empty channel", result)
+	}
+
+	b.mu.Lock()
+	b.cursorSeeded = true
+	b.lastTS = "100.000900"
+	b.seedUnwritten = true
+	b.mu.Unlock()
+
+	// No call comes after it. The session simply ends.
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	stored, err := NewStore(cfg.StateDir).LastTS(testChannel)
+	if err != nil {
+		t.Fatalf("reading the state file: %v", err)
+	}
+	if stored != "100.000900" {
+		t.Errorf("stored cursor = %q, want the seed this session established; without it the next process seeds at the channel's head and skips everything sent in between", stored)
+	}
+}
+
 // The stream's lost-reaction marker clears when it is read. A connection
 // replaced between the question and the answer would otherwise take the answer
 // with it, and a reaction lost on a connection that has died is still one the

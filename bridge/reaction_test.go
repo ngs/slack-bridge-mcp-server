@@ -787,3 +787,44 @@ func TestAReactionOnlyDeliveryStillCarriesAnEmptyMessageArray(t *testing.T) {
 		t.Error("messages is null on a reaction-only delivery, want the empty array every other result carries")
 	}
 }
+
+// A call that gives up its turn at catch-up still hands over what the socket
+// already delivered, and a reaction is delivered on its own: nobody has to
+// have said anything for an emoji to be news. A hand-over that only looked at
+// the message queues would leave it there, and the call that was told "nothing
+// yet" was holding the answer all along.
+//
+// Fail-first: with the early return looking only at the two message queues,
+// the drain below comes back empty.
+func TestAHandOverWithoutReadingStillTakesTheReactions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+	eventually(t, "the reaction to reach the queue", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.reactionsWaitingLocked()
+	})
+
+	// Somebody else's request is out and this call cannot wait for it. The
+	// message queues are empty; the emoji queue is not.
+	b.catchUpSlot <- struct{}{}
+	defer func() { <-b.catchUpSlot }()
+
+	msgs, reactions, err := b.drainCatchUp(ctx, b.currentGeneration(), true, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("messages = %+v, want none; nothing was said", msgs)
+	}
+	if len(reactions) != 1 {
+		t.Fatalf("reactions = %+v, want the one the socket delivered; a wait that gave up its turn sits out its whole timeout with the answer already in the bridge", reactions)
+	}
+}
