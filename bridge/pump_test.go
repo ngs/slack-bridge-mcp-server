@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -389,9 +390,12 @@ func TestACatchUpRequestedMidFlightIsNotSwallowed(t *testing.T) {
 		}
 	}()
 
-	// The reconnect lands while the first catch-up is still fetching history.
+	// A hole lands while the first catch-up is still fetching history. The
+	// socket refusing a message rather than a reconnect, because a
+	// connection's own first hello is the catch-up it already asked for
+	// arriving, not a hole on top of it.
 	eventually(t, "catch-up to reach Slack", func() bool { return len(api.calls()) > 0 })
-	b.absorb(StreamEvent{Kind: StreamConnected})
+	b.absorb(StreamEvent{Kind: StreamDropped})
 	close(gate)
 	<-done
 
@@ -1907,5 +1911,324 @@ func TestAStreamIsNeverAskedAnythingUnderTheLock(t *testing.T) {
 	}
 	if stream.askedLocked.Load() {
 		t.Error("the stream was asked with b.mu held; an implementation that blocks there takes the pump and every tool call with it")
+	}
+}
+
+// The probes from the local review, kept as tests. Each was written against
+// the behaviour before this round and failed on it.
+// one overflow produces two holes (poll + the StreamDropped announcement).
+func TestOneOverflowRaisesOneHole(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout", result)
+	}
+
+	b.mu.Lock()
+	before := b.holeEpoch
+	b.mu.Unlock()
+
+	stream.pendingOverflow.Store(true)
+	eventually(t, "the overflow to be noticed by the poll", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.holeEpoch != before
+	})
+	b.mu.Lock()
+	afterPoll := b.holeEpoch
+	b.mu.Unlock()
+
+	// The stream now announces the same overflow, the way flushDropped does:
+	// event first, flag cleared after.
+	stream.events <- StreamEvent{Kind: StreamDropped}
+	stream.pendingOverflow.Store(false)
+
+	time.Sleep(3 * overflowPollWait)
+	b.mu.Lock()
+	afterAnnounce := b.holeEpoch
+	b.mu.Unlock()
+	if afterAnnounce != afterPoll {
+		t.Errorf("holeEpoch %d -> %d for a single overflow: the poll and the announcement each raised one", afterPoll, afterAnnounce)
+	}
+}
+
+// slowAPI makes every history call take a while, so a hole can land while one
+// is in flight.
+type slowAPI struct {
+	*fakeAPI
+	delay time.Duration
+}
+
+func (s *slowAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, error) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return HistoryPage{}, ctx.Err()
+	}
+	return s.fakeAPI.History(ctx, req)
+}
+
+// a stream that keeps reporting holes (reconnect storm) starves the
+// wait: the queued live message is never handed over while holes keep coming.
+func TestAHoleStormStillHandsOverTheQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	inner := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	api := &slowAPI{fakeAPI: inner, delay: 60 * time.Millisecond}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: inner, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout", result)
+	}
+	// Swap the API for the slow one under the lock.
+	b.mu.Lock()
+	b.api = api
+	b.mu.Unlock()
+
+	// A message the owner sent, sitting in the queue.
+	stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.000200", Channel: testChannel, User: testOwner, Text: "hello?",
+	}}
+	eventually(t, "the message to be queued", func() bool { return b.pendingHomeCount() == 1 })
+
+	// The socket flaps: a reconnect every 30ms for 1.5s. Each is a hole.
+	stormDone := make(chan struct{})
+	go func() {
+		defer close(stormDone)
+		end := time.Now().Add(1500 * time.Millisecond)
+		for time.Now().Before(end) {
+			select {
+			case stream.events <- StreamEvent{Kind: StreamConnected}:
+			case <-ctx.Done():
+				return
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+
+	start := time.Now()
+	result, err := b.Wait(ctx, 5*time.Second)
+	took := time.Since(start)
+	<-stormDone
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Wait returned after %v: %+v; history calls=%d", took, texts(result.Messages), len(inner.calls()))
+	if took > time.Second {
+		t.Errorf("a message already in the queue was held for %v while the socket flapped; nothing bounds the discard-and-retry", took)
+	}
+}
+
+// out-of-scope reactions held while a catch-up is due accumulate to
+// the cap and then poison the loss marker.
+func TestAHeldReactionNeverReportsALossOfItsOwn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout", result)
+	}
+
+	b.mu.Lock()
+	b.needCatchUp = true // e.g. scan.skipped with more than 20 open threads
+	for i := 0; i < maxPendingReactions; i++ {
+		b.absorbReactionLocked(Reaction{TS: "1.0", Channel: "CELSEWHERE", User: "UOTHER", Reaction: "eyes", Added: true, EventTS: strconv.Itoa(i)})
+	}
+	got := b.drainReactionsLocked()
+	held := len(b.pendingReactions)
+	// One more out-of-scope reaction, in a channel the session is not in.
+	b.absorbReactionLocked(Reaction{TS: "1.0", Channel: "CELSEWHERE", User: "UOTHER", Reaction: "eyes", Added: true, EventTS: "final"})
+	dropped := b.reactionsDropped
+	b.mu.Unlock()
+
+	if len(got) != 0 {
+		t.Fatalf("out-of-scope reactions were delivered: %d", len(got))
+	}
+	t.Logf("held=%d dropped=%v", held, dropped)
+	if dropped {
+		t.Errorf("a reaction in a channel the session is not in set reactions_dropped; the agent is told to re-read tallies for nothing")
+	}
+}
+
+// with more than maxThreadsPerCatchUp conversations open, needCatchUp
+// never clears, and every wakeup re-runs the whole scan.
+func TestMoreOpenThreadsThanOnePassReadsStillSettles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxThreadsPerCatchUp+1; i++ {
+		if err := store.SetThread("CPROJ", "50.00000"+strconv.Itoa(i), "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout", result)
+	}
+	if !b.catchUpDue() {
+		t.Skip("catch-up cleared; the skipped rule did not fire")
+	}
+	api.mu.Lock()
+	replies0 := len(api.replyCalls)
+	api.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: "100.00030" + strconv.Itoa(i), Channel: testChannel, User: testOwner, Text: "hi",
+		}}
+		if got := waitOnce(ctx, t, b); len(got.Messages) != 1 {
+			t.Fatalf("Wait() = %+v", got)
+		}
+	}
+	api.mu.Lock()
+	replies := len(api.replyCalls) - replies0
+	api.mu.Unlock()
+	t.Logf("three live messages cost %d conversations.replies calls (catch-up still due: %v)", replies, b.catchUpDue())
+	if replies >= 3*maxThreadsPerCatchUp {
+		t.Errorf("every delivery re-walks %d threads because needCatchUp never clears", maxThreadsPerCatchUp)
+	}
+}
+
+// the socket's own Connected event on first connect discards the
+// initial seed pass.
+func TestAConnectionsOwnHelloDoesNotDiscardItsFirstCatchUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+		historyGate:    make(chan struct{}),
+	}
+	stream := newFakeStream()
+	// The real socket emits Connected as soon as the WebSocket is up, which is
+	// after Connect returned and while the first catch-up is in flight.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	done := make(chan WaitResult, 1)
+	go func() {
+		r, _ := b.Wait(ctx, 2*time.Second)
+		done <- r
+	}()
+	eventually(t, "seed to reach Slack", func() bool { return len(api.calls()) >= 1 })
+	stream.events <- StreamEvent{Kind: StreamConnected}
+	time.Sleep(50 * time.Millisecond) // let the pump absorb Connected
+	close(api.historyGate)
+	<-done
+	t.Logf("history calls on first connect: %d", len(api.calls()))
+	if n := len(api.calls()); n > 1 {
+		t.Errorf("the seed was read %d times; the Connected event that follows every connect threw the first away", n)
+	}
+}
+
+// A conversation the budget could not reach is read first next time. The walk
+// used to take whatever the map yielded, so a busy conversation could be passed
+// over on every pass while the budget went to quiet ones.
+func TestASkippedConversationIsReadFirstNextTime(t *testing.T) {
+	cursors := map[threadKey]string{
+		{channel: "C1", threadTS: "1.000000"}: "",
+		{channel: "C1", threadTS: "2.000000"}: "",
+		{channel: "C2", threadTS: "3.000000"}: "",
+	}
+	waiting := map[threadKey]struct{}{
+		{channel: "C2", threadTS: "3.000000"}: {},
+	}
+
+	order := threadWalkOrder(cursors, waiting)
+	if len(order) != 3 {
+		t.Fatalf("threadWalkOrder() = %+v, want every conversation", order)
+	}
+	if order[0].channel != "C2" {
+		t.Errorf("threadWalkOrder() = %+v, want the one that waited last time first", order)
+	}
+	// And stable for the rest, so two passes with nothing waiting agree.
+	if order[1].threadTS != "1.000000" || order[2].threadTS != "2.000000" {
+		t.Errorf("threadWalkOrder() = %+v, want the rest in a settled order", order)
+	}
+}
+
+// A reaction held for a catch-up is judged once more when that catch-up has
+// run, and dropped quietly if it still belongs to no conversation of ours.
+// Held for ever, these fill the queue that reports real losses.
+func TestAHeldReactionIsJudgedOnceMoreAndThenDropped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.absorbReactionLocked(Reaction{
+		TS: "200.000100", Channel: otherChannel, User: colleague, Reaction: "eyes", Added: true,
+	})
+	b.mu.Unlock()
+
+	if kept := b.drainReactions(generation); len(kept) != 0 {
+		t.Fatalf("drainReactions() = %+v, want it held for the catch-up", kept)
+	}
+	b.mu.Lock()
+	held := len(b.heldReactions)
+	b.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("held reactions = %d, want the one that matched nothing", held)
+	}
+
+	// The catch-up runs and explains nothing.
+	b.mu.Lock()
+	b.catchUpRuns++
+	b.needCatchUp = false
+	b.mu.Unlock()
+
+	if kept := b.drainReactions(generation); len(kept) != 0 {
+		t.Errorf("drainReactions() = %+v, want nothing: it belongs to no conversation of ours", kept)
+	}
+	b.mu.Lock()
+	held = len(b.heldReactions)
+	dropped := b.reactionsDropped
+	b.mu.Unlock()
+	if held != 0 {
+		t.Errorf("held reactions = %d, want the wait to have ended", held)
+	}
+	if dropped {
+		t.Error("dropping somebody else's emoji in somebody else's channel told the agent its count was wrong")
 	}
 }

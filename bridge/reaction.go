@@ -123,6 +123,21 @@ func (b *Bridge) absorbReactionLocked(r Reaction) {
 	b.notifyPendingLocked()
 }
 
+// heldReaction is a reaction that belongs to no conversation the session is in,
+// kept back while a catch-up that may explain it is outstanding.
+type heldReaction struct {
+	r Reaction
+	// at is the number of catch-ups that had completed when this was held. One
+	// more than that is where its wait ends.
+	at uint64
+}
+
+// maxHeldReactions bounds the reactions kept back for a catch-up. They are a
+// queue of their own so that somebody else's emoji in a channel the session is
+// only sitting in cannot crowd out the ones waiting to be delivered, or set the
+// marker that tells the agent its count is wrong.
+const maxHeldReactions = 128
+
 // maxPendingReactions bounds the queue of emoji waiting to be handed over. It
 // is generous — a decision post collects a burst, not a stream — and exists so
 // that a busy workspace cannot grow the queue without limit while nothing is
@@ -199,7 +214,7 @@ func (b *Bridge) drainReactions(generation uint64) []Reaction {
 // reactions that arrived with them leave the queues as one step.
 func (b *Bridge) drainReactionsLocked() []Reaction {
 
-	if len(b.pendingReactions) == 0 {
+	if len(b.pendingReactions) == 0 && len(b.heldReactions) == 0 {
 		return nil
 	}
 	queued := b.pendingReactions
@@ -223,18 +238,41 @@ func (b *Bridge) drainReactionsLocked() []Reaction {
 	// catch-up recovers messages and nothing recovers reactions, so a reaction
 	// that matches nothing waits for it rather than being judged against a
 	// conversation the session has not read its way into yet.
-	kept := make([]Reaction, 0, len(queued))
-	var held []Reaction
+	//
+	// For one catch-up, though, and no longer. A reaction still matching
+	// nothing after the window has been read is one Slack genuinely sent
+	// before the agent was part of the conversation: it is a tally rather than
+	// an event, and slack_reactions reads tallies. Held for ever it would fill
+	// the queue that reports real losses, and the agent would be told to
+	// re-read its count for somebody else's emoji in somebody else's channel.
+	kept := make([]Reaction, 0, len(queued)+len(b.heldReactions))
+	var held []heldReaction
+
+	// The ones already waiting come first: they arrived first.
+	for _, h := range b.heldReactions {
+		if reaction, ok := b.classifyReactionLocked(h.r); ok {
+			kept = append(kept, reaction)
+			continue
+		}
+		if b.catchUpRuns > h.at {
+			// A catch-up has run since this was held, and it still belongs to
+			// no conversation of ours. Dropped quietly: nothing was lost that
+			// the agent has any use for.
+			continue
+		}
+		held = append(held, h)
+	}
+
 	for _, r := range queued {
 		if reaction, ok := b.classifyReactionLocked(r); ok {
 			kept = append(kept, reaction)
 			continue
 		}
-		if b.needCatchUp && len(held) < maxPendingReactions {
-			held = append(held, r)
+		if b.needCatchUp && len(held) < maxHeldReactions {
+			held = append(held, heldReaction{r: r, at: b.catchUpRuns})
 		}
 	}
-	b.pendingReactions = held
+	b.heldReactions = held
 	if len(kept) == 0 {
 		return nil
 	}

@@ -102,6 +102,12 @@ type Bridge struct {
 	// messages: no cursor applies to them, they are never merged with history,
 	// and a reaction older than the home cursor is still news.
 	pendingReactions []Reaction
+	// heldReactions are the ones that matched no conversation while a catch-up
+	// was outstanding, waiting for the window that may explain them.
+	heldReactions []heldReaction
+	// catchUpRuns counts the catch-ups that have finished. It is how a held
+	// reaction knows its wait is over.
+	catchUpRuns uint64
 	// seenReactions and seenReactionOrder are the window of reactions already
 	// queued, against Slack redelivering an envelope it was not acknowledged
 	// for. They live here rather than on the stream because a reconnect
@@ -148,6 +154,27 @@ type Bridge struct {
 	// actually been delivered is remembered instead.
 	deliveredMessages map[string]struct{}
 	deliveredOrder    []string
+	// holeDiscards counts the catch-ups thrown away in a row because a hole
+	// opened while they were reading. One is ordinary; a run of them is a
+	// socket flapping, and what it costs is the messages already queued.
+	holeDiscards int
+	// threadsSkipped marks conversations left unread for want of budget. It is
+	// its own flag rather than another meaning for needCatchUp: what it asks
+	// for is one more walk through the threads, not a re-read of the home
+	// channel and another scan for mentions — and left on needCatchUp it never
+	// cleared, so a session with more open conversations than one pass can read
+	// ran a full catch-up on every wake and held every out-of-scope reaction
+	// for ever.
+	threadsSkipped bool
+	// skippedThreads are the conversations the last walk could not reach, so
+	// the next one starts with them rather than with whatever the map yields
+	// first.
+	skippedThreads map[threadKey]struct{}
+	// connectAnnounced marks this connection's own hello as seen. The socket
+	// announces itself once per connection, after Connect has returned, and
+	// the catch-up that covers what was missed while the session was down is
+	// asked for when the connection is opened rather than when it says hello.
+	connectAnnounced bool
 	// overflowNoted marks an overflow the stream is holding that has already
 	// been answered with a request to read the window again. The stream keeps
 	// reporting it until it has room to announce it, and this is what keeps
@@ -350,6 +377,22 @@ func (b *Bridge) noteDeliveredLocked(batches ...[]Message) {
 			}
 		}
 	}
+}
+
+// undeliveredLocked drops the messages that have been handed over already. The
+// caller must hold b.mu.
+func (b *Bridge) undeliveredLocked(msgs []Message) []Message {
+	if len(b.deliveredMessages) == 0 || len(msgs) == 0 {
+		return msgs
+	}
+	kept := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if b.alreadyDeliveredLocked(m) {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return kept
 }
 
 // alreadyDeliveredLocked reports whether this message has been handed over
@@ -644,6 +687,8 @@ func (b *Bridge) ensure() error {
 	}
 	b.stopConnection = stopConnection
 	b.connCtx = connCtx
+	// This connection has not said hello yet.
+	b.connectAnnounced = false
 
 	b.api = api
 	// Its own user ID is how the bridge recognises a mention. Without it the
@@ -997,11 +1042,35 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		*full = false
 		*queue = append(*queue, msg)
 		b.notifyPendingLocked()
-	case StreamConnected, StreamDropped:
-		// Both mean the live stream may have a hole in it. History is the
-		// authority, so go re-read the window after the cursor. A hole is a
-		// reason to go and look as much as a message is: what history has to
-		// offer is exactly what a blocked call is waiting for.
+	case StreamDropped:
+		// The stream announcing a message it refused. If the pump already saw
+		// that refusal by asking — it polls, because the announcement needs
+		// room on the very channel that had none — this is the same hole
+		// arriving a second time, and raising another would throw away a
+		// second catch-up for one lost message.
+		if b.overflowNoted.Swap(false) {
+			return
+		}
+		b.requestCatchUpForHoleLocked()
+
+	case StreamConnected:
+		// Every connection announces itself once, and the catch-up for that is
+		// asked for where the connection is opened — so this first hello is
+		// that request arriving, not a reconnect on top of it. Raising a hole
+		// here would discard the first catch-up of every session, every time.
+		//
+		// Only while that catch-up is still outstanding. A hello that arrives
+		// after it has run is not the one it was asked for, and the safe
+		// reading of a connection announcing itself is that something was
+		// missed.
+		firstHello := !b.connectAnnounced
+		b.connectAnnounced = true
+		if firstHello && b.needCatchUp {
+			return
+		}
+		// A reconnect underneath a connection that was never replaced — the
+		// socket library's own — means the live stream may have a hole in it.
+		// History is the authority, so go re-read the window after the cursor.
 		b.requestCatchUpForHoleLocked()
 	}
 }
@@ -1047,6 +1116,10 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		return nil, nil, nil
 	}
 	needCatchUp := b.needCatchUp
+	// Threads left unread ask for a walk of their own. It is a smaller errand
+	// than a catch-up: no window, no scan, only the conversations that were
+	// skipped.
+	threadsOnly := !needCatchUp && b.threadsSkipped
 	epoch := b.catchUpEpoch
 	holes := b.holeEpoch
 	seeded := b.cursorSeeded
@@ -1091,6 +1164,17 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// being established rather than read from.
 		seeding bool
 	)
+	if threadsOnly {
+		var err error
+		conversations, err = b.catchUpSkippedThreads(ctx, api, owner, generation, scan)
+		if err != nil {
+			if abandoned(err) {
+				return nil, nil, nil
+			}
+			return nil, nil, err
+		}
+	}
+
 	if needCatchUp {
 		if !seeded {
 			// First run against this channel: seeding from the newest
@@ -1185,6 +1269,23 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// that was kept — handed the same messages over again on every pass, and
 	// under a queue that stayed full it never stopped.
 	if holes != b.holeEpoch {
+		// Twice over is a storm, not an accident. A socket that flaps faster
+		// than a catch-up takes would otherwise keep throwing every pass away,
+		// and a message the owner sent — sitting in the queue, already
+		// received — would wait for the flapping to stop.
+		//
+		// So the second discard in a row hands over the queue and nothing
+		// else. Those messages came off the socket, which is what makes them
+		// safe: whatever the hole swallowed, it did not swallow these. What
+		// was fetched is still dropped, and the cursor still does not move, so
+		// nothing steps over the hole — the next pass reads that window again
+		// and the delivered window keeps it from arriving twice.
+		if b.holeDiscards > 0 && len(b.pending)+len(b.pendingThreads) > 0 {
+			b.holeDiscards = 0
+			return b.handOverQueuesLocked(takeReactions)
+		}
+		b.holeDiscards++
+
 		if seeding && !b.cursorSeeded && !b.closed {
 			// The seed is not part of what was read; it is where the channel
 			// was when this session found it, which no hole changes. Kept, so
@@ -1196,7 +1297,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		return nil, nil, nil
 	}
 
-	if needCatchUp {
+	if needCatchUp || threadsOnly {
 		// What the scan found, under this check like everything else: a
 		// conversation it opened, one it gave up on, and how far it looked are
 		// all true of the installation it ran with.
@@ -1221,10 +1322,29 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// The epoch is compared again here, not just at the top: establishing a
 		// seed over a refusal asks for another pass of its own, and clearing
 		// the flag on the way past would answer that request with this window.
-		if !scan.skipped && epoch == b.catchUpEpoch {
+		if epoch == b.catchUpEpoch {
 			b.needCatchUp = false
 		}
+		// Finished, whether or not it cleared the flag: the window was read,
+		// which is what a reaction waiting for an explanation was waiting for.
+		b.catchUpRuns++
 	}
+
+	// Threads the walk could not reach. Recorded on their own flag, which asks
+	// for another walk and nothing else.
+	if needCatchUp || threadsOnly {
+		b.threadsSkipped = scan.skipped
+		b.skippedThreads = nil
+		if len(scan.skippedKeys) > 0 {
+			b.skippedThreads = make(map[threadKey]struct{}, len(scan.skippedKeys))
+			for _, key := range scan.skippedKeys {
+				b.skippedThreads[key] = struct{}{}
+			}
+		}
+	}
+
+	// A pass that reached here is a pass that was not thrown away.
+	b.holeDiscards = 0
 
 	// The seed another call established in memory and could not write. Paid
 	// here, where the connection is the live one and the lock is held, and
@@ -1237,6 +1357,13 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// timestamp says, and on the run that seeds the cursor it can be older
 	// than the seed and still be the message this session was started for.
 	live, liveThreads := b.pending, b.pendingThreads
+
+	// What has already been handed over is not fetched again. The cursor
+	// catches most of it, but a storm hands the queue over without moving one
+	// — so history returns those messages on the next pass, and this is what
+	// stops them arriving a second time.
+	fetched = b.undeliveredLocked(fetched)
+	conversations = b.undeliveredLocked(conversations)
 
 	home := mergeLive(b.lastTS, fetched, live)
 	threads := b.mergeThreadMessagesLocked(conversations, liveThreads)
@@ -1361,6 +1488,38 @@ func (b *Bridge) oldestPendingLocked() string {
 		}
 	}
 	return oldest
+}
+
+// handOverQueuesLocked hands over what the socket has already delivered,
+// without moving any cursor. The caller must hold b.mu.
+//
+// It is the way out of a storm. Nothing here was fetched, so nothing here can
+// be on the far side of the hole that keeps interrupting: these messages came
+// off this connection, into these queues, before the pass that is giving up
+// looked at them. The cursors stay where they are, which means the window will
+// be read again — and what it returns will have been handed over already, which
+// is what the delivered window is for.
+func (b *Bridge) handOverQueuesLocked(takeReactions bool) ([]Message, []Reaction, error) {
+	home := mergeMessages("", b.pending)
+	threads := b.mergeThreadMessagesLocked(b.pendingThreads)
+	b.pending = nil
+	b.pendingThreads = nil
+
+	var reactions []Reaction
+	if takeReactions {
+		reactions = b.drainReactionsLocked()
+	}
+
+	// No cursor moves here, the thread ones included: a hole of unknown
+	// position may sit behind a reply older than the newest of these, and a
+	// cursor stepped over it is a reply nobody ever receives. The window comes
+	// round again, and the delivered window is what keeps it from arriving
+	// twice.
+	b.noteDeliveredLocked(home, threads)
+	if len(home) == 0 && len(threads) == 0 {
+		return nil, reactions, nil
+	}
+	return mergeConversations(home, threads), reactions, nil
 }
 
 // writeSeedDebtLocked records a seed that was established in memory by a call

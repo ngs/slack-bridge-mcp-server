@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -151,6 +152,45 @@ func (b *Bridge) openThreads() map[threadKey]string {
 	return cursors
 }
 
+// skippedThreadKeys reports the conversations the last walk ran out of budget
+// for, so the next one starts with them.
+func (b *Bridge) skippedThreadKeys() map[threadKey]struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.skippedThreads) == 0 {
+		return nil
+	}
+	waiting := make(map[threadKey]struct{}, len(b.skippedThreads))
+	for key := range b.skippedThreads {
+		waiting[key] = struct{}{}
+	}
+	return waiting
+}
+
+// catchUpSkippedThreads walks the open conversations and nothing else. It is
+// what a walk that ran out of budget asks for: the home channel's window and
+// the search for mentions were read by the catch-up that skipped them, and
+// reading either again would spend two API calls a wake to learn nothing.
+func (b *Bridge) catchUpSkippedThreads(ctx context.Context, api API, owner string, generation uint64, scan *scanChanges) ([]Message, error) {
+	if api == nil {
+		return nil, nil
+	}
+	if b.conversationsAreDegraded(generation) {
+		return nil, nil
+	}
+
+	replies, err := b.catchUpThreadConversations(ctx, api, owner, b.openThreads(), b.skippedThreadKeys(), scan)
+	if err != nil {
+		if !errors.Is(err, ErrMissingScope) {
+			return nil, err
+		}
+		b.degradeConversations(generation, err)
+		return nil, nil
+	}
+	return replies, nil
+}
+
 // catchUpConversations recovers what was said outside the home channel while
 // the bridge was not listening: new mentions first, then the replies in every
 // thread that is open once those are counted.
@@ -196,7 +236,7 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 		starts[threadKey{m.Channel, m.ThreadTS}] = m.TS
 	}
 
-	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts, scan)
+	replies, err := b.catchUpThreadConversations(ctx, api, owner, starts, b.skippedThreadKeys(), scan)
 	if err != nil {
 		if !errors.Is(err, ErrMissingScope) {
 			return nil, err
@@ -226,6 +266,9 @@ type scanChanges struct {
 	opened        []threadKey
 	closed        []threadKey
 	mentionCursor string
+	// skippedKeys are the conversations this walk ran out of budget for. The
+	// next walk starts with them.
+	skippedKeys []threadKey
 	// skipped marks conversations left unread for want of budget. What they
 	// hold is still there, and only another catch-up will go and get it.
 	skipped bool
@@ -287,7 +330,7 @@ func (b *Bridge) degradeConversations(generation uint64, err error) {
 
 // catchUpThreadConversations reads every open thread from the point it was
 // last read to.
-func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner string, cursors map[threadKey]string, scan *scanChanges) ([]Message, error) {
+func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner string, cursors map[threadKey]string, waiting map[threadKey]struct{}, scan *scanChanges) ([]Message, error) {
 	if len(cursors) == 0 {
 		return nil, nil
 	}
@@ -295,11 +338,14 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 	var (
 		messages []Message
 		walked   int
-		skipped  int
 	)
-	for key, after := range cursors {
+	for _, key := range threadWalkOrder(cursors, waiting) {
+		after := cursors[key]
 		if walked >= maxThreadsPerCatchUp {
-			skipped++
+			// Recorded rather than counted: the next walk starts with these,
+			// so a conversation cannot be passed over for ever by a map that
+			// happens to yield it last.
+			scan.skippedKeys = append(scan.skippedKeys, key)
 			continue
 		}
 		walked++
@@ -322,14 +368,37 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 		messages = append(messages, replies...)
 	}
 
-	if skipped > 0 {
+	if len(scan.skippedKeys) > 0 {
 		// Asked for again, so "a later catch-up" is a promise rather than a
 		// hope: nothing else would bring one along.
 		scan.skipped = true
-		log.Printf("catch-up read %d conversation threads and skipped %d; replies in the skipped threads will arrive on a later catch-up",
-			walked, skipped)
+		log.Printf("catch-up read %d conversation threads and skipped %d; the skipped ones are read first on the next pass",
+			walked, len(scan.skippedKeys))
 	}
 	return messages, nil
+}
+
+// threadWalkOrder puts the conversations a previous walk could not reach first,
+// and is otherwise stable. A map's own order is unspecified, which is how a
+// busy conversation could be passed over on every pass while the budget went
+// to quiet ones.
+func threadWalkOrder(cursors map[threadKey]string, waiting map[threadKey]struct{}) []threadKey {
+	keys := make([]threadKey, 0, len(cursors))
+	for key := range cursors {
+		keys = append(keys, key)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		_, iWaiting := waiting[keys[i]]
+		_, jWaiting := waiting[keys[j]]
+		if iWaiting != jWaiting {
+			return iWaiting
+		}
+		if keys[i].channel != keys[j].channel {
+			return keys[i].channel < keys[j].channel
+		}
+		return keys[i].threadTS < keys[j].threadTS
+	})
+	return keys
 }
 
 // scanForMentions looks for mentions that arrived while the bridge was not

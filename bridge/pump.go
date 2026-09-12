@@ -173,8 +173,7 @@ func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
 	// implementation of the stream, and one of them clears what it reports.
 	lostReactions := streamDroppedReactions(stream)
 	overflow := streamPendingOverflow(stream)
-	if !lostReactions && !overflow && !b.overflowNoted.Load() {
-		// Nothing lost, nothing refused, and nothing outstanding to clear.
+	if !lostReactions && !overflow {
 		return
 	}
 
@@ -194,9 +193,6 @@ func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
 // caller must hold b.mu and must be on the live connection.
 func (b *Bridge) noteOverflowLocked(overflow bool) {
 	if !overflow {
-		// The stream has room again and has said what it lost. The next
-		// refusal is a new one.
-		b.overflowNoted.Store(false)
 		return
 	}
 	if b.overflowNoted.Load() {
@@ -205,6 +201,9 @@ func (b *Bridge) noteOverflowLocked(overflow bool) {
 		// epoch out from under the catch-up that is answering this one.
 		return
 	}
+	// Held until the stream announces it. The announcement is a StreamDropped
+	// event, and absorbing that one is what clears this: the two are the same
+	// refusal, and one refusal is one hole.
 	b.overflowNoted.Store(true)
 
 	// A hole, even when a catch-up is already due. The one in flight went to
@@ -549,11 +548,14 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		b.noteReactionsDroppedLocked()
 	}
 
-	if overflow {
+	if overflow && !b.overflowNoted.Swap(false) {
 		// An overflow the stream recorded but never had room to announce. The
 		// messages it refused are in the window and nowhere else, and the
 		// cursor has just moved over the ones that did fit — so the request to
 		// read that window again outlives the connection that lost them.
+		//
+		// Unless the pump already raised it by asking, in which case this is
+		// the same refusal seen twice.
 		b.requestCatchUpForHoleLocked()
 	}
 	b.mu.Unlock()
