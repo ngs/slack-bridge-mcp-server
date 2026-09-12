@@ -36,6 +36,12 @@ type stateWrite struct {
 	// remove marks a conversation the bridge has given up on, which is a
 	// deletion rather than a cursor.
 	remove bool
+	// reopened marks a conversation opened again after being given up on,
+	// where the two changes collapsed into this one. The removal has to happen
+	// anyway: SetThread leaves an existing cursor alone when it is given an
+	// empty one, so without it the conversation would come back still pointing
+	// at where the old one had been read to.
+	reopened bool
 }
 
 // stateWriteFlushWait is how long Close waits for the writer to finish what it
@@ -77,6 +83,11 @@ func (b *Bridge) recordStateWriteLocked(w stateWrite) {
 		go b.writeState(b.store, b.stateWake, b.stopStateWrites, b.stateWritesDone)
 	}
 
+	if previous, ok := b.stateDirty[w.stateKey]; ok && previous.remove && !w.remove {
+		// Given up on and opened again before either reached the file. The
+		// later one wins, as always, but it has to undo the first as well.
+		w.reopened = true
+	}
 	b.stateDirty[w.stateKey] = w
 	select {
 	case b.stateWake <- struct{}{}:
@@ -170,6 +181,13 @@ func applyStateWrite(store *Store, w stateWrite) error {
 	case w.kind == writeThread && w.remove:
 		err = store.RemoveThread(w.channel, w.threadTS)
 	case w.kind == writeThread:
+		if w.reopened {
+			// Clears the cursor the old conversation left behind, which
+			// SetThread would otherwise keep.
+			if err = store.RemoveThread(w.channel, w.threadTS); err != nil {
+				break
+			}
+		}
 		err = store.SetThread(w.channel, w.threadTS, w.ts)
 	case w.kind == writeLastTS:
 		err = store.SetLastTS(w.channel, w.ts)
@@ -190,6 +208,11 @@ func (b *Bridge) requeueStateWrites(failed []stateWrite) {
 	}
 	for _, w := range failed {
 		if _, newer := b.stateDirty[w.stateKey]; !newer {
+			if previous, ok := b.stateDirty[w.stateKey]; ok && previous.remove && !w.remove {
+				// Given up on and opened again before either reached the file. The
+				// later one wins, as always, but it has to undo the first as well.
+				w.reopened = true
+			}
 			b.stateDirty[w.stateKey] = w
 		}
 	}
@@ -250,8 +273,9 @@ func (b *Bridge) reportUnwrittenState() {
 const stateWriteRetryWait = 200 * time.Millisecond
 
 // stopStateWriter tells the writer to flush what it has and stop, and waits
-// briefly for it. It must be called without b.mu held.
-func (b *Bridge) stopStateWriter() {
+// briefly for it. It reports whether the writer actually stopped, and must be
+// called without b.mu held.
+func (b *Bridge) stopStateWriter() bool {
 	b.mu.Lock()
 	stop, done := b.stopStateWrites, b.stateWritesDone
 	b.stopStateWrites = nil
@@ -259,7 +283,7 @@ func (b *Bridge) stopStateWriter() {
 	b.mu.Unlock()
 
 	if stop == nil {
-		return
+		return true
 	}
 	close(stop)
 
@@ -267,7 +291,9 @@ func (b *Bridge) stopStateWriter() {
 	defer timeout.Stop()
 	select {
 	case <-done:
+		return true
 	case <-timeout.C:
 		log.Printf("gave up waiting for the cursors to reach the state file")
+		return false
 	}
 }

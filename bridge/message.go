@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -197,6 +198,29 @@ func tsLess(a, b string) bool {
 		return as < bs
 	}
 	return aq < bq
+}
+
+// predecessorTS returns a timestamp just before ts, for use as an exclusive
+// bound that has to include ts itself.
+//
+// Slack's timestamps are a second count and a per-second sequence, and the
+// sequence is what moves between two messages in the same second. Stepping it
+// back by one is therefore the smallest step there is; at the start of a second
+// it goes to the end of the one before, which is earlier than anything in this
+// one and no earlier than it needs to be. A timestamp that does not parse is
+// returned unchanged, which costs a duplicate rather than a loss.
+func predecessorTS(ts string) string {
+	seconds, sequence, ok := splitTS(ts)
+	if !ok {
+		return ts
+	}
+	if sequence > 0 {
+		return fmt.Sprintf("%d.%06d", seconds, sequence-1)
+	}
+	if seconds == 0 {
+		return ts
+	}
+	return fmt.Sprintf("%d.%06d", seconds-1, 999999)
 }
 
 // splitTS breaks "seconds.sequence" into its two integer components.

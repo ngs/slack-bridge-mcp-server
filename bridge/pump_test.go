@@ -1001,3 +1001,74 @@ func TestAClickFromALaterConnectionDoesNotAnswerAnOlderQuestion(t *testing.T) {
 		t.Errorf("Ask() = %+v, want no answer: the click came from a connection the question never had", got.result)
 	}
 }
+
+// The cursor has to move on an ordinary delivery. A guard written for the
+// gapped case, where the queue is deliberately kept, would otherwise see the
+// batch it is handing over still sitting in that queue and never advance —
+// leaving every reconnect to replay what was just delivered.
+func TestAnOrdinaryDeliveryAdvancesTheCursor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	send(stream, testChannel, "100.000200", "", "ship it?")
+	if msgs := waitOnce(ctx, t, b).Messages; len(msgs) != 1 {
+		t.Fatalf("Wait() returned %v, want the message", texts(msgs))
+	}
+
+	if got := b.Status().LastTS; got != "100.000200" {
+		t.Errorf("last_ts = %q, want it moved to the message just handed over", got)
+	}
+}
+
+// A message refused before the first cursor exists is not recoverable from a
+// seed that would filter it out. The cursor goes behind what the session has
+// actually seen instead, so the catch-up reads forward from there.
+func TestARefusalBeforeTheFirstCursorKeepsTheWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	// The channel's newest message is newer than anything the session has in
+	// hand — somebody else posted while this one was connecting — so a seed
+	// taken from it would sit ahead of the refused message and hide it.
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "before this session"), ownerMsg("900.000000", "somebody else, just now")},
+		},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// Queued before the connection is opened, so the seed is read with them
+	// already in hand, and one more than the queue will take.
+	b.mu.Lock()
+	for i := 0; i < maxPendingMessages; i++ {
+		b.pending = append(b.pending, Message{
+			TS: fmt.Sprintf("200.%06d", i), Channel: testChannel, User: testOwner, Text: "queued",
+		})
+	}
+	b.mu.Unlock()
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "300.000100", Channel: testChannel, User: testOwner, Text: "refused",
+	}})
+
+	waitOnce(ctx, t, b)
+
+	// The seed did not become the cursor. What did is the batch actually handed
+	// over, which leaves the refused message inside the window the catch-up
+	// asked for will read.
+	if got := b.Status().LastTS; !tsLess(got, "300.000100") {
+		t.Errorf("last_ts = %q, want it behind the refused message so history still has it", got)
+	}
+
+}

@@ -68,6 +68,10 @@ type Bridge struct {
 	// the connection lives exactly as long as the MCP session.
 	ctx context.Context
 
+	// catchUpMu serialises catch-up, which is the one place a call goes to
+	// Slack and back before committing. It is taken before b.mu, never after.
+	catchUpMu sync.Mutex
+
 	mu        sync.Mutex
 	api       API
 	stream    Stream
@@ -384,7 +388,7 @@ func (b *Bridge) Close() error {
 	// stopped would leave it in a queue nobody is reading, which is a
 	// conversation the owner has to open again after a restart.
 	waitForPump(pumpStopped)
-	b.stopStateWriter()
+	writerStopped := b.stopStateWriter()
 
 	if done != nil {
 		timeout := time.NewTimer(shutdownIndicatorWait)
@@ -398,6 +402,13 @@ func (b *Bridge) Close() error {
 
 	if lock == nil {
 		return nil
+	}
+	if !writerStopped {
+		// The lock is what keeps two sessions off one state file, and it is
+		// being let go with a writer that has not finished. Said plainly
+		// because the consequence is not local: a session started now can
+		// interleave its own writes with what this one is still finishing.
+		log.Printf("releasing the single-instance lock while the state file writer is still running")
 	}
 	return lock.Release()
 }
@@ -797,6 +808,15 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 // returned, so a failure anywhere earlier leaves the bridge ready to fetch
 // them again on the next call rather than skipping past them.
 func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReactions bool) ([]Message, []Reaction, error) {
+	// One at a time. Two calls reading the same window would both fetch it and,
+	// behind a gap — where the cursor deliberately stays put — both deliver it,
+	// handing the owner's messages over twice. The wait costs nothing that was
+	// not going to be spent: the second call was about to make the same
+	// request, and by the time it gets the lock the first has moved the cursor
+	// past what it took.
+	b.catchUpMu.Lock()
+	defer b.catchUpMu.Unlock()
+
 	b.mu.Lock()
 	needCatchUp := b.needCatchUp
 	epoch := b.catchUpEpoch
@@ -949,7 +969,10 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// has nowhere to put a reaction — taking one here would be taking it off
 	// the wait that reports them.
 	var reactions []Reaction
-	if takeReactions {
+	if takeReactions && !gapped {
+		// Not behind a gap. The messages those reactions belong to are
+		// deliberately still queued, and handing a reaction over ahead of its
+		// message is the split the pump exists to prevent.
 		reactions = b.drainReactionsLocked()
 	}
 
@@ -957,7 +980,8 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		return nil, reactions, nil
 	}
 
-	if len(home) > 0 && !b.cursorWouldPassQueuedLocked(home[len(home)-1].TS) {
+	heldBack := gapped && b.cursorWouldPassQueuedLocked(home)
+	if len(home) > 0 && !heldBack {
 		newest := home[len(home)-1].TS
 		// Never backwards. On the run that seeds the cursor, a message the pump
 		// took while history was being read can be older than the seed, and
@@ -1040,15 +1064,32 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	})
 }
 
-// cursorWouldPassQueuedLocked reports whether moving the home cursor to ts
-// would step over a message still waiting in the queue. The caller must hold
-// b.mu.
+// oldestPendingLocked reports the timestamp of the oldest home message waiting
+// to be handed over, or empty if there is none. The caller must hold b.mu.
+func (b *Bridge) oldestPendingLocked() string {
+	oldest := ""
+	for _, m := range b.pending {
+		if oldest == "" || tsLess(m.TS, oldest) {
+			oldest = m.TS
+		}
+	}
+	return oldest
+}
+
+// cursorWouldPassQueuedLocked reports whether moving the home cursor to the end
+// of this batch would step over a message still waiting in the queue. The
+// caller must hold b.mu.
 //
-// It only ever says yes behind a gap, where the queue is deliberately left
-// alone: history can return a message newer than one the socket delivered, and
-// a cursor that moved past the queued one would have the next merge filter it
-// out as already seen.
-func (b *Bridge) cursorWouldPassQueuedLocked(ts string) bool {
+// It is asked only behind a gap, where the queue is deliberately left alone:
+// history can return a message newer than one the socket delivered, and a
+// cursor that moved past the queued one would have the next merge filter it out
+// as already seen. On the ordinary path the queue is being handed over in this
+// very batch, so asking would always say yes and the cursor would never move.
+func (b *Bridge) cursorWouldPassQueuedLocked(delivered []Message) bool {
+	if len(delivered) == 0 {
+		return false
+	}
+	ts := delivered[len(delivered)-1].TS
 	for _, m := range b.pending {
 		if !tsLess(ts, m.TS) {
 			return true
@@ -1071,6 +1112,18 @@ func (b *Bridge) cursorWouldPassQueuedLocked(ts string) bool {
 // memory so a replacement does not seed again against a channel that has moved
 // on, and the write is left to whoever hands the messages over.
 func (b *Bridge) establishSeedLocked(channel, seed string, commit bool) {
+	if b.preSeedRefused {
+		// The queue filled while the seed was being read, so messages were
+		// refused. They are newer than everything queued, and the queue is
+		// what the session has actually seen — so the cursor goes behind the
+		// oldest of those instead of on the seed, and catch-up reads forward
+		// from there. Nothing before this session is in that window: the
+		// oldest queued message arrived on this connection.
+		if oldest := b.oldestPendingLocked(); oldest != "" {
+			seed = predecessorTS(oldest)
+		}
+	}
+
 	b.cursorSeeded = true
 	b.lastTS = seed
 	b.seedMergePending = true

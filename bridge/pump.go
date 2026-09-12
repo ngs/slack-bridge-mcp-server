@@ -309,7 +309,7 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		// abandons nothing, and saying otherwise would send the agent to
 		// re-read a tally that was never wrong, every time the socket
 		// reconnected.
-		if len(carried) > 0 || len(reactions) > 0 || len(late) > 0 {
+		if len(carried) > 0 || len(reactions) > 0 {
 			b.reactionsDropped = true
 		}
 		b.mu.Unlock()
