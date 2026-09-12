@@ -560,7 +560,17 @@ cursor moves — which means the window is read again afterwards, and what comes
 back has been handed over already. That is what the record of delivered
 messages is for, and why the cursor is taken from what a pass *read* rather than
 from what it handed on: a pass that reads only messages it has already
-delivered still moves the cursor past them. A message this bridge refused for want of room is the other way
+delivered still moves the cursor past them.
+
+The conversations outside the home channel keep one more rule of their own. A
+conversation this pass could not reach — the walk ran out of budget before it —
+keeps its cursor whatever the pass hands over from it. The socket can deliver a
+reply in such a conversation while the walk is skipping it, and moving the
+cursor to that reply would step over every reply the walk was going to go back
+for, which is exactly what the skipped list promises to collect. So the reply is
+handed over and the cursor waits; the walk that reads that conversation is what
+moves it, even when everything it reads has been handed over already and it
+delivers nothing at all. A message this bridge refused for want of room is the other way
 round: the queue was full, so the refused message is newer than everything in
 it, and everything read alongside it is still good. That batch is handed over,
 the cursor moves, and the request stands for the message that did not fit.

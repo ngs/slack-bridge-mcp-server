@@ -2550,3 +2550,97 @@ func TestASkippedConversationKeepsItsCursorWhenALiveReplyArrives(t *testing.T) {
 		t.Errorf("replies in the skipped conversation delivered = %v, want [unread one unread two]", got)
 	}
 }
+
+// The cursor a skipped conversation kept is moved by the walk that reads it,
+// even when that walk hands nothing over. The ordinary shape of this is a
+// conversation with nothing unread behind it: the owner replies, the reply is
+// delivered from the queue, and the walk that follows finds only that reply and
+// drops it as delivered. Left there, the cursor never moves — every later pass
+// reads the conversation again, and a restart hands the reply over twice.
+func TestAWalkThatDeliversNothingStillRecordsHowFarItRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	cursors := map[threadKey]string{}
+	for i := 0; i < maxThreadsPerCatchUp+1; i++ {
+		ts := "50.00000" + strconv.Itoa(i)
+		if err := store.SetThread("CPROJ", ts, "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+		cursors[threadKey{"CPROJ", ts}] = "60.000000"
+	}
+	order := threadWalkOrder(cursors, nil)
+	target := order[len(order)-1] // the one a full walk skips
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+		// Nothing unread behind the cursor: only the reply the socket is about
+		// to deliver, which history has as well.
+		replies: []candidate{
+			{Channel: "CPROJ", User: testOwner, Text: "live", TS: "90.000000", ThreadTS: target.threadTS},
+		},
+		historyGate: make(chan struct{}),
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+
+	send(stream, "CPROJ", "90.000000", target.threadTS, "live")
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b.pendingThreadCount() == 1 {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		close(api.historyGate)
+	}()
+
+	if result, err := b.Wait(ctx, 2*time.Second); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	} else if len(result.Messages) != 1 {
+		t.Fatalf("Wait() = %v, want the live reply", texts(result.Messages))
+	}
+
+	b.mu.Lock()
+	kept := b.threadCursors[target]
+	b.mu.Unlock()
+	if kept != "60.000000" {
+		t.Fatalf("the skipped conversation's cursor = %q, want it left for the walk that reads it", kept)
+	}
+
+	// The walk that reads it. It hands nothing over — the only reply there has
+	// been delivered already — and it still has to record how far it read.
+	waitOnce(ctx, t, b)
+
+	b.mu.Lock()
+	moved := b.threadCursors[target]
+	b.mu.Unlock()
+	if moved != "90.000000" {
+		t.Errorf("the cursor after the walk that read it = %q, want the reply it read", moved)
+	}
+
+	// Which is what a restart is decided by: the memory of what has been
+	// handed over does not survive one.
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	next := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = next.Close() })
+	for i := 0; i < 3; i++ {
+		if msgs := waitOnce(ctx, t, next).Messages; len(msgs) != 0 {
+			t.Fatalf("Wait() after a restart = %v, want nothing: it was handed over before the session ended", texts(msgs))
+		}
+	}
+}

@@ -1415,28 +1415,11 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		newest = last
 	}
 
-	if len(home) == 0 && len(threads) == 0 && newest == "" {
-		return nil, reactions, nil
-	}
-
-	if newest != "" {
-		// Never backwards. On the run that seeds the cursor, a message the pump
-		// took while history was being read can be older than the seed, and
-		// moving the cursor back to it would have the next reconnect re-read
-		// the channel's past.
-		if tsLess(newest, b.lastTS) {
-			newest = b.lastTS
-		}
-		if b.store != nil {
-			// A stale cursor costs a duplicate after a restart; the messages
-			// reach the agent either way.
-			b.recordStateWriteLocked(stateWrite{
-				stateKey: stateKey{kind: writeLastTS, channel: channel},
-				ts:       newest,
-			})
-		}
-		b.lastTS = newest
-	}
+	// The thread cursors, before anything can return. A pass that reads a
+	// conversation and finds only what has been delivered already hands
+	// nothing over — and it still has to record how far it read, or the next
+	// one starts in the same place and reads it again.
+	//
 	// A conversation the walk could not reach keeps its cursor, whatever this
 	// pass hands over from it. The socket can deliver a reply in a conversation
 	// the walk skipped, and moving the cursor to that reply steps over
@@ -1466,6 +1449,28 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		}
 	}
 
+	if len(home) == 0 && len(threads) == 0 && newest == "" {
+		return nil, reactions, nil
+	}
+
+	if newest != "" {
+		// Never backwards. On the run that seeds the cursor, a message the pump
+		// took while history was being read can be older than the seed, and
+		// moving the cursor back to it would have the next reconnect re-read
+		// the channel's past.
+		if tsLess(newest, b.lastTS) {
+			newest = b.lastTS
+		}
+		if b.store != nil {
+			// A stale cursor costs a duplicate after a restart; the messages
+			// reach the agent either way.
+			b.recordStateWriteLocked(stateWrite{
+				stateKey: stateKey{kind: writeLastTS, channel: channel},
+				ts:       newest,
+			})
+		}
+		b.lastTS = newest
+	}
 	if len(home) == 0 && len(threads) == 0 {
 		return nil, reactions, nil
 	}
@@ -1876,7 +1881,11 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 		}
 	}
 
-	log.Printf("stopped reading a thread after %d pages of replies; anything past that is older than the new cursor and will not be delivered",
+	// Replies come back oldest first, so what is left is newer than everything
+	// read — and the cursor stops at the newest reply this walk reached. The
+	// rest is waiting there for the walk after it, rather than behind a cursor
+	// that stepped over it.
+	log.Printf("stopped reading a thread after %d pages of replies; the rest is newer than the cursor and waits for the next walk",
 		maxThreadCatchUpPages)
 	return messages, nil
 }
