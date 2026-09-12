@@ -362,13 +362,9 @@ func TestTheFirstRunSeedsTheMentionCursorInsteadOfReplaying(t *testing.T) {
 		t.Errorf("Wait() on a first run returned %v, want the workspace's history left where it is", texts(msgs))
 	}
 
-	cursor, err := NewStore(cfg.StateDir).MentionCursor()
-	if err != nil {
-		t.Fatalf("MentionCursor() error = %v", err)
-	}
-	if cursor != "300.000100" {
-		t.Errorf("mention cursor = %q, want the newest message the scan saw", cursor)
-	}
+	eventuallyOnDisk(t, "the mention cursor to reach the state file", func() bool {
+		return storedMentionCursor(cfg.StateDir) == "300.000100"
+	})
 }
 
 // The search is bounded, because a workspace can hold hundreds of channels and
@@ -637,7 +633,7 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 	// The state file is written by a goroutine of its own, off the paths that
 	// must not wait for a disk, so what is on disk arrives a moment later.
 	eventuallyOnDisk(t, "the conversation to reach the state file", func() bool {
-		return len(storedThreads(t, b)) == 1
+		return len(storedThreads(b)) == 1
 	})
 
 	// The thread has been deleted since.
@@ -651,7 +647,7 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 	}
 
 	if !storedThreadsEventually(t, b, 0) {
-		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", storedThreads(t, b))
+		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", storedThreads(b))
 	}
 }
 
@@ -685,9 +681,9 @@ func TestAnEmptyFirstScanStillRecordsThatItLooked(t *testing.T) {
 	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
 		t.Fatalf("Wait() returned %v from an empty workspace, want nothing", texts(msgs))
 	}
-	if cursor, err := NewStore(cfg.StateDir).MentionCursor(); err != nil || cursor == "" {
-		t.Fatalf("mention cursor = %q (err %v), want the scan to have recorded that it looked", cursor, err)
-	}
+	eventuallyOnDisk(t, "the scan to record that it looked", func() bool {
+		return storedMentionCursor(cfg.StateDir) != ""
+	})
 
 	// Now the owner mentions the app while the session is not listening.
 	sent := strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10) + ".000100"
@@ -704,13 +700,25 @@ func TestAnEmptyFirstScanStillRecordsThatItLooked(t *testing.T) {
 	}
 }
 
-// storedThreads reads the conversations recorded in the state file.
-func storedThreads(t *testing.T, b *Bridge) []ThreadState {
-	t.Helper()
+// storedMentionCursor reads how far the state file says the scan has looked,
+// treating a read it cannot make as one to try again.
+func storedMentionCursor(dir string) string {
+	cursor, err := NewStore(dir).MentionCursor()
+	if err != nil {
+		return ""
+	}
+	return cursor
+}
 
+// storedThreads reads the conversations recorded in the state file.
+//
+// A read that fails is a read to try again, not a test failure: the file is
+// replaced by a rename, and on Windows a read landing in the middle of one is
+// refused outright. The caller is polling.
+func storedThreads(b *Bridge) []ThreadState {
 	threads, err := NewStore(b.cfg.StateDir).Threads()
 	if err != nil {
-		t.Fatalf("Threads() error = %v", err)
+		return nil
 	}
 	return threads
 }
@@ -724,7 +732,7 @@ func storedThreadsEventually(t *testing.T, b *Bridge, want int) bool {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(storedThreads(t, b)) == want {
+		if len(storedThreads(b)) == want {
 			return true
 		}
 		time.Sleep(stateFilePollInterval)

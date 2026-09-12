@@ -211,13 +211,9 @@ func TestALaterConnectionRetriesTheScan(t *testing.T) {
 
 	// The scan that ran seeded its cursor, which is what makes the next one a
 	// search: proof it got as far as succeeding rather than being skipped.
-	cursor, err := NewStore(stateDir).MentionCursor()
-	if err != nil {
-		t.Fatalf("reading the mention cursor: %v", err)
-	}
-	if cursor == "" {
-		t.Error("the mention cursor is still unset, so the scan did not complete on the new connection")
-	}
+	eventuallyOnDisk(t, "the scan's cursor to reach the state file", func() bool {
+		return storedMentionCursor(stateDir) != ""
+	})
 }
 
 // Catch-up runs with the lock released, so a slow one can outlive the
