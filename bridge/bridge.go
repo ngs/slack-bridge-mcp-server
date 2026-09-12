@@ -289,15 +289,17 @@ type Bridge struct {
 	// click on an older question still standing in the channel is held as an
 	// early click and replayed against the message that replaces it.
 	askReserved bool
-	// retiredTS is the question whose buttons were last sent away. That request
-	// outlives the call that made it, so the buttons can still be on the
-	// owner's screen while the next question is going up — and a tap on them is
-	// not the next question's answer, whether or not it has a timestamp of its
-	// own yet to be told apart by.
+	// retiredTS holds the questions whose buttons were last sent away, newest
+	// first. Those requests outlive the calls that made them, so the buttons
+	// can still be on the owner's screen while the next question is going up —
+	// and a tap on them is not the next question's answer, whether or not it
+	// has a timestamp of its own yet to be told apart by.
 	//
-	// One is enough. Anything older was retired by a call that had already
-	// returned before this one started.
-	retiredTS string
+	// Two of them, because one call can retire two: the question it asked, and
+	// an abandoned one the search found on its way in. One slot would let the
+	// second overwrite the first, and the first is the one whose update is
+	// likelier to be still in flight.
+	retiredTS [2]string
 	// retiring counts the chat.update calls taking a question's buttons away
 	// that are still in flight. They outlive the call that asked, so Close
 	// waits for them.
@@ -1572,15 +1574,22 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// the start of the pass for that reason, so this can only be a moment the
 	// history read already covers.
 	//
-	// The epoch is the second bound, and it is the one that holds when the
-	// clocks disagree. A message refused for want of room is what makes the
-	// cursor safe to move over the queue at all, and it is safe only as far as
-	// this pass read: a cursor taken from a reply of the same age as the
-	// refused message would step over a channel message nothing ever read, and
-	// nothing would go back for it. So when something has asked for another
-	// catch-up since this one started, the walk's reach waits — and the pass
-	// that answers it walks the same threads once more and moves the cursor
-	// then.
+	// The epoch is the second bound, and what it covers is the interruptions
+	// this pass was told about while it ran. A message refused for want of
+	// room is what makes the cursor safe to move over the queue at all, and it
+	// is safe only as far as this pass read: a cursor taken from a reply of
+	// the same age as the refused message would step over a channel message
+	// nothing ever read, and nothing would go back for it. So when something
+	// has asked for another catch-up since this one started, the walk's reach
+	// waits — and the pass that answers it walks the same threads once more
+	// and moves the cursor then.
+	//
+	// The two do not stand in for each other. An interruption that only comes
+	// to light after this pass has committed — a socket that died without
+	// saying so, a first hello still on its way — is in neither epoch, and the
+	// bound above is the only thing holding there. That bound is taken from
+	// this machine's clock, so it holds as long as the clock is not running
+	// more than walkReachSlack ahead of Slack's.
 	if epoch == b.catchUpEpoch && tsLess(newest, walked) {
 		newest = walked
 	}

@@ -667,7 +667,7 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 	// question, in the window where a tap on the old one cannot be told apart
 	// by timestamp.
 	b.mu.Lock()
-	b.retiredTS = found
+	b.noteRetiredLocked(found)
 	b.mu.Unlock()
 
 	if err := b.tryResolve(api, orphan.channel, found, orphanExpiredText, time.Until(ends)); err != nil {
@@ -938,7 +938,7 @@ func (b *Bridge) retireQuestion(api API, channel, ts, text string) <-chan struct
 	b.mu.Lock()
 	// Remembered before the request goes out, so a tap on these buttons counts
 	// as stale from the moment the bridge decided they were.
-	b.retiredTS = ts
+	b.noteRetiredLocked(ts)
 	counted := !b.retireSealed
 	if counted {
 		b.retiring.Add(1)
@@ -955,6 +955,26 @@ func (b *Bridge) retireQuestion(api API, channel, ts, text string) <-chan struct
 		}
 	}()
 	return done
+}
+
+// noteRetiredLocked records a question whose buttons have been sent away,
+// keeping the two most recent. The caller must hold b.mu.
+func (b *Bridge) noteRetiredLocked(ts string) {
+	if ts == "" || ts == b.retiredTS[0] {
+		return
+	}
+	b.retiredTS[1] = b.retiredTS[0]
+	b.retiredTS[0] = ts
+}
+
+// wasRetiredLocked reports whether a click landed on one of those. The caller
+// must hold b.mu.
+//
+// It does not look at the channel: a Slack timestamp is unique within one, and
+// a click from another channel has already been turned away by the time this
+// is asked.
+func (b *Bridge) wasRetiredLocked(ts string) bool {
+	return ts != "" && (ts == b.retiredTS[0] || ts == b.retiredTS[1])
 }
 
 // awaitRetirements waits for the question retirements still in flight, so a
@@ -1033,7 +1053,7 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 		// Only in this window. Once the question has a timestamp of its own,
 		// that timestamp is the authority and the comparison below is the one
 		// that decides.
-		if in.MessageTS != "" && in.MessageTS == b.retiredTS {
+		if b.wasRetiredLocked(in.MessageTS) {
 			ask.warn(in)
 			return
 		}

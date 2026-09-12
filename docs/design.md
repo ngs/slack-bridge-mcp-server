@@ -507,7 +507,16 @@ Two invariants hold across all of it, whatever is arriving:
   it is safe only as far as this pass read. When something has asked, the pass
   that answers it walks the same threads once more and moves the cursor then:
   one extra read, with the delivered window keeping the replies from arriving
-  twice.
+  twice. The first pass of a session is normally one of those, since the socket
+  usually says hello after the window has been read — so the standing cost of
+  the deferral is one extra `conversations.replies` per connection for each
+  thread with a reply newer than the cursor, up to the same cap the walk itself
+  has. The two bounds do not stand in for each other, either: the second covers
+  only what the pass was told about while it ran, so an interruption that comes
+  to light after it has committed — a socket that died without saying so, a
+  first hello still on its way — leaves the first one holding alone, and that
+  one is taken from this machine's clock. It holds while that clock is not
+  running more than five seconds ahead of Slack's.
 - **The home cursor follows what a pass read, and stops at what it did not hand
   over.** Every message in every page counts towards how far a read got, so a
   page of somebody else's conversation moves the cursor past itself; a message

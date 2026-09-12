@@ -2181,3 +2181,94 @@ func TestAnAbandonedQuestionSurvivesACallWithNoTimeToLook(t *testing.T) {
 		t.Error("the abandoned question was forgotten by a call that never looked for it; its buttons stay in the channel and nothing looks again")
 	}
 }
+
+// One call can send two questions' buttons away: the one it asks, and an
+// abandoned one the search finds on its way in. Remembering only the newer
+// forgets the other — and the other is the one whose update has been out
+// longest, so its buttons are the likelier of the two to still be tappable.
+//
+// Fail-first: with one slot, the abandoned question the third call finds
+// overwrites the question the second call timed out on, and taps on that one
+// crowd out the answer.
+func TestBothQuestionsRetiredByOneCallAreRecognised(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	// Slack refuses every chat.update, so no question's buttons ever actually
+	// go: they all stay tappable, which is the situation being described.
+	api.resolveErr = errors.New("slack would not take the update")
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A post given up on, which is what leaves an abandoned question behind.
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+	orphanTS := slackTS(time.Now())
+
+	// The next call cannot finish looking for it, so it stays abandoned and
+	// the call after this one is the one that finds it.
+	stuck := make(chan struct{})
+	const timedOutTS = "100.000720"
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.questionTS = timedOutTS
+	api.historyGate = stuck
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+
+	// It asks anyway, and its own question times out — so its buttons are sent
+	// away, refused, and left live.
+	if result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  orphanSearchWait + 500*time.Millisecond,
+	}); err != nil || !result.TimedOut {
+		t.Fatalf("Ask() = %+v, err = %v, want a timeout", result, err)
+	}
+	if !b.hasOrphanQuestion() {
+		t.Fatal("setup: the abandoned question was not kept for the next call")
+	}
+
+	// Now the search can finish. This call retires the abandoned question as
+	// well as posting one of its own — and while it posts, the owner taps the
+	// question the call before it timed out on.
+	close(stuck)
+	const thirdTS = "100.000730"
+	api.mu.Lock()
+	api.historyGate = nil
+	api.questionTS = thirdTS
+	api.beforeQuestionReturns = func() {
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, timedOutTS, 0))
+		}
+		b.routeInteraction(click(testOwner, thirdTS, 1))
+	}
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "still there?",
+		Options:  []string{"yes", "no"},
+		Timeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the owner's click on the new question honoured as choice 1", result)
+	}
+}
