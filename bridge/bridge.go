@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,9 +69,10 @@ type Bridge struct {
 	// the connection lives exactly as long as the MCP session.
 	ctx context.Context
 
-	// catchUpMu serialises catch-up, which is the one place a call goes to
-	// Slack and back before committing. It is taken before b.mu, never after.
-	catchUpMu sync.Mutex
+	// catchUpSlot serialises catch-up, which is the one place a call goes to
+	// Slack and back before committing. A channel rather than a mutex so that
+	// a caller waiting for its turn can give up when its own context does.
+	catchUpSlot chan struct{}
 
 	mu        sync.Mutex
 	api       API
@@ -152,6 +154,10 @@ type Bridge struct {
 	stateDirty map[stateKey]stateWrite
 	// stateWriteFailing keeps a failing state file to one line per episode.
 	stateWriteFailing bool
+	// stateFenced stops the writer for good, whatever it is in the middle of.
+	// It is set when shutdown has waited as long as it can and is about to
+	// release the lock that keeps another session off this file.
+	stateFenced atomic.Bool
 	// stateClosed marks the writer as flushed and stopped, so a call still
 	// running at shutdown does not start another one behind it.
 	stateClosed     bool
@@ -256,7 +262,12 @@ func New(ctx context.Context, cfg Config, connector Connector) *Bridge {
 	if connector == nil {
 		connector = SocketModeConnector{}
 	}
-	return &Bridge{ctx: ctx, cfg: cfg, connector: connector}
+	return &Bridge{
+		ctx:         ctx,
+		cfg:         cfg,
+		connector:   connector,
+		catchUpSlot: make(chan struct{}, 1),
+	}
 }
 
 // requestCatchUpLocked asks for the window to be re-read, and stamps the
@@ -404,11 +415,10 @@ func (b *Bridge) Close() error {
 		return nil
 	}
 	if !writerStopped {
-		// The lock is what keeps two sessions off one state file, and it is
-		// being let go with a writer that has not finished. Said plainly
-		// because the consequence is not local: a session started now can
-		// interleave its own writes with what this one is still finishing.
-		log.Printf("releasing the single-instance lock while the state file writer is still running")
+		// The writer has been fenced: it will not write again, whatever it was
+		// holding. Said plainly because what it was holding is now work to be
+		// done again after a restart.
+		log.Printf("the state file writer was stopped before it finished; what it had not written will be read again after a restart")
 	}
 	return lock.Release()
 }
@@ -812,10 +822,17 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// behind a gap — where the cursor deliberately stays put — both deliver it,
 	// handing the owner's messages over twice. The wait costs nothing that was
 	// not going to be spent: the second call was about to make the same
-	// request, and by the time it gets the lock the first has moved the cursor
+	// request, and by the time it has its turn the first has moved the cursor
 	// past what it took.
-	b.catchUpMu.Lock()
-	defer b.catchUpMu.Unlock()
+	//
+	// A caller that gives up while waiting says so rather than waiting out
+	// somebody else's slow request: its own deadline is the one it promised.
+	select {
+	case b.catchUpSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	defer func() { <-b.catchUpSlot }()
 
 	b.mu.Lock()
 	needCatchUp := b.needCatchUp
@@ -833,7 +850,9 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 
 	// gapped marks a catch-up that was asked for again while this one was in
 	// flight, which means there is a hole somewhere after the window it read.
-	var gapped bool
+	// more marks one that ran out of pages, or threads, before it ran out of
+	// window: what it did not reach is still there to be read.
+	var gapped, more bool
 
 	var (
 		fetched, conversations []Message
@@ -853,10 +872,19 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 			lastTS = seeded
 			seeding = true
 		} else {
-			var err error
-			fetched, err = catchUp(ctx, api, channel, owner, lastTS)
+			var (
+				err       error
+				truncated bool
+			)
+			fetched, truncated, err = catchUp(ctx, api, channel, owner, lastTS)
 			if err != nil {
 				return nil, nil, err
+			}
+			if truncated {
+				// More window than one pass can read. The cursor moves through
+				// what was delivered, so the next pass picks up from there —
+				// but only if something asks for one.
+				more = true
 			}
 		}
 
@@ -921,7 +949,10 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// reconnect or a refused message that arrived while history was in
 		// flight is a request this catch-up never saw, and clearing it would
 		// answer that request with a window that did not include it.
-		if !gapped {
+		// The epoch is compared again here, not just at the top: establishing a
+		// seed over a refusal asks for another pass of its own, and clearing
+		// the flag on the way past would answer that request with this window.
+		if !gapped && !more && !scan.skipped && epoch == b.catchUpEpoch {
 			b.needCatchUp = false
 		}
 	}
@@ -1001,6 +1032,14 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		b.lastTS = newest
 	}
 	for _, m := range threads {
+		if gapped && b.threadCursorWouldPassQueuedLocked(m) {
+			// Behind a gap the replies are deliberately still queued, and a
+			// thread cursor moved past one of them is a reply the next merge
+			// filters out as already seen. The cost of not moving it is that
+			// this reply comes back once more; the cost of moving it is that
+			// the other never does.
+			continue
+		}
 		b.noteThreadDeliveredLocked(m)
 	}
 
@@ -1064,6 +1103,21 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	})
 }
 
+// threadCursorWouldPassQueuedLocked reports whether recording m as delivered
+// would move its thread's cursor past a reply still waiting in the queue. The
+// caller must hold b.mu.
+func (b *Bridge) threadCursorWouldPassQueuedLocked(m Message) bool {
+	for _, queued := range b.pendingThreads {
+		if queued.Channel != m.Channel || queued.ThreadTS != m.ThreadTS {
+			continue
+		}
+		if !tsLess(m.TS, queued.TS) {
+			return true
+		}
+	}
+	return false
+}
+
 // oldestPendingLocked reports the timestamp of the oldest home message waiting
 // to be handed over, or empty if there is none. The caller must hold b.mu.
 func (b *Bridge) oldestPendingLocked() string {
@@ -1113,6 +1167,12 @@ func (b *Bridge) cursorWouldPassQueuedLocked(delivered []Message) bool {
 // on, and the write is left to whoever hands the messages over.
 func (b *Bridge) establishSeedLocked(channel, seed string, commit bool) {
 	if b.preSeedRefused {
+		// The refused messages are only recoverable by reading the window
+		// again, so the request for that must outlive this call: the drain
+		// that seeded is the one that would otherwise clear it.
+		b.needCatchUp = true
+		b.catchUpEpoch++
+
 		// The queue filled while the seed was being read, so messages were
 		// refused. They are newer than everything queued, and the queue is
 		// what the session has actually seen — so the cursor goes behind the
@@ -1188,9 +1248,9 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, generation uint64, cha
 // ever returns channel-surface messages, so a reply the owner typed inside a
 // thread while the bridge was away is invisible to it. The second pass goes
 // and finds those.
-func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
+func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Message, bool, error) {
 	if api == nil {
-		return nil, errors.New("the bridge is not connected to Slack")
+		return nil, false, errors.New("the bridge is not connected to Slack")
 	}
 
 	var (
@@ -1205,7 +1265,7 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 			Limit:   historyPageLimit,
 		})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		for _, c := range resp.Messages {
@@ -1222,11 +1282,15 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 
 	replies, err := catchUpThreads(ctx, api, channel, owner, after)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
+	// A cursor left over means the walk stopped at its page bound with more
+	// window behind it. The caller is told so it can come back: the cursor
+	// moves only through what was delivered, so another pass continues from
+	// there rather than starting again.
 	// History pages arrive newest-first; mergeMessages sorts and deduplicates.
-	return mergeMessages(after, messages, replies), nil
+	return mergeMessages(after, messages, replies), cursor != "", nil
 }
 
 // catchUpThreads recovers thread replies newer than the cursor.

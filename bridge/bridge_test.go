@@ -183,12 +183,28 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 		reversed = append(reversed, matched[i])
 	}
 
-	hasMore := false
-	if req.Limit > 0 && len(reversed) > req.Limit {
-		reversed = reversed[:req.Limit]
-		hasMore = true
+	// Paged the way Slack pages: a cursor into the newest-first list, and a
+	// next one whenever there is more behind the page being returned.
+	start := 0
+	if req.Cursor != "" {
+		parsed, err := strconv.Atoi(req.Cursor)
+		if err != nil {
+			return HistoryPage{}, fmt.Errorf("bad cursor %q", req.Cursor)
+		}
+		start = parsed
 	}
-	return HistoryPage{Messages: reversed, HasMore: hasMore}, nil
+	if start > len(reversed) {
+		start = len(reversed)
+	}
+	reversed = reversed[start:]
+
+	page := HistoryPage{Messages: reversed}
+	if req.Limit > 0 && len(reversed) > req.Limit {
+		page.Messages = reversed[:req.Limit]
+		page.HasMore = true
+		page.NextCursor = strconv.Itoa(start + req.Limit)
+	}
+	return page, nil
 }
 
 func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, error) {

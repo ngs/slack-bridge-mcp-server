@@ -1072,3 +1072,38 @@ func TestARefusalBeforeTheFirstCursorKeepsTheWindow(t *testing.T) {
 	}
 
 }
+
+// A catch-up that runs out of pages before it runs out of window has not
+// finished. The cursor moves through what it delivered, and it asks to come
+// back — without which the middle of a long backlog is never read.
+func TestATruncatedCatchUpAsksToComeBack(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000000"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	// More messages than one catch-up can page through.
+	history := make([]candidate, 0, maxHistoryPages*historyPageLimit+10)
+	for i := 0; i < cap(history); i++ {
+		history = append(history, ownerMsg(fmt.Sprintf("100.%06d", i+1), "backlog"))
+	}
+	api := &fakeAPI{
+		botUserID:       testBotUser,
+		repliesPageSize: historyPageLimit,
+		channelHistory:  map[string][]candidate{testChannel: history},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if msgs := waitOnce(ctx, t, b).Messages; len(msgs) == 0 {
+		t.Fatal("Wait() returned nothing, want the first pass of the backlog")
+	}
+	if !b.catchUpDue() {
+		t.Error("the catch-up stopped at its page bound without asking to come back; the rest of the backlog is never read")
+	}
+}

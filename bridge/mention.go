@@ -226,6 +226,9 @@ type scanChanges struct {
 	opened        []threadKey
 	closed        []threadKey
 	mentionCursor string
+	// skipped marks conversations left unread for want of budget. What they
+	// hold is still there, and only another catch-up will go and get it.
+	skipped bool
 }
 
 // commitScanLocked applies what the scan found. The caller must hold b.mu, and
@@ -320,6 +323,9 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 	}
 
 	if skipped > 0 {
+		// Asked for again, so "a later catch-up" is a promise rather than a
+		// hope: nothing else would bring one along.
+		scan.skipped = true
 		log.Printf("catch-up read %d conversation threads and skipped %d; replies in the skipped threads will arrive on a later catch-up",
 			walked, skipped)
 	}

@@ -83,10 +83,12 @@ func (b *Bridge) recordStateWriteLocked(w stateWrite) {
 		go b.writeState(b.store, b.stateWake, b.stopStateWrites, b.stateWritesDone)
 	}
 
-	if previous, ok := b.stateDirty[w.stateKey]; ok && previous.remove && !w.remove {
+	if previous, ok := b.stateDirty[w.stateKey]; ok && !w.remove {
 		// Given up on and opened again before either reached the file. The
-		// later one wins, as always, but it has to undo the first as well.
-		w.reopened = true
+		// later one wins, as always, but it has to undo the first as well —
+		// and the marker survives a third write on top, such as the cursor
+		// that follows the first reply in the reopened conversation.
+		w.reopened = previous.remove || previous.reopened
 	}
 	b.stateDirty[w.stateKey] = w
 	select {
@@ -136,6 +138,13 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 	flush := func() bool {
 		writes := b.takeStateWrites()
 		for i, w := range writes {
+			if b.stateFenced.Load() {
+				// Another session owns the file now. What is left is not
+				// written, and what it would have recorded is work done again
+				// after a restart — which is the smaller of the two costs.
+				b.requeueStateWrites(writes[i:])
+				return false
+			}
 			if err := applyStateWrite(store, w); err != nil {
 				b.noteStateWriteError(err)
 				// The batch stops here. What follows was ordered behind this
@@ -173,6 +182,14 @@ func (b *Bridge) writeState(store *Store, wake <-chan struct{}, stop <-chan stru
 			return
 		}
 	}
+}
+
+// fenceStateWriter tells the writer to stop writing, whatever it is in the
+// middle of. It is the last resort before the single-instance lock is released:
+// another session is about to own this file, and a write from this one landing
+// afterwards would overwrite what that session has since recorded.
+func (b *Bridge) fenceStateWriter() {
+	b.stateFenced.Store(true)
 }
 
 func applyStateWrite(store *Store, w stateWrite) error {
@@ -293,7 +310,25 @@ func (b *Bridge) stopStateWriter() bool {
 	case <-done:
 		return true
 	case <-timeout.C:
-		log.Printf("gave up waiting for the cursors to reach the state file")
-		return false
 	}
+
+	// It has had its time. From here nothing more may be written, because the
+	// lock that keeps two sessions off this file is about to be let go: the
+	// fence stops the next write, and a moment is given to whichever one is
+	// already in flight.
+	b.fenceStateWriter()
+
+	settle := time.NewTimer(stateWriteFenceWait)
+	defer settle.Stop()
+	select {
+	case <-done:
+	case <-settle.C:
+	}
+	log.Printf("gave up waiting for the cursors to reach the state file")
+	return false
 }
+
+// stateWriteFenceWait is how long shutdown gives a write already in flight to
+// finish, once the writer has been told to stop. One file write is all it can
+// be.
+const stateWriteFenceWait = time.Second
