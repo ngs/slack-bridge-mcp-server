@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,16 @@ func askBridge(ctx context.Context, t *testing.T) (*Bridge, *fakeAPI, *fakeStrea
 	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
 	t.Cleanup(func() { _ = b.Close() })
 	return b, api, stream
+}
+
+// waitForQuestion blocks until a question is up. It polls rather than using
+// eventually because it runs in a goroutine, and the test's own Fatalf belongs
+// to the test's goroutine; a question that never appears is caught by the test
+// timeout instead.
+func waitForQuestion(b *Bridge) {
+	for b.pendingAskTS() == "" {
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // click is the interaction Slack sends when the owner taps the option at index.
@@ -65,7 +76,11 @@ func TestAskReturnsTheClickedOption(t *testing.T) {
 	b, api, stream := askBridge(ctx, t)
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		// Once the question exists, not merely once some time has passed: a
+		// click with no question pending is answering nothing, and the pump
+		// that owns the socket says so straight away rather than leaving it on
+		// the channel for whoever asks next.
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 
@@ -114,7 +129,7 @@ func TestAskIgnoresClicksThatAreNotTheOwnerAnsweringThisQuestion(t *testing.T) {
 	b, api, stream := askBridge(ctx, t)
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		waitForQuestion(b)
 		// Someone else in the channel, then a click on a different message —
 		// a question from an earlier session, say, whose buttons are stale.
 		stream.interactions <- click("U0INTRUDER", askTS, 0)
@@ -132,9 +147,16 @@ func TestAskIgnoresClicksThatAreNotTheOwnerAnsweringThisQuestion(t *testing.T) {
 		t.Errorf("Ask() choice_index = %d on a timeout, want -1 so it cannot be read as the first option", result.ChoiceIndex)
 	}
 
-	resolutions := api.snapshotResolutions()
-	if len(resolutions) != 1 || !strings.Contains(resolutions[0].Text, "⌛") {
-		t.Errorf("resolutions = %+v, want the expired question rewritten once", resolutions)
+	// Waited for rather than asserted outright. A question that has run out of
+	// time has nothing left to watch its own retirement with, so the
+	// chat.update is sent and the call returns ahead of it; the buttons still
+	// go, which is what this is checking.
+	eventually(t, "the expired question to be rewritten", func() bool {
+		got := api.snapshotResolutions()
+		return len(got) == 1 && strings.Contains(got[0].Text, "⌛")
+	})
+	if got := len(api.snapshotResolutions()); got != 1 {
+		t.Errorf("the question was rewritten %d times, want once", got)
 	}
 }
 
@@ -154,6 +176,11 @@ func TestAskExpiresTheQuestionOnTimeout(t *testing.T) {
 		t.Fatalf("Ask() = %+v, want a bare timeout", result)
 	}
 
+	// The same wait, for the same reason: the retirement outlives a call with
+	// nothing left to watch it with.
+	eventually(t, "the expired question to be rewritten", func() bool {
+		return len(api.snapshotResolutions()) == 1
+	})
 	resolutions := api.snapshotResolutions()
 	if len(resolutions) != 1 {
 		t.Fatalf("Ask() resolved the question %d times, want 1", len(resolutions))
@@ -192,7 +219,7 @@ func TestAskRefusesASecondQuestionWhileOneIsPending(t *testing.T) {
 
 	// Once the first question is answered the slot is free again.
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 1)
 	}()
 	if _, err := b.Ask(ctx, AskRequest{Question: "And now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err != nil {
@@ -244,7 +271,7 @@ func TestAskInAThreadRestartsTheIndicatorInThatThread(t *testing.T) {
 	b, api, stream := askBridge(ctx, t)
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
@@ -435,7 +462,7 @@ func TestAskTakesAQueuedClickOverTheDeadline(t *testing.T) {
 	// Queue the click first, then give the question a deadline that has
 	// effectively already passed: both cases are ready at once.
 	go func() {
-		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
+		waitForQuestion(b)
 		stream.interactions <- click(testOwner, askTS, 0)
 	}()
 
@@ -525,7 +552,7 @@ func TestAskExpiresTheQuestionWhenTheStreamCloses(t *testing.T) {
 
 	go func() {
 		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
-		close(stream.events)
+		stream.closeEvents()
 	}()
 
 	if _, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: MaxWaitTimeout, ThreadTS: ""}); err == nil {
@@ -589,7 +616,7 @@ func TestAskReportsTheDisconnectionWhenTheClickChannelCloses(t *testing.T) {
 
 	go func() {
 		eventually(t, "the question to be posted", func() bool { return b.pendingAskTS() != "" })
-		close(stream.interactions)
+		stream.closeInteractions()
 	}()
 
 	done := make(chan error, 1)
@@ -681,5 +708,1567 @@ func TestInteractiveEnvelopesAreAcknowledgedAndTranslated(t *testing.T) {
 	}
 	if len(stream.interactions) != 0 {
 		t.Errorf("the unusable payload was queued as %d interaction(s), want 0", len(stream.interactions))
+	}
+}
+
+// The timeout a question is given is a promise about when the tool returns,
+// and the backlog it collects on the way out is made of Slack requests. One
+// that hangs used to hold the call open indefinitely: the wait for a turn at
+// catch-up was bounded and the request itself was not.
+func TestAQuestionAnswersOnTimeEvenWithSlackNotAnswering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+
+	// Connect first, so the question is asked on a live connection.
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack stops answering, and a catch-up is due — so the question's backlog
+	// collection has somewhere to hang.
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	type answered struct {
+		result AskResult
+		err    error
+	}
+	done := make(chan answered, 1)
+	go func() {
+		result, err := b.Ask(ctx, AskRequest{
+			Question: "ship it?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		})
+		done <- answered{result, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Ask() error = %v, want the ordinary timed-out answer", got.err)
+		}
+		if !got.result.TimedOut {
+			t.Errorf("Ask() = %+v, want it to report the timeout it promised", got.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ask() never came back: its own deadline did not bound the backlog it was collecting")
+	}
+}
+
+// A conversation the walk could not reach holds replies that are in neither
+// queue. A question asked over the top of them is a question the owner has
+// already answered somewhere else, so the walk that brings them counts as a
+// backlog — once per question, because it is a round trip.
+func TestAQuestionCollectsTheRepliesAWalkCouldNotReach(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	// More than two passes can reach, so one is still waiting by the time the
+	// question is asked: the first catch-up walks its budget, the last look
+	// behind it walks another, and one conversation is left.
+	cursors := map[threadKey]string{}
+	for i := 0; i < 2*maxThreadsPerCatchUp+1; i++ {
+		ts := "50.0000" + fmt.Sprintf("%02d", i)
+		if err := store.SetThread("CPROJ", ts, "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+		cursors[threadKey{"CPROJ", ts}] = "60.000000"
+	}
+	order := threadWalkOrder(cursors, nil)
+	target := order[len(order)-1] // the one a full walk skips
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		questionTS:     askTS,
+		postTS:         "100.000900",
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// The first catch-up reads what it has budget for and leaves one behind.
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The owner says something in one of those conversations, and the walk
+	// that would read it has run out of budget: the reply is in Slack, in
+	// neither queue, and only a walk will bring it.
+	api.mu.Lock()
+	api.replies = []candidate{
+		{Channel: "CPROJ", User: testOwner, Text: "said in the conversation the walk skipped", TS: "70.000000", ThreadTS: target.threadTS},
+	}
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.threadsSkipped = true
+	b.skippedThreads = map[threadKey]struct{}{target: {}}
+	b.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if len(result.Messages) != 1 || result.Messages[0].TS != "70.000000" {
+		t.Errorf("Ask() = %v, want the reply from the conversation the walk could not reach", texts(result.Messages))
+	}
+	// Handed over instead of the question, not alongside the timeout it would
+	// otherwise have run out to: the owner has already said something, and the
+	// question was about to talk over it.
+	if result.TimedOut {
+		t.Errorf("Ask() timed out with the reply attached, want the question interrupted by it")
+	}
+
+	// A wakeup that is not about conversations buys no walk. The walk is a
+	// round trip, and the question looks for skipped conversations once; after
+	// that only a walk that leaves some behind says so again, and each of those
+	// reads the set and shrinks it.
+	api.mu.Lock()
+	api.replies = nil
+	api.mu.Unlock()
+	b.mu.Lock()
+	b.threadsSkipped = true
+	b.skippedThreads = map[threadKey]struct{}{target: {}}
+	b.mu.Unlock()
+
+	reads := len(api.replyCallsSnapshot())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  time.Second,
+		}); err != nil {
+			t.Errorf("Ask() error = %v", err)
+		}
+	}()
+	waitForQuestion(b)
+
+	// Woken three times by something that is not a conversation: a loss
+	// marker, which wakes the subscribers and hands over no messages.
+	for i := 0; i < 3; i++ {
+		b.noteReactionsDropped()
+		time.Sleep(20 * time.Millisecond)
+	}
+	<-done
+
+	if got := len(api.replyCallsSnapshot()) - reads; got > maxThreadsPerCatchUp {
+		t.Errorf("the second question cost %d thread reads, want one walk at most", got)
+	}
+}
+
+// More conversations left unread than one walk can read. The first look brings
+// what it can reach, and the walk that leaves some behind says so again — so a
+// reply in the last of them interrupts the question rather than arriving with
+// the timeout it ran out to.
+func TestARepliesBeyondOneWalkStillInterruptTheQuestion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	// Enough that one walk cannot reach them all.
+	cursors := map[threadKey]string{}
+	for i := 0; i < 2*maxThreadsPerCatchUp+1; i++ {
+		ts := "50.0000" + fmt.Sprintf("%02d", i)
+		if err := store.SetThread("CPROJ", ts, "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+		cursors[threadKey{"CPROJ", ts}] = "60.000000"
+	}
+	order := threadWalkOrder(cursors, nil)
+	last := order[len(order)-1]
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		questionTS:     askTS,
+		postTS:         "100.000900",
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The owner says something in the conversation the walks reach last, and
+	// every conversation is waiting again.
+	api.mu.Lock()
+	api.replies = []candidate{
+		{Channel: "CPROJ", User: testOwner, Text: "beyond the first walk", TS: "70.000000", ThreadTS: last.threadTS},
+	}
+	api.mu.Unlock()
+
+	waiting := make(map[threadKey]struct{}, len(cursors))
+	for key := range cursors {
+		waiting[key] = struct{}{}
+	}
+	b.mu.Lock()
+	b.threadsSkipped = true
+	b.skippedThreads = waiting
+	b.mu.Unlock()
+
+	started := time.Now()
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut {
+		t.Errorf("Ask() timed out after %v, want the reply to interrupt it: one walk cannot reach every conversation", time.Since(started))
+	}
+	if len(result.Messages) != 1 || result.Messages[0].TS != "70.000000" {
+		t.Errorf("Ask() = %v, want the reply from the conversation the walks reach last", texts(result.Messages))
+	}
+}
+
+// The timeout a question is given covers the whole call, posting included. A
+// post is a Slack request like any other, and a clock started after it is one
+// the call can outlast without ever having waited for an answer.
+func TestAQuestionsTimeoutCoversThePostAsWell(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack takes its time over the post, and the question's own timeout is
+	// shorter than the bound posting would otherwise get.
+	api.mu.Lock()
+	api.questionDelay = time.Second
+	api.mu.Unlock()
+
+	started := time.Now()
+	_, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	})
+	took := time.Since(started)
+
+	if err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+	if took > 2*time.Second {
+		t.Errorf("Ask() took %v for a question given 300ms; posting is not bounded by the call's own timeout", took)
+	}
+}
+
+// A question whose post was given up on can still be standing in the channel,
+// with buttons nothing can answer: the timestamp that would retire it went
+// with the request. The next question looks for it.
+func TestAQuestionWhosePostWasAbandonedIsRetiredLater(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	// Known before the connection opens: the bridge reads its own user ID
+	// when it connects, and recognising its own message is what the search
+	// below turns on.
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = time.Second
+	api.mu.Unlock()
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  200 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+
+	// It landed after all, which is what an abandoned request does — and what
+	// Slack stored is not what was sent: the ampersand and the link have been
+	// rewritten, which is why the search does not go by the text.
+	landed := slackTS(time.Now())
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.channelHistory = map[string][]candidate{testChannel: {
+		// Older than the attempt, and answered: not this call's business.
+		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: "100.000300"},
+		{Channel: testChannel, User: testBotUser, Text: "ship it? see &amp; &lt;https://example.com&gt;", TS: landed, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+
+	// The next question looks for it before putting another one up.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		}); err != nil {
+			t.Errorf("Ask() error = %v", err)
+		}
+	}()
+	<-done
+
+	var retired, touchedOld bool
+	api.mu.Lock()
+	for _, u := range api.resolutions {
+		switch u.TS {
+		case landed:
+			retired = true
+		case "100.000300":
+			touchedOld = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("the question left standing by an abandoned post still has its buttons; a click on it answers nothing")
+	}
+	if touchedOld {
+		t.Error("a question from before the attempt was rewritten as expired")
+	}
+}
+
+// A click that settles a question at its deadline is an answer in hand. The
+// backlog collected on the way out has a budget of nothing left, and the
+// courtesy the timed-out path gets would spend it past the timeout the caller
+// asked for.
+func TestAQuestionAnsweredAtTheDeadlineStillReturnsOnTime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack stops answering history, and a catch-up is due — so the backlog
+	// collection has somewhere to hang.
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	api.mu.Unlock()
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	type answered struct {
+		result AskResult
+		err    error
+	}
+	done := make(chan answered, 1)
+	go func() {
+		result, err := b.Ask(ctx, AskRequest{
+			Question:          "ship it?",
+			Options:           []string{"yes", "no"},
+			Timeout:           400 * time.Millisecond,
+			InterruptDisabled: true,
+		})
+		done <- answered{result, err}
+	}()
+	waitForQuestion(b)
+
+	// Clicked as the question runs out.
+	started := time.Now()
+	time.Sleep(350 * time.Millisecond)
+	stream.interactions <- click(testOwner, askTS, 0)
+
+	select {
+	case got := <-done:
+		took := time.Since(started)
+		if got.err != nil {
+			t.Fatalf("Ask() error = %v", got.err)
+		}
+		if got.result.ChoiceIndex != 0 && !got.result.TimedOut {
+			t.Errorf("Ask() = %+v, want the answer or the timeout, not something else", got.result)
+		}
+		// Its own timeout and a moment, not its own timeout and a courtesy
+		// spent on a Slack that is not answering.
+		if took > 400*time.Millisecond+askLastLookWait/2 {
+			t.Errorf("Ask() took %v for a question given 400ms; a budget already spent bought another look", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ask() never came back: a question with nothing left of its budget still spent a courtesy on Slack")
+	}
+}
+
+// The search for a question an abandoned post may have left is inside the
+// question's own timeout, like everything else the call does: it may never have
+// landed, and looking for it is not worth the promise the caller was given.
+func TestTheSearchForAnAbandonedQuestionIsBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A question was given up on mid-post, and Slack has stopped answering
+	// history — which is where the search for it goes.
+	b.noteOrphanQuestion(testChannel, "", time.Now())
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	api.mu.Unlock()
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ask() error = %v", err)
+		}
+		if took := time.Since(started); took > 300*time.Millisecond+askLastLookWait {
+			t.Errorf("Ask() took %v for a question given 300ms; the search for the abandoned one is not inside the timeout", took)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ask() never came back: the search for a question that may never have landed is not bounded at all")
+	}
+}
+
+// A question that has already been answered is not an abandoned one. What
+// Slack shows for a live question is its text and nothing else; a retired one
+// carries what retired it after that, so the match is exact.
+func TestAnAnsweredQuestionIsNotMistakenForAnAbandonedOne(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Inside the window the search looks at, and already answered: the mark
+	// under it is what says so.
+	attempted := time.Now()
+	answeredTS := slackTS(attempted.Add(time.Millisecond))
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: answeredTS},
+	}}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  200 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, r := range api.resolutions {
+		if r.TS == answeredTS {
+			t.Error("a question the owner had already answered was rewritten as expired")
+		}
+	}
+}
+
+// A question asked inside a conversation is looked for there. A reply is in no
+// channel history, so searching the channel would never find it.
+func TestAnAbandonedQuestionInAThreadIsLookedForInTheThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	api.mu.Lock()
+	// A long conversation, with the abandoned question at the end of it.
+	api.replies = nil
+	for i := 0; i < 50; i++ {
+		api.replies = append(api.replies, candidate{
+			Channel: testChannel, User: colleague, Text: "chatter",
+			TS: fmt.Sprintf("100.0006%02d", i), ThreadTS: "100.000500",
+		})
+	}
+	api.replies = append(api.replies, candidate{
+		Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, ThreadTS: "100.000500",
+		HasAskButtons: true,
+	})
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "100.000500", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  200 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	var retired bool
+	api.mu.Lock()
+	for _, r := range api.resolutions {
+		if r.TS == orphanTS {
+			retired = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("the question left in a conversation still has its buttons; the search looked in the channel, where a reply never is")
+	}
+}
+
+// Nothing is posted by a call that has already run out of time. The search for
+// an abandoned question can spend the whole of a short timeout, and putting
+// buttons in the channel for a call that is over is worse than not asking.
+func TestNoQuestionIsPostedWithNoTimeLeft(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The search for the abandoned question takes longer than the question
+	// about to be asked has to live.
+	b.noteOrphanQuestion(testChannel, "", time.Now())
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.historyGate = gate
+	posted := len(api.questions)
+	api.mu.Unlock()
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		close(gate)
+	}()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if !result.TimedOut {
+		t.Errorf("Ask() = %+v, want the timeout it had already spent", result)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.questions) != posted {
+		t.Error("a question went up for a call that was already over; its buttons answer nobody")
+	}
+}
+
+// The search for an abandoned question and the retirement that follows it are
+// one budget between them, not one each. A Slack that answers the first slowly
+// and the second not at all would otherwise hold the question that paid for
+// both.
+func TestRetiringAnAbandonedQuestionIsInsideTheSameBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	history := make(chan struct{})
+	resolve := make(chan struct{})
+	defer close(resolve)
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.historyGate = history
+	api.resolveGate = resolve
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	// The search answers late, and the retirement never does.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		close(history)
+	}()
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  time.Second,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ask() error = %v", err)
+		}
+		if took := time.Since(started); took > time.Second+askLastLookWait {
+			t.Errorf("Ask() took %v for a question given a second; the search and the retirement each took a budget of their own", took)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Ask() never came back: retiring the abandoned question is not inside the budget the search shares")
+	}
+}
+
+// What identifies an abandoned question is the block the bridge puts its
+// buttons in, not "the newest thing I posted". After a post that failed the
+// bridge posts other things — the indicator saying it is working, the reply to
+// whatever prompted the question — and expiring one of those rewrites a message
+// the owner is reading.
+func TestOnlyAQuestionIsRetiredAsAnAbandonedOne(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	laterTS := slackTS(attempted.Add(2 * time.Millisecond))
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+		// Posted after it, by the bridge, and not a question: the indicator,
+		// or an answer the agent gave.
+		{Channel: testChannel, User: testBotUser, Text: "⏳ Working… (0s)", TS: laterTS},
+	}}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	var retiredOrphan bool
+	for _, r := range api.resolutions {
+		switch r.TS {
+		case orphanTS:
+			retiredOrphan = true
+		case laterTS:
+			t.Error("a message the bridge posted after the question was rewritten as an expired question")
+		}
+	}
+	if !retiredOrphan {
+		t.Error("the abandoned question was not retired")
+	}
+}
+
+// The moment of the attempt is this machine's clock and the timestamps are
+// Slack's, and both ends of a window are exclusive. A question posted in the
+// same instant must not fall outside a window cut to it.
+func TestAnAbandonedQuestionIsFoundDespiteTheClocksDisagreeing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack's clock is a moment behind this one: the question it stored is
+	// stamped before the attempt was made.
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(-200 * time.Millisecond))
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	var retired bool
+	api.mu.Lock()
+	for _, r := range api.resolutions {
+		if r.TS == orphanTS {
+			retired = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("a question stamped a moment before the attempt was outside the window; the clocks are not the same one")
+	}
+}
+
+// A channel that has been busy since the attempt fills the newest end of the
+// page, which is the end history counts its limit from. The window has an
+// upper end for that: as long after the attempt as the post could have taken,
+// and no longer.
+func TestAnAbandonedQuestionIsFoundBehindABusyChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	history := []candidate{
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}
+	// Twenty-five messages from everybody else, after it and well past the
+	// window's far end.
+	for i := 0; i < 25; i++ {
+		history = append(history, candidate{
+			Channel: testChannel, User: colleague, Text: "chatter",
+			TS: slackTS(attempted.Add(askPostTimeout + orphanClockSlack + time.Duration(i+1)*time.Second)),
+		})
+	}
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: history}
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	var retired bool
+	api.mu.Lock()
+	for _, r := range api.resolutions {
+		if r.TS == orphanTS {
+			retired = true
+		}
+	}
+	api.mu.Unlock()
+	if !retired {
+		t.Error("the abandoned question was behind a busy channel's later traffic; the window has to have a far end as well as a near one")
+	}
+}
+
+// A retirement that runs out of time is worth trying again, and a question
+// that cannot be reached is not worth every later question's budget. Three
+// goes, and a refusal from Slack is not one of them.
+func TestAnAbandonedQuestionIsRetriedThreeTimesAndNoMore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	stuck := make(chan struct{})
+	defer close(stuck)
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	// The retirement never answers, which is what running out of time looks
+	// like from here.
+	api.resolveGate = stuck
+	api.mu.Unlock()
+
+	ask := func() {
+		t.Helper()
+		if _, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		}); err != nil {
+			t.Fatalf("Ask() error = %v", err)
+		}
+	}
+
+	b.noteOrphanQuestion(testChannel, "", attempted)
+	for i := 1; i <= maxOrphanAttempts; i++ {
+		ask()
+		if !b.hasOrphanQuestion() {
+			t.Fatalf("the abandoned question was let go of after %d tries, want %d", i, maxOrphanAttempts)
+		}
+	}
+	ask()
+	if b.hasOrphanQuestion() {
+		t.Errorf("the abandoned question is still being tried after %d goes; every later question pays for one that cannot be reached", maxOrphanAttempts)
+	}
+}
+
+// A refusal is not a timeout. Slack saying no to the retirement means the next
+// question has nothing to gain by asking again.
+func TestAnAbandonedQuestionRefusedIsNotRetried(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: slackTS(attempted.Add(time.Millisecond)), HasAskButtons: true},
+	}}
+	api.resolveErr = errors.New("cant_update_message")
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	if b.hasOrphanQuestion() {
+		t.Error("a retirement Slack refused is being tried again; the answer will be the same one")
+	}
+}
+
+// hasOrphanQuestion reports whether a question whose post was given up on is
+// still waiting to be retired.
+func (b *Bridge) hasOrphanQuestion() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.orphan != nil
+}
+
+// The search for an abandoned question is a round trip, and what it is looking
+// for is a question of the bridge's own still standing in the channel: the
+// same block id, the same channel, the same owner. Taps on those buttons are
+// not the next question's answer.
+//
+// What they must not do is take its answer's place. The buffer that holds
+// clicks during the posting window is small on purpose, and stale taps filling
+// it cost the owner the click they actually meant.
+//
+// Fail-first: with the pending question published when the call is accepted
+// rather than when its buttons go up, the taps below fill that buffer, the
+// owner's own click is dropped for want of room, and the question times out.
+func TestClicksOnAnAbandonedQuestionDoNotCrowdOutTheNextAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A post given up on, which is what leaves a question nobody can retire.
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+
+	const orphanTS = "100.000800"
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	// The owner, tapping the buttons that are still there, while the next
+	// question is out looking for them. Only that read has both ends of a
+	// window, which is what tells it apart from a catch-up.
+	api.beforeHistoryReturns = func(req HistoryRequest) {
+		if req.Latest == "" {
+			return
+		}
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, orphanTS, 0))
+		}
+	}
+	// And the click they mean, landing in the window where the new question
+	// exists in Slack but its timestamp has not come back.
+	api.beforeQuestionReturns = func() { b.routeInteraction(click(testOwner, askTS, 1)) }
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the owner's own click honoured as choice 1", result)
+	}
+}
+
+// A caller that gives up during that search has gone before anything of this
+// call's own exists. Posting a question for it would put buttons in the
+// channel for nobody — created and retired in the same breath, with a moment
+// in between where a tap answers a call that has ended.
+//
+// Fail-first: without the check between the search and the post, a second
+// question is posted here.
+func TestNoQuestionIsPostedForACallerWhoLeftDuringTheSearch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+	posted := len(api.snapshotQuestions())
+
+	askCtx, abandon := context.WithCancel(ctx)
+	defer abandon()
+
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: "100.000800", HasAskButtons: true},
+	}}
+	api.beforeHistoryReturns = func(req HistoryRequest) {
+		if req.Latest != "" {
+			abandon()
+		}
+	}
+	api.mu.Unlock()
+
+	if _, err := b.Ask(askCtx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  500 * time.Millisecond,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ask() error = %v, want the cancellation", err)
+	}
+	if got := len(api.snapshotQuestions()) - posted; got != 0 {
+		t.Errorf("%d question(s) posted for a caller that had already gone", got)
+	}
+}
+
+// The timeout covers the whole call, and taking the buttons away is part of
+// it. A chat.update that Slack is slow to answer must not hold the call past
+// the deadline it was given — and abandoning that update would leave the
+// buttons standing, on a question nothing else will ever go back for. Both are
+// kept by sending the request on its own and waiting for it only as long as
+// there is.
+//
+// Fail-first: with the retirement run inline and given a floor of its own, the
+// answered call below returns a second and a half after its deadline.
+func TestAnAnsweredQuestionReturnsOnTimeThroughASlowRetirement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	// Slack has taken the update and not answered it.
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.resolveGate = gate
+	api.mu.Unlock()
+
+	go func() {
+		waitForQuestion(b)
+		stream.interactions <- click(testOwner, askTS, 0)
+	}()
+
+	const timeout = 300 * time.Millisecond
+	started := time.Now()
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: timeout})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.ChoiceIndex != 0 {
+		t.Fatalf("Ask() = %+v, want the click", result)
+	}
+	if elapsed > timeout+askTimeoutSlack {
+		t.Errorf("Ask() took %v with a timeout of %v; the retirement held the answer past the deadline the caller was promised", elapsed, timeout)
+	}
+
+	// And the buttons still go, which is the half a bounded wait on its own
+	// would have given up.
+	close(gate)
+	eventually(t, "the question to be retired after Slack answers", func() bool {
+		for _, u := range api.snapshotResolutions() {
+			if u.TS == askTS {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// The same promise on the way out through an interruption. That path had a
+// detached five seconds of its own, so a slow chat.update there outran the
+// timeout by an order of magnitude rather than by a floor.
+//
+// Fail-first: with the interruption retiring the question on the detached
+// bound, the call below returns about five seconds late.
+func TestAnInterruptedQuestionReturnsOnTimeThroughASlowRetirement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.resolveGate = gate
+	api.mu.Unlock()
+	defer close(gate)
+
+	go func() {
+		waitForQuestion(b)
+		// The owner answering with words instead of a button.
+		stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: "100.001000", Channel: testChannel, User: testOwner, Text: "not either of those",
+		}}
+	}()
+
+	const timeout = 300 * time.Millisecond
+	started := time.Now()
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: timeout})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if !result.Interrupted {
+		t.Fatalf("Ask() = %+v, want the message to have interrupted the question", result)
+	}
+	if elapsed > timeout+askTimeoutSlack {
+		t.Errorf("Ask() took %v with a timeout of %v; the retirement held the owner's message past the deadline the caller was promised", elapsed, timeout)
+	}
+}
+
+// askTimeoutSlack is what a call is allowed over its own timeout: scheduling,
+// and the hand-off between the goroutine that notices and the one that
+// returns. It is deliberately far below the bounds the fixes above removed.
+const askTimeoutSlack = 125 * time.Millisecond
+
+// The answer path does two things with what is left of the timeout, one after
+// the other: it takes the buttons away and then collects what the owner said
+// while the question was up. A remainder measured once and used twice lets the
+// second start after the deadline has already passed.
+//
+// Fail-first: with the remainder captured before the retirement instead of
+// measured again after it, the drain below starts on a budget that is already
+// spent and the call returns about twice its timeout late.
+func TestTheBacklogAQuestionCollectsIsBoundedByWhatIsLeftAfterRetiring(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack answers neither the update that retires the question nor the
+	// history the backlog would be read from.
+	resolveGate, historyGate := make(chan struct{}), make(chan struct{})
+	api.mu.Lock()
+	api.resolveGate = resolveGate
+	api.historyGate = historyGate
+	api.mu.Unlock()
+	defer func() {
+		close(resolveGate)
+		close(historyGate)
+	}()
+
+	// Something to collect, so the drain is actually attempted.
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	go func() {
+		waitForQuestion(b)
+		stream.interactions <- click(testOwner, askTS, 0)
+	}()
+
+	const timeout = 300 * time.Millisecond
+	started := time.Now()
+	result, err := b.Ask(ctx, AskRequest{Question: "Deploy now?", Options: []string{"Yes", "No"}, Timeout: timeout, InterruptDisabled: true})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.ChoiceIndex != 0 {
+		t.Fatalf("Ask() = %+v, want the click", result)
+	}
+	if elapsed > timeout+askTimeoutSlack {
+		t.Errorf("Ask() took %v with a timeout of %v; the backlog was collected on a budget the retirement had already spent", elapsed, timeout)
+	}
+}
+
+// Taking the buttons away outlives the call that asked, so the question just
+// answered can still be tappable while the next one is going up. Taps on it
+// are not the next question's answer, and until that question's timestamp
+// comes back there is nothing to tell them apart by — so they fill the buffer
+// that covers the posting window and push out the click the owner meant.
+//
+// Fail-first: without remembering the question whose buttons were sent away,
+// the second question below times out with the owner's click discarded.
+func TestTapsOnTheQuestionJustRetiredDoNotCrowdOutTheNextAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	// Slack has taken the update that retires the first question and not
+	// answered it, so its buttons are still live when the second goes up.
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.resolveGate = gate
+	api.mu.Unlock()
+	defer close(gate)
+
+	go func() {
+		waitForQuestion(b)
+		stream.interactions <- click(testOwner, askTS, 0)
+	}()
+	if result, err := b.Ask(ctx, AskRequest{
+		Question: "Deploy now?",
+		Options:  []string{"Yes", "No"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil || result.ChoiceIndex != 0 {
+		t.Fatalf("first Ask() = %+v, err = %v, want the click", result, err)
+	}
+
+	const secondTS = "100.000710"
+	api.mu.Lock()
+	api.questionTS = secondTS
+	// The owner tapping the old question's buttons, which are still on their
+	// screen, and then the new one.
+	api.beforeQuestionReturns = func() {
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, askTS, 0))
+		}
+		b.routeInteraction(click(testOwner, secondTS, 1))
+	}
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "And now?",
+		Options:  []string{"Yes", "No"},
+		Timeout:  500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("second Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("second Ask() = %+v, want the owner's click on the new question honoured as choice 1", result)
+	}
+}
+
+// A search cut short by the caller giving up has learned nothing about the
+// question it was looking for. Treated as a permanent failure it would be the
+// worst of both: the buttons stay in the channel and no later question ever
+// looks for them again.
+//
+// Fail-first: without the put-back, the next question makes no windowed
+// history call at all.
+func TestAnAbandonedQuestionSurvivesASearchTheCallerGaveUpOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+
+	// It landed after all, at a moment inside the window the search cuts by.
+	orphanTS := slackTS(time.Now())
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+
+	// A question whose caller walks away while the search is in flight.
+	askCtx, abandon := context.WithCancel(ctx)
+	stuck := make(chan struct{})
+	api.mu.Lock()
+	// The search reaches Slack, the caller gives up, and the request comes
+	// back cancelled rather than with an answer.
+	api.historyGate = stuck
+	api.beforeHistoryReturns = func(req HistoryRequest) {
+		if req.Latest != "" {
+			abandon()
+		}
+	}
+	api.mu.Unlock()
+	if _, err := b.Ask(askCtx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  500 * time.Millisecond,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ask() error = %v, want the cancellation", err)
+	}
+	abandon()
+	close(stuck)
+
+	if !b.hasOrphanQuestion() {
+		t.Fatal("the abandoned question was forgotten by a search that never finished; its buttons stay in the channel and nothing looks for them again")
+	}
+
+	// And the next question does look, and does retire it.
+	api.mu.Lock()
+	api.beforeHistoryReturns = nil
+	api.historyGate = nil
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "still there?",
+		Options:  []string{"yes", "no"},
+		Timeout:  500 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	retired := false
+	for _, u := range api.snapshotResolutions() {
+		if u.TS == orphanTS {
+			retired = true
+		}
+	}
+	if !retired {
+		t.Error("the question left standing by an abandoned post still has its buttons")
+	}
+}
+
+// A question found by the search for an abandoned one is retired the same way,
+// and the same thing can go wrong with it: Slack may not take the update, or
+// may take its time over it, and those buttons are still on the owner's screen
+// while this call posts a question of its own. Taps on them are not its answer.
+//
+// Fail-first: without remembering what the search sent away, the taps below
+// fill the buffer that covers the posting window and the owner's own click is
+// dropped.
+func TestTapsOnAnAbandonedQuestionDoNotCrowdOutTheNextAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+
+	orphanTS := slackTS(time.Now())
+	// Slack never answers the update that would retire it, so its buttons stay
+	// live while the next question goes up.
+	stuck := make(chan struct{})
+	defer close(stuck)
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.resolveGate = stuck
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.beforeQuestionReturns = func() {
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, orphanTS, 0))
+		}
+		b.routeInteraction(click(testOwner, askTS, 1))
+	}
+	api.mu.Unlock()
+
+	// Generous, because the search and the retirement come out of it first.
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the owner's click on the new question honoured as choice 1", result)
+	}
+}
+
+// A call with no time left does not look for an abandoned question, and a call
+// with no connection cannot. Neither has learned anything about it, so neither
+// is the one to decide it is gone.
+//
+// Fail-first: without the put-back, one question asked with a timeout too
+// short to look is enough to forget the abandoned one for good.
+func TestAnAbandonedQuestionSurvivesACallWithNoTimeToLook(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+	if !b.hasOrphanQuestion() {
+		t.Fatal("setup: the abandoned post was not remembered")
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.mu.Unlock()
+
+	// A question whose timeout is already spent by the time it gets here. It
+	// says so and posts nothing.
+	if result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  -time.Second,
+	}); err != nil || !result.TimedOut {
+		t.Fatalf("Ask() = %+v, err = %v, want a timeout without posting", result, err)
+	}
+
+	if !b.hasOrphanQuestion() {
+		t.Error("the abandoned question was forgotten by a call that never looked for it; its buttons stay in the channel and nothing looks again")
+	}
+}
+
+// One call can send two questions' buttons away: the one it asks, and an
+// abandoned one the search finds on its way in. Remembering only the newer
+// forgets the other — and the other is the one whose update has been out
+// longest, so its buttons are the likelier of the two to still be tappable.
+//
+// Fail-first: with one slot, the abandoned question the third call finds
+// overwrites the question the second call timed out on, and taps on that one
+// crowd out the answer.
+func TestBothQuestionsRetiredByOneCallAreRecognised(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	// Slack refuses every chat.update, so no question's buttons ever actually
+	// go: they all stay tappable, which is the situation being described.
+	api.resolveErr = errors.New("slack would not take the update")
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// A post given up on, which is what leaves an abandoned question behind.
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+	orphanTS := slackTS(time.Now())
+
+	// The next call cannot finish looking for it, so it stays abandoned and
+	// the call after this one is the one that finds it.
+	stuck := make(chan struct{})
+	const timedOutTS = "100.000720"
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.questionTS = timedOutTS
+	api.historyGate = stuck
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+
+	// It asks anyway, and its own question times out — so its buttons are sent
+	// away, refused, and left live.
+	if result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  orphanSearchWait + 500*time.Millisecond,
+	}); err != nil || !result.TimedOut {
+		t.Fatalf("Ask() = %+v, err = %v, want a timeout", result, err)
+	}
+	if !b.hasOrphanQuestion() {
+		t.Fatal("setup: the abandoned question was not kept for the next call")
+	}
+
+	// Now the search can finish. This call retires the abandoned question as
+	// well as posting one of its own — and while it posts, the owner taps the
+	// question the call before it timed out on.
+	close(stuck)
+	const thirdTS = "100.000730"
+	api.mu.Lock()
+	api.historyGate = nil
+	api.questionTS = thirdTS
+	api.beforeQuestionReturns = func() {
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, timedOutTS, 0))
+		}
+		b.routeInteraction(click(testOwner, thirdTS, 1))
+	}
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "still there?",
+		Options:  []string{"yes", "no"},
+		Timeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the owner's click on the new question honoured as choice 1", result)
 	}
 }

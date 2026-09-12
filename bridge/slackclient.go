@@ -64,6 +64,7 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 		events:       make(chan StreamEvent, liveEventBuffer),
 		interactions: make(chan Interaction, liveInteractionBuffer),
 		reactions:    make(chan Reaction, liveReactionBuffer),
+		finished:     make(chan struct{}),
 		owner:        cfg.Owner,
 		botUserID:    auth.UserID,
 	}
@@ -202,17 +203,18 @@ func toCandidate(channel string, m slack.Message) candidate {
 	}
 
 	return candidate{
-		Channel:     channel,
-		User:        m.User,
-		BotID:       m.BotID,
-		SubType:     m.SubType,
-		Text:        m.Text,
-		TS:          m.Timestamp,
-		ThreadTS:    m.ThreadTimestamp,
-		Username:    username,
-		ReplyCount:  m.ReplyCount,
-		LatestReply: m.LatestReply,
-		Files:       toFiles(m.Files),
+		Channel:       channel,
+		User:          m.User,
+		BotID:         m.BotID,
+		SubType:       m.SubType,
+		Text:          m.Text,
+		TS:            m.Timestamp,
+		ThreadTS:      m.ThreadTimestamp,
+		Username:      username,
+		ReplyCount:    m.ReplyCount,
+		LatestReply:   m.LatestReply,
+		Files:         toFiles(m.Files),
+		HasAskButtons: hasAskButtons(m.Blocks),
 	}
 }
 
@@ -440,7 +442,11 @@ type socketModeStream struct {
 	events       chan StreamEvent
 	interactions chan Interaction
 	reactions    chan Reaction
-	owner        string
+	// finished closes when the consumer has stopped, before the channels it
+	// fills are closed: the bridge waits on it rather than on a timer, so a
+	// reaction queued between the last send and the close is still taken.
+	finished chan struct{}
+	owner    string
 	// reactionsDropped records that a reaction did not fit in the queue. It is
 	// sticky and read by the wait, which passes it to the agent: a lost vote
 	// that nobody is told about is a count quietly wrong, where one that is
@@ -470,6 +476,15 @@ func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
 // to handing a batch over.
 func (s *socketModeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
+// Finished closes when the consumer has stopped, before it closes the channels
+// it fills.
+func (s *socketModeStream) Finished() <-chan struct{} { return s.finished }
+
+// PendingOverflow reports a message refused for want of room and not yet
+// announced. The announcement is a StreamDropped event, and it cannot be made
+// until the channel that had no room has some.
+func (s *socketModeStream) PendingOverflow() bool { return s.dropped.Load() }
+
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
 	// Deferred calls run in reverse, so this closes reactions, then
 	// interactions, then events. The events channel is the one the bridge
@@ -478,8 +493,18 @@ func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Clien
 	defer close(s.events)
 	defer close(s.interactions)
 	defer close(s.reactions)
+	// Registered last, so it runs first: the bridge learns that nothing more
+	// is coming before the channels start closing. Everything already queued
+	// is still there to be taken — what this rules out is something arriving
+	// after the bridge has stopped looking.
+	defer close(s.finished)
 
-	ack := func(req socketmode.Request) { _ = client.Ack(req) }
+	// Acknowledged on the connection's context. slack-go's Ack uses a context
+	// of its own and blocks on a queue the sender goroutine drains — which has
+	// already stopped by the time this is being told to stop, so an Ack in
+	// that moment would never return and this loop would never close the
+	// channels it owns.
+	ack := func(req socketmode.Request) { _ = client.AckCtx(ctx, req.EnvelopeID, nil) }
 
 	for {
 		s.flushDropped()
@@ -499,13 +524,20 @@ func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Clien
 // flushDropped turns a recorded overflow into a StreamDropped event once the
 // consumer has made room, so the bridge still learns it needs to catch up.
 func (s *socketModeStream) flushDropped() {
-	if !s.dropped.Load() {
+	// Cleared before the send, not after it. The bridge asks this flag as well
+	// as reading the announcement, and between a successful send and a later
+	// clear it would see both — one refusal counted twice, and then a flag
+	// left standing that swallows the next announcement whole.
+	//
+	// Put back if the send does not land, which is the only thing the flag was
+	// ever for.
+	if !s.dropped.CompareAndSwap(true, false) {
 		return
 	}
 	select {
 	case s.events <- StreamEvent{Kind: StreamDropped}:
-		s.dropped.Store(false)
 	default:
+		s.dropped.Store(true)
 	}
 }
 
@@ -685,6 +717,23 @@ func reactionFromItem(user, emoji, eventTS string, item slackevents.Item, added 
 		Added:    added,
 		EventTS:  eventTS,
 	}, true
+}
+
+// hasAskButtons reports whether these blocks are a question of the bridge's
+// with its buttons still on it.
+//
+// The block id is the bridge's own, put there when the question is posted, and
+// retiring a question replaces the block list — so a question that has been
+// taken away no longer has one. That makes this both "mine" and "still live"
+// in a single look, without reading a word of the text.
+func hasAskButtons(blocks slack.Blocks) bool {
+	for _, block := range blocks.BlockSet {
+		action, ok := block.(*slack.ActionBlock)
+		if ok && action.BlockID == askBlockID {
+			return true
+		}
+	}
+	return false
 }
 
 // filesFromEnvelope recovers a message's attachments from the raw Socket Mode

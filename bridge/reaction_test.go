@@ -3,7 +3,6 @@ package bridge
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -409,6 +408,9 @@ type olderConnector struct {
 }
 
 func (c olderConnector) Connect(context.Context, Config) (API, Stream, error) {
+	// Deliberately not closed with its connection: this stands in for a
+	// connector written before any of this, and the pump's wait for the close
+	// is bounded precisely so one like it cannot hold shutdown up.
 	return c.api, c.stream, nil
 }
 
@@ -507,7 +509,7 @@ func TestBufferedReactionsSurviveTheStreamClosing(t *testing.T) {
 		b, _, stream := mentionBridge(ctx, t)
 
 		react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
-		close(stream.events)
+		stream.closeEvents()
 
 		// Generous, because both of the outcomes below are reached at once:
 		// a short deadline could fire first on a slow machine and say nothing
@@ -603,14 +605,15 @@ func TestADroppedReactionIsReportedToTheAgent(t *testing.T) {
 	b, _, stream := mentionBridge(ctx, t)
 	stream.reactionsDropped.Store(true)
 
-	// Nothing else to hand over: a timeout is exactly when the loss would
-	// otherwise go unmentioned.
+	// Nothing else to hand over, so the loss is the whole of what there is to
+	// say — and it is said straight away rather than at the end of a poll the
+	// agent is spending on a count it cannot know is wrong.
 	result := waitOnce(ctx, t, b)
-	if !result.TimedOut {
-		t.Fatalf("Wait() = %+v, want a timeout", result)
-	}
 	if !result.ReactionsDropped {
-		t.Error("reactions_dropped = false after the queue overflowed; the agent is left counting a tally it cannot know is wrong")
+		t.Fatalf("Wait() = %+v, want the loss reported", result)
+	}
+	if result.TimedOut {
+		t.Error("Wait() timed out with a loss to report, want it handed over as a delivery")
 	}
 
 	// And it is reported once: the record is cleared by the call that carried
@@ -678,7 +681,7 @@ func TestDrainingAClosedStreamMarksItDisconnected(t *testing.T) {
 	b, _, stream := mentionBridge(ctx, t)
 
 	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
-	close(stream.events)
+	stream.closeEvents()
 
 	_, _ = b.Wait(ctx, 5*time.Second)
 
@@ -696,10 +699,15 @@ func TestADroppedReactionSurvivesTheConnectionItWasLostOn(t *testing.T) {
 	b, _, stream := mentionBridge(ctx, t)
 
 	stream.reactionsDropped.Store(true)
-	close(stream.events)
+	stream.closeEvents()
 
-	_, _ = b.Wait(ctx, 5*time.Second)
-
+	// Whichever the call notices first — the loss or the closure — the loss is
+	// not what goes missing: either it comes back with this result, or it is
+	// still on the bridge for the next call.
+	result, err := b.Wait(ctx, 5*time.Second)
+	if err == nil && result.ReactionsDropped {
+		return
+	}
 	if !b.droppedReactionMark() {
 		t.Error("the record of a lost reaction died with the connection; the agent would never learn its count is wrong")
 	}
@@ -749,89 +757,15 @@ func TestADroppedReactionIsRescuedWhicheverChannelClosesFirst(t *testing.T) {
 	// does: the events channel is the one a disconnection is reported from,
 	// and it is closed last.
 	stream.reactionsDropped.Store(true)
-	close(stream.interactions)
+	stream.closeInteractions()
 
-	if _, err := b.Wait(ctx, 5*time.Second); err == nil {
-		t.Fatal("Wait() = nil error after the click channel closed, want the disconnection reported")
+	result, err := b.Wait(ctx, 5*time.Second)
+	if err == nil && !result.ReactionsDropped {
+		t.Fatal("Wait() = nil error and no loss after the click channel closed, want one or the other")
 	}
-	if !b.droppedReactionMark() {
+	if err != nil && !b.droppedReactionMark() {
 		t.Error("the loss died with the connection because a different channel closed first")
 	}
-}
-
-// Two calls read the same stream, and the one that takes the opening mention
-// off it is not always the one that absorbs it first. A reaction judged in that
-// instant looks out of scope and is not, so an unmatched one is held briefly
-// rather than dropped where it lands.
-func TestAnUnmatchedReactionIsHeldUntilItsScopeCanOpen(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	b, _, stream := mentionBridge(ctx, t)
-
-	// Judged with no conversation open anywhere: held, not delivered, not gone.
-	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
-	b.drainStreamReactions(stream.reactions)
-	if kept := b.drainReactions(); len(kept) != 0 {
-		t.Fatalf("drainReactions() = %+v, want nothing delivered while no conversation is open", kept)
-	}
-	if b.deferredReactionCount() != 1 {
-		t.Fatal("the reaction was dropped where it landed; a mention a moment behind it would arrive too late")
-	}
-
-	// The mention lands, and the held reaction goes out with it.
-	send(stream, otherChannel, "200.000100", "", mention("ship it?"))
-	result := waitOnce(ctx, t, b)
-	if len(result.Messages) != 1 {
-		t.Fatalf("Wait() returned %v, want the mention", texts(result.Messages))
-	}
-	if len(result.Reactions) != 1 {
-		t.Fatalf("Wait() returned %+v, want the held reaction once its conversation is open", result.Reactions)
-	}
-}
-
-// The hold is brief, not for ever: a reaction that belongs nowhere is let go
-// when it expires, or the list would grow with every emoji in every channel the
-// bot is in.
-func TestAnUnmatchedReactionIsLetGoWhenItsHoldExpires(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	b, _, stream := mentionBridge(ctx, t)
-
-	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
-	b.drainStreamReactions(stream.reactions)
-
-	b.drainReactions()
-	if b.deferredReactionCount() != 1 {
-		t.Fatalf("held %d reactions after the first drain, want 1", b.deferredReactionCount())
-	}
-
-	// Wind the hold back rather than waiting it out.
-	b.expireHeldReactions()
-
-	b.drainReactions()
-	if b.deferredReactionCount() != 0 {
-		t.Errorf("held %d reactions after the hold expired, want it let go", b.deferredReactionCount())
-	}
-}
-
-// expireHeldReactions puts every hold in the past, so a test can see one let go
-// without waiting for the clock.
-func (b *Bridge) expireHeldReactions() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for i := range b.deferredReactions {
-		b.deferredReactions[i].expires = time.Now().Add(-time.Second)
-	}
-}
-
-// deferredReactionCount reports how many reactions are being held for another
-// round, for tests that need to see the grace period working.
-func (b *Bridge) deferredReactionCount() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.deferredReactions)
 }
 
 // A delivery carrying only reactions still reports an empty message array. A
@@ -854,120 +788,43 @@ func TestAReactionOnlyDeliveryStillCarriesAnEmptyMessageArray(t *testing.T) {
 	}
 }
 
-// A reaction with nowhere to be held is a reaction lost, and a lost one is
-// something the agent has to hear about: it might have come into scope before
-// its hold was up, and no history brings it back.
-func TestAnUnheldableReactionIsReportedAsDropped(t *testing.T) {
+// A call that gives up its turn at catch-up still hands over what the socket
+// already delivered, and a reaction is delivered on its own: nobody has to
+// have said anything for an emoji to be news. A hand-over that only looked at
+// the message queues would leave it there, and the call that was told "nothing
+// yet" was holding the answer all along.
+//
+// Fail-first: with the early return looking only at the two message queues,
+// the drain below comes back empty.
+func TestAHandOverWithoutReadingStillTakesTheReactions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	b, _, stream := mentionBridge(ctx, t)
-
-	// Fill the hold list with reactions that match nothing.
-	for i := 0; i < maxPendingReactions; i++ {
-		react(stream, otherChannel, fmt.Sprintf("200.%06d", i), colleague, "white_check_mark", true)
-		b.drainStreamReactions(stream.reactions)
-		b.drainReactions()
-	}
-	if b.deferredReactionCount() != maxPendingReactions {
-		t.Fatalf("held %d reactions, want the list full at %d", b.deferredReactionCount(), maxPendingReactions)
-	}
-
-	react(stream, otherChannel, "300.000100", colleague, "white_check_mark", true)
-	b.drainStreamReactions(stream.reactions)
-	b.drainReactions()
-
-	if !b.droppedReactionMark() {
-		t.Error("a reaction was discarded for want of room with nothing said; the agent would never know to re-read the tally")
-	}
-}
-
-// A hold covers one instant, not an open-ended wait for a conversation that
-// might turn up. One that has run out is let go even if the channel opens
-// later, or the grace period would be bypassed by a slow mention.
-func TestAnExpiredHoldIsNotRevivedByALaterMention(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	b, _, stream := mentionBridge(ctx, t)
-
-	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
-	b.drainStreamReactions(stream.reactions)
-	if kept := b.drainReactions(); len(kept) != 0 {
-		t.Fatalf("drainReactions() = %+v, want nothing while no conversation is open", kept)
-	}
-	b.expireHeldReactions()
-
-	// The conversation opens, but too late for that reaction.
-	send(stream, otherChannel, "200.000100", "", mention("ship it?"))
-	result := waitOnce(ctx, t, b)
-	if len(result.Messages) != 1 {
-		t.Fatalf("Wait() returned %v, want the mention", texts(result.Messages))
-	}
-	if len(result.Reactions) != 0 {
-		t.Errorf("Wait() returned %+v, want the expired hold let go rather than revived", result.Reactions)
-	}
-}
-
-// A blocked wait is woken when a conversation opens, because what is in scope
-// has just changed and a held reaction may have been waiting for exactly that.
-// Without it the call sits out its whole timeout with a vote in hand.
-func TestOpeningAConversationWakesABlockedWait(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	b, _, stream := mentionBridge(ctx, t)
-
-	// Connect and leave a reaction held, with no conversation open for it.
 	if result := waitOnce(ctx, t, b); !result.TimedOut {
 		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
 	}
-	react(stream, otherChannel, "200.000100", colleague, "white_check_mark", true)
-	b.drainStreamReactions(stream.reactions)
-	b.drainReactions()
-	if b.deferredReactionCount() != 1 {
-		t.Fatal("the reaction was not held, so there is nothing for the wakeup to deliver")
+
+	react(stream, testChannel, "100.000500", colleague, "white_check_mark", true)
+	eventually(t, "the reaction to reach the queue", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.reactionsWaitingLocked()
+	})
+
+	// Somebody else's request is out and this call cannot wait for it. The
+	// message queues are empty; the emoji queue is not.
+	b.catchUpSlot <- struct{}{}
+	defer func() { <-b.catchUpSlot }()
+
+	msgs, reactions, err := b.drainCatchUp(ctx, b.currentGeneration(), true, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
 	}
-
-	woken := make(chan WaitResult, 1)
-	go func() {
-		// Long enough that only a wakeup can end it early.
-		result, err := b.Wait(ctx, 20*time.Second)
-		if err != nil {
-			t.Errorf("Wait() error = %v", err)
-		}
-		woken <- result
-	}()
-
-	// The wait has to be blocked before the scope changes, or it would find the
-	// reaction in scope on its own first drain and prove nothing.
-	eventually(t, "the wait to start", func() bool { return b.activeWaitCount() > 0 })
-	time.Sleep(100 * time.Millisecond)
-
-	b.openThread(otherChannel, "200.000100")
-
-	select {
-	case result := <-woken:
-		if len(result.Reactions) != 1 {
-			t.Errorf("Wait() returned %+v, want the held reaction once its conversation opened", result.Reactions)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the wait was never woken; it would have sat out its whole timeout with the vote in hand")
+	if len(msgs) != 0 {
+		t.Errorf("messages = %+v, want none; nothing was said", msgs)
 	}
-}
-
-// activeWaitCount reports how many calls are listening, so a test can tell that
-// a wait has started before changing what it is waiting for.
-func (b *Bridge) activeWaitCount() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.activeWaits
-}
-
-// openThread registers a conversation the way a mention does, for tests that
-// need the scope to change while a call is blocked.
-func (b *Bridge) openThread(channel, threadTS string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.openThreadLocked(channel, threadTS)
+	if len(reactions) != 1 {
+		t.Fatalf("reactions = %+v, want the one the socket delivered; a wait that gave up its turn sits out its whole timeout with the answer already in the bridge", reactions)
+	}
 }

@@ -110,6 +110,15 @@ scanned window, replies included: the last thing anyone said is often a reply
 in an older thread, and a cursor set to the newest surface message would leave
 those replies looking new to the thread pass below.
 
+The seed is established in memory and written by whichever call commits, which
+leaves one case where nobody does: a call whose connection is replaced
+underneath it may not write, so it records a debt instead, and a session that
+ends before another call commits would take the debt with it. `Close` pays it.
+Left unpaid it is messages skipped rather than repeated — the state file stays
+unseeded, so the next process seeds again at whatever the channel's head is by
+then and treats everything sent in between as the channel's past, which is the
+one loss the seed exists to prevent.
+
 #### Thread replies need a second pass
 
 `conversations.history` returns the channel surface and nothing else: a reply
@@ -419,19 +428,13 @@ cases, for a conversation that was open by the time anybody looked.
 
 So the rule is the one that can be stated without reference to ordering: a
 reaction is delivered when the message it is on belongs to a conversation the
-session is in at the moment the batch is handed over. Draining messages before
-reactions is kept anyway, since a batch that carries both should carry them
-whole, but nothing depends on it any more.
+session is in at the moment the batch is handed over.
 
-One instant is still too small for that rule to catch on its own. Two calls read
-the same stream, and receiving a mention and absorbing it are not one step: for
-as long as it takes the receiving call to reach `absorb`, the thread that
-mention opens does not exist yet, and another call judging a reaction against
-the scope right then would find nothing. So a reaction that matches nothing is
-held for a couple of seconds rather than dropped where it lands, and judged
-again on the next drain. The window being covered is sub-millisecond; the hold
-is generous because the cost of holding is one entry in a bounded list, and the
-cost of not holding is a vote.
+The instant that rule cannot catch on its own — a mention received but not yet
+applied — is closed by the pump below, which applies a reaction and the messages
+ahead of it under one lock. A reaction still matching nothing at delivery is one
+Slack genuinely sent before the agent was part of the conversation, and that is
+not a live event to be recovered but a tally to be read.
 
 Both channels are optional halves of the `Stream` interface, reached by type
 assertion. `Stream`, `API` and `Connector` are exported, so requiring a new
@@ -439,13 +442,474 @@ method on them would break anything outside this repository that implements
 one; an implementation without the reaction half simply delivers no reactions,
 and `slack_reactions` says so rather than failing obscurely.
 
+### One goroutine owns the connection
+
+Every tool call reads bridge state. Nothing but the pump reads the socket.
+
+The pump is one goroutine per connection, started when the connection opens and
+ended when it closes. It owns all three stream channels — messages, clicks,
+reactions — receives from them, and writes what it receives into the bridge's
+own queues under the same lock every tool call uses. `slack_wait` and
+`slack_ask` never touch a stream channel.
+
+**Why.** Receiving an event and applying it are two steps, and while two callers
+both read the socket there is no way to make them one. A wait can take a mention
+off the events channel and be descheduled before it registers the thread that
+mention opens; a question running at the same time then judges a reaction
+against a scope that is about to change and finds nothing. The reaction was
+never out of scope — it was early by the width of a goroutine switch. Every fix
+that keeps two readers is a patch over that gap rather than a closure of it: a
+drain here, an ordering rule there, a grace period on top. With one reader,
+receive and apply happen in the same goroutine, and no other call can observe a
+state between them.
+
+**Queues.** The bridge already had most of them; the pump makes them the whole
+interface.
+
+| What arrives | Where the pump puts it | Who takes it |
+|---|---|---|
+| Owner message | `pending` / `pendingThreads` | the next `slack_wait`, or a settled `slack_ask` |
+| Reaction | `pendingReactions` | the next `slack_wait` |
+| Button click | routed straight to the pending question | the `slack_ask` waiting for it |
+| Reconnect or overflow | `needCatchUp` and `holeEpoch` | the next call to run catch-up |
+| Overflow the stream cannot announce yet | the same, asked of the stream | the next call to run catch-up |
+| A message refused for want of room | `needCatchUp` | the next call to run catch-up |
+| Conversations left unread for want of budget | `threadsSkipped` | the next call, which walks those and nothing else |
+| Disconnect | `connected`, cleared | whoever is blocked, as an error |
+
+Every write wakes the subscribers, so a call blocked on an empty queue hears
+about what another call's connection just received.
+
+Two invariants hold across all of it, whatever is arriving:
+
+- **The clicks are taken every turn.** They keep no order with anything, they
+  are the one thing no history can give back — a question whose answer is lost
+  times out — and the buffer they wait in is the smallest of the three. The
+  sweep empties it rather than leaving it to the select.
+- **Every cursor follows what was read, not only what was handed over.** A page
+  of somebody else's conversation has been read, in the home channel and in a
+  thread alike, and a cursor left behind it is the same messages fetched again
+  on every catch-up. The home channel's thread walk counts the same way: a
+  thread whose only newer reply is a colleague's hands nothing over, and left
+  out of how far the pass got, `latest_reply` goes on saying "news here" and
+  every later catch-up spends a round trip learning it again.
+- **The home cursor is a statement about channel history, so only the channel
+  surface sets it.** A thread reply is in no history page — whoever wrote it,
+  and whether the pass handed it over or merely read it — so it cannot say how
+  far history has been read. The walk reports its reach separately, and that
+  reach is bounded twice over. It is cut back to the moment the pass began,
+  because a reply posted while the walk was running is in none of the pages the
+  pass fetched and neither is a channel message posted in the same moment: a
+  cursor taken from the reply would step over that message for good. And it is
+  applied only when nothing has asked for another catch-up since the pass
+  started, which is what keeps it behind a message refused for want of room —
+  the refusal is what makes the cursor safe to move over the queue at all, and
+  it is safe only as far as this pass read. When something has asked, the pass
+  that answers it walks the same threads once more and moves the cursor then:
+  one extra read, with the delivered window keeping the replies from arriving
+  twice. The first pass of a session is normally one of those, since the socket
+  usually says hello after the window has been read — so the standing cost of
+  the deferral is one extra `conversations.replies` per connection for each
+  thread with a reply newer than the cursor, up to the same cap the walk itself
+  has. The two bounds do not stand in for each other, either: the second covers
+  only what the pass was told about while it ran, so an interruption that comes
+  to light after it has committed — a socket that died without saying so, a
+  first hello still on its way — leaves the first one holding alone, and that
+  one is taken from this machine's clock. It holds while that clock is not
+  running more than five seconds ahead of Slack's.
+- **The home cursor follows what a pass read, and stops at what it did not hand
+  over.** Every message in every page counts towards how far a read got, so a
+  page of somebody else's conversation moves the cursor past itself; a message
+  still waiting to be handed over stops it, and a pass thrown away by a hole
+  moves it nowhere at all.
+
+An overflow is the one thing the stream cannot simply hand over: it is announced
+as an event on the channel that had no room for one. So the pump asks the stream
+each time round whether it is holding a refusal it has not been able to report,
+rather than waiting to be told — between the refusal and the announcement the
+bridge would otherwise believe it had missed nothing, and a reaction judged in
+that window is judged against the conversations a message nobody saw would have
+opened. A reaction that matches nothing is held for the same reason: the catch-up
+recovers messages, and nothing recovers reactions.
+
+It is held for one catch-up, in a queue of its own, and then judged again. Still
+matching nothing, it is dropped without a word — it is somebody else's emoji in
+a channel the session is only sitting in, which is a tally rather than an event,
+and `slack_reactions` reads tallies. The separate queue is what keeps those from
+crowding out the reactions waiting to be delivered. When it is full the oldest
+goes, as everywhere else, and that one loss is reported: a reaction judged out
+of scope is a tally and says nothing, but one dropped for want of room was being
+kept because a catch-up might yet put it in scope, so what went may be a vote
+the agent would have been given. The line is between judging and running out of
+room — a marker set by every out-of-scope emoji in every channel the session is
+sitting in would mean nothing at all. One turn of grace applies even with no catch-up outstanding,
+because the moment between a refusal and its announcement is exactly the moment
+where nothing has been asked for yet.
+
+**Three reasons to go and look, and three flags.** A hole in the stream, a
+message refused for want of room, and conversations left unread for want of
+budget used to share one flag, and the third kept the other two permanently
+raised: a session with more open conversations than one pass can read ran a full
+catch-up on every wake, and held every unmatched reaction for ever. They are
+separate now. A hole moves `holeEpoch` as well as the catch-up stamp, which is
+what makes a pass that was reading while one opened throw its work away. A
+refusal moves only the stamp, so that pass may hand over what it read. Skipped
+conversations raise `threadsSkipped`, and what answers that is a walk through
+those conversations alone — not the window, not the search for mentions, and not
+the conversations the pass before it already read.
+
+Raising it wakes whoever is waiting, and a question counts it as a backlog: the
+replies those conversations hold are in neither queue, and a question asked over
+the top of them is one the owner has already answered somewhere else. A question
+looks for them once; after that, only a walk that leaves some behind says so
+again. Each of those walks reads the skipped set and nothing else, so the set
+shrinks by the budget every time and the waking stops after as many turns as it
+takes to empty it — a bound rather than a round trip per wakeup.
+
+**A connection's own hello is not a reconnect, and not nothing either.** Every
+connection announces itself once, and the catch-up for what was missed while the
+session was down is asked for where the connection is opened — so treating that
+hello as a hole discarded the first catch-up of every session. It is consumed
+instead, as long as that catch-up has not gone to Slack yet.
+
+Once it has, the same hello means something else. `Connect` returns before the
+socket is up, so a window read before the hello stops where it looked, and
+Socket Mode replays nothing: a message the owner sends between that read and the
+socket coming up is in history and nowhere else. The hello asks for one more
+read, as a refusal rather than a hole — nothing has been missed from the stream,
+so a catch-up in flight may still hand over everything it read; it only may not
+call the window finished.
+
+In practice that second pass is the normal case rather than the exception: the
+history request goes out the moment `Connect` returns, and the socket is usually
+slower than Slack. It costs one more window read per connection, and it is what
+covers a gap nothing else can. Making the first read wait for the hello instead
+— bounded, so a socket that never comes up cannot hold the session — would
+remove both the gap and the second pass, and is the obvious next thing to try.
+
+**Ordering.** Messages first, always: the pump applies everything waiting on the
+events channel before it will take a reaction at all, and it applies the pair it
+does take as one step, under one lock. Every sweep is bounded, so a flood cannot
+hold the lock indefinitely — and a sweep that comes back at its bound defers the
+reactions rather than applying them, since there may still be a mention behind
+what it took. A flood defers reactions and nothing else: clicks keep no order
+with messages, and shutdown is answered throughout. Both directions matter: whichever
+channel the select happens to pick, the other is already there, so a delivery
+that has both hands over both instead of splitting them across two calls on a
+coin toss. The ordering rule already existed, but it could not be relied upon
+while another goroutine might receive a message in the middle of it. In the pump
+it holds absolutely — a caller cannot see a reaction applied while a message that
+arrived before it has not been.
+
+**Backlog.** The socket's own buffer used to bound what was waiting, because
+nothing moved a message off it until a call asked. The pump moves every one, so
+the bound lives on the queue instead. What is already queued stays: the newest
+message is refused and a catch-up asked for, and since no cursor has moved,
+history still has it. The home channel and the conversations outside it are
+counted apart, so a flood in one cannot crowd out the other — and the replies
+outside the home channel are the ones that matter most here, because that
+catch-up is best effort and stands down entirely when a scope is missing.
+
+A delivery takes both queues in one step, under the lock. Two waits running
+together could otherwise split a pair the pump applied as one: the first takes
+the message and yields, the second takes the reaction that came with it, and
+each hands over half. A question is the exception — it collects the messages
+that arrived while it was up and has nowhere to put a reaction, so it leaves
+them for the wait that reports them.
+
+What a question collects is bounded by the question's own timeout, requests to
+Slack included. That timeout is a promise about when the tool returns, and a
+history call that hangs would otherwise outlast it; nothing is committed until
+the messages are in hand, so a collection cut short costs a round trip and no
+messages. The whole call is inside that promise: the clock starts before the
+question is posted, because posting is a Slack request like any other, and
+retiring the buttons on the way out is waited for only as long as is left of it.
+What is left is measured again at each step rather than once and reused: a
+settled question retires its buttons and then collects the backlog, and a
+remainder taken before the first would let the second start after the deadline
+had already passed. A budget already spent buys nothing — the quarter of a second
+a timed-out question gets for one last look belongs to the call that has run out
+of time and has nothing else to return.
+
+### Retiring a question outlives the call, so the timeout can be kept
+
+Taking the buttons away is a request of its own, and for a while it was the one
+place a call could outrun its own timeout: the request was made inline and given
+a floor of a second and a half, whatever the caller had left, because a
+chat.update abandoned before Slack answered would leave the buttons standing in
+the channel for good. A question the call owns is one nothing else will ever go
+back for.
+
+The two are not actually in tension once the request stops being the thing that
+is waited for. It is sent on a goroutine of its own, on a detached context, with
+the full bound it needs; the caller waits for it only as long as its own timeout
+allows and returns either way. The buttons go, the deadline holds, and the
+ordinary case is unchanged — Slack answers in well under the budget, so the
+owner still sees the answer written onto the question rather than a moment after
+it. `Close` waits for whatever is still in flight, bounded, so a process on its
+way out does not leave live buttons behind for the sake of the moment they had
+left to run.
+
+That is also what lets the interrupted path keep the promise. It used to retire
+the question on the same detached five seconds, so a slow chat.update held the
+owner's own message back by an order of magnitude more than the timeout they
+had asked for.
+
+The cost is that the question just answered can still be tappable while the
+next one is going up, so the bridge remembers the one whose buttons it last
+sent away and drops clicks on it. Until a new question's timestamp comes back
+there is nothing else to tell those taps apart by, and the buffer that holds
+clicks through the posting window is small: stale taps filling it would cost
+the owner the click they meant. One is enough to remember — anything older was
+retired by a call that had already returned before this one started.
+
+A post given up on can still land: the request was abandoned, not cancelled at
+Slack, and what is lost with it is the timestamp that could take the buttons
+away. The moment of the attempt is remembered instead, and the next question
+looks for what came after it before putting another up beside it — the bridge's
+own message, in the window since that moment, in the channel or in the
+conversation when the question was asked inside one.
+
+What identifies it is the block the bridge puts its buttons in, inside a window
+around the attempt. Not the text: what Slack stores is not what was sent — an
+ampersand becomes an entity, a bare link grows angle brackets — so a comparison
+that looked exact would quietly find nothing at all. And not "the newest thing
+this app posted" either, because after a post that failed the bridge posts other
+things: the indicator saying it is working, the reply to whatever prompted the
+question. The block id is on the question's buttons and nowhere else, and
+retiring a question replaces the block list — so it says both "mine" and "still
+live" in one look.
+
+The window has both ends and a margin at each. The moment of the attempt comes
+from this machine's clock and the timestamps come from Slack's, and both ends of
+a history window are exclusive, so a question posted in the same instant would
+fall outside a window cut to it. The far end is as long after the attempt as the
+post could have taken: history comes back newest first and counts its limit from
+that end, so a channel that has been busy since would otherwise fill the page
+with what came after.
+
+The search and the retirement that follows are one budget between them, inside
+the new question's timeout like everything else, and they can spend the whole of
+a short one: a call left with nothing does not post at all, and says it timed
+out. A question whose buttons are in the channel for a call that is already over
+is worse than a question never asked. If there is not enough left the question goes
+back on the shelf and the next call tries again, three times over before it is
+let go of; a Slack that refuses the retirement outright is not tried again at
+all. The search itself is put back on the same terms: a caller that gives up
+part-way through one, a search that runs out of budget, a call with no time to
+look or no connection to look with — none of them has learned anything about
+the question, and treating that as final would leave the buttons in the channel
+with nothing ever looking for them again.
+
+What the search does retire is remembered the same way a question the call owns
+is, before the request goes out and whether or not Slack takes it. Those
+buttons are on the owner's screen while this very call posts a question of its
+own, in the window where a tap on the old one cannot be told apart by
+timestamp.
+
+One thing it can get wrong, harmlessly: if the post never landed but an earlier
+question of the bridge's is still live inside the window — one whose own
+retirement failed — the search finds that one and expires it. It was a question
+nothing was going to answer either, so what it costs is a message saying it
+expired a little before it would have. That is what makes this different from
+retiring a question the call owns: this one is waited for inside the budget and
+put back on the shelf if it does not fit, because there is a next call to try
+again, and that one is sent whether or not there is time to watch it, because
+there is not.
+
+The search is also the one stretch of a call where the bridge has no question of
+its own. The pending question is published when its buttons are about to exist,
+not when the call is accepted — refusing a second `slack_ask` is a separate
+thing, held for the whole call, and does not have to be the same flag. The
+reason is the search itself: what it is looking for is a question of the
+bridge's own still standing in the channel, with the same block id, in the same
+channel, posted for the same owner. A tap on those buttons while the next
+question is being looked up is not the next question's answer, and the buffer
+that holds clicks through the posting window is small on purpose — stale taps
+filling it cost the owner the click they actually meant. With nothing published,
+those taps are dropped where they arrive. A caller that gives up during the
+search is answered there too, before a question goes up for nobody.
+
+A catch-up request carries an epoch. One already in flight went to Slack with
+the old window in mind, so it clears the flag only if nothing has asked again
+since it started; otherwise a reconnect, or a message refused for want of room,
+would be answered by a fetch that never knew about it.
+
+What such a fetch may hand over depends on what asked. A hole — a reconnect, an
+overflow, a stream that refused a message and could not say so — has no known
+position, so a catch-up that was reading while one opened cannot tell whether
+what it has belongs before it or after: it throws the whole pass away, queues
+and cursor untouched, and the next call reads the window with the hole already
+in the past. One round trip is the entire cost, and the pass was going to be
+repeated anyway.
+
+Once, though. A socket that flaps faster than a catch-up takes would otherwise
+throw every pass away, and a message the owner had already sent would wait in
+the queue for the flapping to stop. The second discard in a row hands over the
+queues and nothing else: those messages came off the socket, so no hole
+swallowed them. Nothing fetched is handed over while the storm lasts, and no
+cursor moves — which means the window is read again afterwards, and what comes
+back has been handed over already. That is what the record of delivered
+messages is for, and why the cursor is taken from what a pass *read* rather than
+from what it handed on: a pass that reads only messages it has already
+delivered still moves the cursor past them.
+
+The same hand-over answers a call that could not get its turn at catch-up at
+all. Another call's request is still out, and this one has its own deadline to
+keep; what is already in the queues came off this connection's socket and has
+nothing to do with that request, so it goes out and no cursor moves. The emoji
+queues count towards "already in the queues" as much as the message ones do. A
+reaction is delivered on its own — nobody has to have said anything for an
+emoji to be news — so a hand-over that looked only at the messages would leave
+a call sitting out its whole timeout with the answer already in the bridge.
+
+The conversations outside the home channel keep one more rule of their own. A
+conversation this pass could not reach — the walk ran out of budget before it —
+keeps its cursor whatever the pass hands over from it. The socket can deliver a
+reply in such a conversation while the walk is skipping it, and moving the
+cursor to that reply would step over every reply the walk was going to go back
+for, which is exactly what the skipped list promises to collect. So the reply is
+handed over and the cursor waits; the walk that reads that conversation is what
+moves it, even when everything it reads has been handed over already and it
+delivers nothing at all. A message this bridge refused for want of room is the other way
+round: the queue was full, so the refused message is newer than everything in
+it, and everything read alongside it is still good. That batch is handed over,
+the cursor moves, and the request stands for the message that did not fit.
+
+The distinction is what makes a full queue drain. Treating a refusal as a hole
+was absorbing: the queue was kept, so it stayed full, so the next live message
+was refused too, and every pass delivered the same window again while the queue
+it duplicated never emptied.
+
+**A stream says when it has stopped.** A connection ends by having its context
+cancelled, and the producer behind it is then somewhere between its last send
+and its close. The channels closing says it has finished, eventually; a stream
+that implements `StreamFinisher` says it sooner, by closing `Finished()` before
+it closes anything else.
+
+What that buys is time. A stream that says when it stops is waited for a step
+short of the wait shutdown spends on the pump itself — a second and three
+quarters against two seconds — because there is something definite to wait for,
+and because the wait has to end before the shutdown waiting on it gives up, or
+which of the two complains first is a matter of scheduling. One that says
+nothing gets a quarter of a second, because there is nothing to wait for beyond
+the channels closing and something has to bound a socket that will not. The difference is a reaction queued in that last moment,
+which has no history to be recovered from and which nothing else would go back
+for — and if the wait does run out on a stream that was supposed to say, the
+count is reported as short, because a producer still running is one that can
+still be holding something.
+
+Implementing it is optional, as with the reaction half and the overflow report:
+a stream that does not is waited for on the short timer, and a slow close there
+says nothing at all.
+
+**One writer for the state file.** Every cursor the bridge keeps — how far the
+home channel has been read, how far each conversation outside it has, how far
+the search for mentions has looked, and that a conversation is open at all — is
+recorded in memory and handed to a writer goroutine. Nothing writes that file
+from under `b.mu`, and that is the whole point of the arrangement: the file is
+read and rewritten whole, and `b.mu` is the lock the pump holds while it applies
+what the socket delivered — so a write beneath that lock would stop the only
+reader the connection has for as long as the disk took, and the click and
+reaction buffers behind it are the ones nothing can recover. Recording a cursor
+therefore never waits for a disk. It leaves a change in a map and returns, the
+writer picks it up on its own goroutine, and a write that fails is retried
+there rather than reported to the caller. One writer keeps the changes in the
+order they were made, and flushes what it has when the session ends — after the
+pump has stopped, so a cursor being recorded as the session ends still reaches
+the file.
+
+A cursor that does not land is kept and tried again. The file is replaced by a
+rename, and a rename can be refused for reasons that pass — another process
+holding it open, which on Windows is enough — so a refusal is a moment to wait
+out rather than a loss. What it would cost if it never landed is work repeated
+after a restart: a window read again, a conversation mentioned into again. Never
+a message, which is in Slack either way.
+
+**The catch-up outside the home channel stages what it finds.** A scan takes as
+long as Slack takes to answer, and it is the one part of catch-up that changes
+the bridge as it goes: a conversation opened by a mention it found, one given up
+on as unreadable, how far it looked. All three are true of the installation it
+ran with — a reinstall is what makes a thread readable or a mention visible — so
+they are collected and committed by the call that delivers, under the same
+generation check as everything else, or dropped with the batch.
+
+**Everything belongs to a connection.** The generation is not only the pump's:
+every call carries the one it started on, and a call whose connection has been
+replaced commits nothing — no cursor, no queue drained, no conversation opened
+or given up on. `Close` moves the generation too, so a call still in flight at
+shutdown cannot move a cursor that the writer, which is stopping, would no
+longer record. What a replaced call would have delivered, the replacement's own
+catch-up reads again; what it received and cannot pass on — reactions, which
+have no history — is reported as lost.
+
+**Lifetime.** A connection gets a context of its own, bounded by the session's.
+Cancelling it stops everything that connection started — the pump, and the
+Socket Mode goroutines the connector runs — and it is cancelled before a
+replacement connection starts and by `Close`. Cancelling is not instant: a pump
+can be inside a select with a buffered channel ready, so it also checks that its
+stream is still the bridge's before applying anything. A replaced connection
+cannot write into the queues, nor hold a socket open behind the reader that
+replaced it.
+
+`Close` stops the connection, waits for the pump, and only then stops the state
+writer. In that order, because a pump still running can record one more cursor,
+and a writer already stopped would leave it in a queue nobody is reading. Both
+waits are bounded: shutdown may be delayed by a slow disk and must not be
+prevented by one.
+
+**Bounds and backpressure.** The pump never blocks on anything slow. Applying an
+event takes the bridge lock for the length of a slice append; catch-up, which
+goes to Slack and back, stays in the calling goroutine where it always was, and
+the pump keeps draining the socket while it runs. Both queues are bounded, and what
+happens at the bound is what differs. A reaction past the cap is gone, and the
+agent is told so it can re-read the tally. A message past the cap is not: what
+is already queued stays where it is, the newest is refused, and a catch-up is
+asked for — which, since no cursor has moved, still has it. Refusing rather than
+discarding matters because the queue holds replies from conversations outside
+the home channel, and the catch-up that would find those again is best effort.
+
+**Cancellation before disconnection.** Cancelling a call cancels the session's
+context in the usual arrangement, which ends the pump, which reports that the
+connection is gone. A caller that gave up is told that it gave up: the
+disconnection is the consequence, not the cause, and only a call that is still
+running hears about it.
+
+**Catch-up.** Unchanged, and still in the caller. `drainCatchUp` merges what
+history returns with what the pump has queued, under the lock, so a message that
+arrives live while history is being fetched is deduplicated by timestamp exactly
+as before. A disconnection during catch-up is recorded by the pump and reported
+by the call when its drain comes back empty, so nothing already received is
+thrown away to report it.
+
+A catch-up that outlives its connection commits nothing: not the cursor, not the
+conversations it opened or gave up on, not the queues it would have merged.
+Everything it read came from the installation as it was, and a reinstall is
+exactly what changes which of it is visible; the replacement asks for its own
+catch-up on connect, and that one reads the window again.
+
+**What this removes.** The hold from the reaction work — an unmatched reaction
+kept for a couple of seconds in case the mention that opens its channel was a
+moment behind — was a workaround for precisely the gap the pump closes. It is
+gone, along with the deferred queue and its expiry. The rule it was propping up
+stands on its own now: a reaction is delivered when the message it is on belongs
+to a conversation the session is in as the batch is decided, and the only way to
+be early for that is for Slack to have genuinely sent the reaction first.
+Reactions that predate the agent being invited into a channel are not a live
+concern at all — they are a tally, and `slack_reactions` reads tallies.
+
+**What does not change.** Every tool's arguments and results are exactly as they
+were, including `reactions`, `reactions_dropped` and the disconnection error.
+The `Stream`, `ReactionStream`, `API` and `Connector` interfaces are untouched:
+the pump reads the same channels the two loops used to read between them.
+
 ### Whoever is blocked hears about the message
 
-Both loops read the same stream, so the call that takes a message off it is not
-necessarily the call that wants it. A wait drains the shared pending queue at
-the top of its loop and then blocks; a message a concurrent question absorbs
-after that lands in the queue with nothing left watching it, and the wait sits
-out its whole timeout with the message already in hand.
+The pump applies a message the moment it arrives, and the call that wants it may
+not be running yet, or may already be blocked. A wait drains the pending queue
+at the top of its loop and then blocks; a message the pump applies a moment
+later lands in the queue with nothing watching it, and the wait sits out its
+whole timeout with the message already in hand.
 
 So a blocked call subscribes, and whatever grows the queue wakes every
 subscriber. Every subscriber, not one of them: a wakeup delivered to a single
@@ -459,8 +923,13 @@ timeout. `timed_out: true` is an instruction to call again, so returning it
 alongside messages would be telling the agent to go back for what it has just
 been given; a wait that finds something at the bell reports a delivery instead.
 
-A question has a second problem underneath that one: it blocks the loop that
-would otherwise be collecting messages at all. Whatever arrives while it is up
+A question has to look as well as listen, for the same reason: the pump can
+apply a message — and send its notification — while the question is still being
+posted, before anything has subscribed to hear it. So it checks the backlog
+before it blocks, not only when it is woken.
+
+A question has a second problem underneath that one: it is not collecting
+messages while it waits. Whatever arrives while it is up
 is absorbed and then stranded until the next `slack_wait` — which, if the answer
 sends the agent off to work, is a long time. So every settled question drains
 the backlog and returns it in `messages`, through the same path a wait uses, so

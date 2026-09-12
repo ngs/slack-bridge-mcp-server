@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,6 +99,11 @@ type candidate struct {
 	// Files are the attachments the message carries, already narrowed to the
 	// fields the bridge reports.
 	Files []File
+	// HasAskButtons marks a message carrying the bridge's own question block:
+	// the buttons of a slack_ask, identified by the block id it puts on them.
+	// It is what the search for a question abandoned mid-post goes by, since
+	// the text cannot be relied on and the bridge posts other things.
+	HasAskButtons bool
 }
 
 // accept reports whether the candidate is owner text worth relaying, returning
@@ -199,6 +205,29 @@ func tsLess(a, b string) bool {
 	return aq < bq
 }
 
+// predecessorTS returns a timestamp just before ts, for use as an exclusive
+// bound that has to include ts itself.
+//
+// Slack's timestamps are a second count and a per-second sequence, and the
+// sequence is what moves between two messages in the same second. Stepping it
+// back by one is therefore the smallest step there is; at the start of a second
+// it goes to the end of the one before, which is earlier than anything in this
+// one and no earlier than it needs to be. A timestamp that does not parse is
+// returned unchanged, which costs a duplicate rather than a loss.
+func predecessorTS(ts string) string {
+	seconds, sequence, ok := splitTS(ts)
+	if !ok {
+		return ts
+	}
+	if sequence > 0 {
+		return fmt.Sprintf("%d.%06d", seconds, sequence-1)
+	}
+	if seconds == 0 {
+		return ts
+	}
+	return fmt.Sprintf("%d.%06d", seconds-1, 999999)
+}
+
 // splitTS breaks "seconds.sequence" into its two integer components.
 func splitTS(ts string) (seconds, sequence int64, ok bool) {
 	whole, frac, found := strings.Cut(ts, ".")
@@ -225,6 +254,59 @@ func splitTS(ts string) (seconds, sequence int64, ok bool) {
 // the same reconnect. Deduplicating here means the caller never sees it twice
 // no matter how the two races resolve. When after is empty, nothing is
 // filtered out by age.
+// messageDedupWindow bounds the memory of what has been handed over. It is the
+// same shape and size as the reaction one: enough to cover a redelivery, small
+// enough to be free.
+const messageDedupWindow = 1024
+
+// newestSurfaceTS reports the newest channel-surface timestamp in a batch,
+// skipping the replies it carries from inside threads, or empty when there are
+// none.
+//
+// The home cursor is a statement about what conversations.history has been
+// read to, and a thread reply is in no history page. It can also be newer than
+// anything the pass fetched — a reply posted while the thread walk was
+// running — so a cursor taken from one claims the channel has been read up to
+// a moment it has not. How far the walk reached is reported on its own, and
+// bounded on its own.
+//
+// It scans rather than taking the last: the batch is sorted by timestamp, and
+// the newest thing in it may well be one of the replies being skipped.
+func newestSurfaceTS(msgs []Message) string {
+	newest := ""
+	for _, m := range msgs {
+		if m.ThreadTS != "" && m.ThreadTS != m.TS {
+			continue
+		}
+		if tsLess(newest, m.TS) {
+			newest = m.TS
+		}
+	}
+	return newest
+}
+
+// deliveredKey identifies a message across connections. A timestamp is unique
+// within a channel, and a redelivered envelope carries the same one.
+func deliveredKey(m Message) string {
+	return m.Channel + "\x00" + m.TS
+}
+
+// mergeLive merges what history returned with what the socket delivered, and
+// filters only the first by the cursor.
+//
+// A live message is never filtered, because the cursor does not describe it. It
+// was received by this session, from the socket, and it has not been handed to
+// anybody: a cursor at or past its timestamp means history has been read that
+// far, which says nothing about whether this message was delivered. The case
+// that makes it matter is the seed — the cursor is taken from the newest
+// message in the channel, and a message posted while that read was in flight
+// can be older than it — but the rule holds generally, and a message the owner
+// sent to this session is not the channel's past.
+func mergeLive(after string, fetched, live []Message) []Message {
+	merged := mergeMessages(after, fetched)
+	return mergeMessages("", merged, live)
+}
+
 func mergeMessages(after string, sources ...[]Message) []Message {
 	seen := make(map[string]bool)
 	var merged []Message

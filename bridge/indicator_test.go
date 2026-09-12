@@ -38,6 +38,29 @@ func (f *fakeAPI) snapshotDeletes() []deleteCall {
 
 // eventually polls because the indicator's Slack calls happen on its own
 // goroutine: the tool call that starts or stops it returns first, by design.
+// stateFilePollInterval is how often a test may look at the state file while
+// the bridge's writer is replacing it.
+//
+// The store writes by rename, and Windows refuses to rename over a file another
+// handle has open — so a test reading it every couple of milliseconds is not
+// merely impatient, it is what stops the write from landing. This is slow
+// enough to leave the writer room.
+const stateFilePollInterval = 50 * time.Millisecond
+
+// eventuallyOnDisk is eventually for a condition that reads the state file.
+func eventuallyOnDisk(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(stateFilePollInterval)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
@@ -78,7 +101,12 @@ func indicatorBridgeWith(ctx context.Context, t *testing.T, history []candidate)
 	api := &fakeAPI{history: history, postTS: "100.000900"}
 
 	stream := newFakeStream()
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	// Without the socket's hello. These tests measure a race inside the
+	// indicator — the label waking its goroutine against the reply that ends
+	// the turn — and an extra event on the way in weighs the scheduler on one
+	// side of it. The race is the pre-existing flake these tests are known
+	// for, and it is not this connection's hello that causes it.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
 	t.Cleanup(func() { _ = b.Close() })
 	return b, api, stream
 }
@@ -614,4 +642,35 @@ func TestIndicatorSettingsFromTheEnvironment(t *testing.T) {
 			t.Errorf("timings = %v/%v, want them clamped to %v/%v", grace, interval, MaxIndicatorGrace, MaxIndicatorInterval)
 		}
 	})
+}
+
+// Close is the end of the session, and nothing starts after it. A call that
+// had already taken a batch can still be handing it over as Close returns, and
+// an indicator started there is a goroutine and a message in the channel that
+// outlive the shutdown that waited for everything else.
+func TestNoIndicatorStartsAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := indicatorBridge(ctx, t)
+	waitForMessages(ctx, t, b)
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	posts := len(indicatorPosts(api))
+
+	// What a delivery in flight does on its way out.
+	b.mu.Lock()
+	b.startIndicatorLocked(time.Now(), testChannel, "")
+	running := b.indicator != nil
+	b.mu.Unlock()
+
+	if running {
+		t.Error("an indicator started after the session ended")
+	}
+	time.Sleep(5 * testGrace)
+	if got := len(indicatorPosts(api)); got != posts {
+		t.Errorf("indicator posts = %d after Close, want the %d it had", got, posts)
+	}
 }

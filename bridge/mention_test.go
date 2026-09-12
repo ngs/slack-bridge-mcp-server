@@ -362,13 +362,9 @@ func TestTheFirstRunSeedsTheMentionCursorInsteadOfReplaying(t *testing.T) {
 		t.Errorf("Wait() on a first run returned %v, want the workspace's history left where it is", texts(msgs))
 	}
 
-	cursor, err := NewStore(cfg.StateDir).MentionCursor()
-	if err != nil {
-		t.Fatalf("MentionCursor() error = %v", err)
-	}
-	if cursor != "300.000100" {
-		t.Errorf("mention cursor = %q, want the newest message the scan saw", cursor)
-	}
+	eventuallyOnDisk(t, "the mention cursor to reach the state file", func() bool {
+		return storedMentionCursor(cfg.StateDir) == "300.000100"
+	})
 }
 
 // The search is bounded, because a workspace can hold hundreds of channels and
@@ -418,9 +414,16 @@ func TestTheMentionSearchIsBounded(t *testing.T) {
 		t.Errorf("the search read %d channels, want it capped at %d", len(scanned), maxScannedChannels)
 	}
 	// One more than the cap is asked for, because the home channel is skipped
-	// and would otherwise cost one of the twenty.
-	if got := api.joinedCalls; len(got) != 1 || got[0] != maxScannedChannels+1 {
-		t.Errorf("users.conversations calls = %v, want one asking for %d channels", got, maxScannedChannels+1)
+	// and would otherwise cost one of the twenty. Every time it is asked: the
+	// socket's hello brings a second pass, which reads the same way.
+	if len(api.joinedCalls) == 0 {
+		t.Fatal("the search never asked which channels the app is in")
+	}
+	for _, got := range api.joinedCalls {
+		if got != maxScannedChannels+1 {
+			t.Errorf("users.conversations calls = %v, want each asking for %d channels", api.joinedCalls, maxScannedChannels+1)
+			break
+		}
 	}
 }
 
@@ -436,10 +439,10 @@ func TestNoConversationOpensWithoutTheBotID(t *testing.T) {
 	api.botUserID = ""
 	api.mu.Unlock()
 
-	// Reconnecting is what makes the bridge read the ID again.
-	if err := b.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
+	// Reconnecting is what makes the bridge read the ID again. Close would do
+	// it too, but Close is the end of the session rather than the end of a
+	// connection, and nothing opens another one after it.
+	b.forceReconnect()
 
 	send(stream, otherChannel, "200.000100", "", mention("anyone home?"))
 	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
@@ -634,13 +637,12 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 		t.Fatalf("Wait() returned %v, want the mention", texts(msgs))
 	}
 
-	threads, err := NewStore(b.cfg.StateDir).Threads()
-	if err != nil {
-		t.Fatalf("Threads() error = %v", err)
-	}
-	if len(threads) != 1 {
-		t.Fatalf("Threads() = %+v, want the conversation recorded", threads)
-	}
+	// The state file is written by a goroutine of its own, off the paths that
+	// must not wait for a disk, so what is on disk arrives a moment later.
+	eventuallyOnDisk(t, "the conversation to reach the state file", func() bool {
+		threads, ok := storedThreads(b)
+		return ok && len(threads) == 1
+	})
 
 	// The thread has been deleted since.
 	api.mu.Lock()
@@ -652,11 +654,8 @@ func TestAnUnreadableThreadIsClosedForGood(t *testing.T) {
 		t.Errorf("Wait() returned %v from a thread that cannot be read, want nothing", texts(msgs))
 	}
 
-	threads, err = NewStore(b.cfg.StateDir).Threads()
-	if err != nil {
-		t.Fatalf("Threads() error = %v", err)
-	}
-	if len(threads) != 0 {
+	if !storedThreadsEventually(t, b, 0) {
+		threads, _ := storedThreads(b)
 		t.Errorf("Threads() = %+v, want the dead conversation forgotten on disk too", threads)
 	}
 }
@@ -691,9 +690,9 @@ func TestAnEmptyFirstScanStillRecordsThatItLooked(t *testing.T) {
 	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
 		t.Fatalf("Wait() returned %v from an empty workspace, want nothing", texts(msgs))
 	}
-	if cursor, err := NewStore(cfg.StateDir).MentionCursor(); err != nil || cursor == "" {
-		t.Fatalf("mention cursor = %q (err %v), want the scan to have recorded that it looked", cursor, err)
-	}
+	eventuallyOnDisk(t, "the scan to record that it looked", func() bool {
+		return storedMentionCursor(cfg.StateDir) != ""
+	})
 
 	// Now the owner mentions the app while the session is not listening.
 	sent := strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10) + ".000100"
@@ -707,5 +706,181 @@ func TestAnEmptyFirstScanStillRecordsThatItLooked(t *testing.T) {
 	msgs := waitFor(ctx, t, b)
 	if len(msgs) != 1 || msgs[0].TS != sent {
 		t.Fatalf("Wait() returned %v, want the first mention delivered rather than swallowed as history", texts(msgs))
+	}
+}
+
+// storedMentionCursor reads how far the state file says the scan has looked,
+// treating a read it cannot make as one to try again.
+func storedMentionCursor(dir string) string {
+	cursor, err := NewStore(dir).MentionCursor()
+	if err != nil {
+		return ""
+	}
+	return cursor
+}
+
+// storedThreads reads the conversations recorded in the state file.
+//
+// A read that fails is a read to try again, not a test failure: the file is
+// replaced by a rename, and on Windows a read landing in the middle of one is
+// refused outright. The caller is polling.
+func storedThreads(b *Bridge) ([]ThreadState, bool) {
+	threads, err := NewStore(b.cfg.StateDir).Threads()
+	if err != nil {
+		return nil, false
+	}
+	return threads, true
+}
+
+// storedThreadsEventually waits for the state file to hold want conversations.
+// The writer is a goroutine of its own — the paths that record a conversation
+// must not wait for a disk — so the file catches up a moment after the bridge
+// does.
+func storedThreadsEventually(t *testing.T, b *Bridge, want int) bool {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// The read has to have succeeded first: a refused one comes back empty,
+		// and an empty answer would satisfy a want of zero without proving that
+		// anything was ever written.
+		if threads, ok := storedThreads(b); ok && len(threads) == want {
+			return true
+		}
+		time.Sleep(stateFilePollInterval)
+	}
+	return false
+}
+
+// forceReconnect ends the current connection without ending the session, so the
+// next call opens another one. It is what a socket dropping does, without the
+// stream having to die with it.
+func (b *Bridge) forceReconnect() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopConnectionLocked()
+	// The generation moves with it, as it does on a real replacement.
+	// Cancelling a pump does not stop it the instant it is called, and without
+	// this the old one could still apply a buffered event afterwards — which
+	// is exactly what the bridge guards against and a test should not pretend
+	// away.
+	b.connGeneration++
+	b.connected = false
+}
+
+// A conversation that is already open keeps the cursor it has when a scan
+// finds another mention in it. Starting it at that mention steps over every
+// reply between where it had been read to and the mention — and the walk's own
+// cursor moves past them when the batch is delivered, so they are gone for
+// good.
+func TestAScanKeepsTheCursorOfAConversationAlreadyOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the home cursor: %v", err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatalf("seeding the mention cursor: %v", err)
+	}
+	// Open, and read as far as the message that opened it.
+	if err := store.SetThread(otherChannel, "200.000100", "200.000100"); err != nil {
+		t.Fatalf("seeding the conversation: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		joined:    []string{testChannel, otherChannel},
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "already answered")},
+			// A second mention in the same conversation, found by the scan.
+			otherChannel: {mentionInThread("200.000300", "200.000100", "still there?")},
+		},
+		replies: []candidate{
+			// Said between the cursor and that second mention.
+			replyIn(otherChannel, "200.000200", "200.000100", "the one in between"),
+			mentionInThread("200.000300", "200.000100", "still there?"),
+		},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	msgs := waitFor(ctx, t, b)
+	var seen bool
+	for _, m := range msgs {
+		if m.TS == "200.000200" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("Wait() = %v, want the reply between the conversation's cursor and the mention the scan found", texts(msgs))
+	}
+}
+
+// replyIn is a thread reply in a channel other than the home one.
+func replyIn(channel, ts, threadTS, text string) candidate {
+	c := reply(ts, threadTS, text)
+	c.Channel = channel
+	return c
+}
+
+// mentionInThread is a message in a thread that mentions the bot.
+func mentionInThread(ts, threadTS, text string) candidate {
+	c := reply(ts, threadTS, mention(text))
+	c.Channel = otherChannel
+	return c
+}
+
+// A conversation where somebody else has been talking has been read, whether
+// or not any of it was the owner's. Left behind, the same replies are fetched
+// again on every catch-up — so its cursor moves to the newest reply the walk
+// read, the way the home channel's does.
+func TestAConversationWithNoOwnerRepliesStillMovesItsCursor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the home cursor: %v", err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatalf("seeding the mention cursor: %v", err)
+	}
+	if err := store.SetThread(otherChannel, "200.000100", "200.000100"); err != nil {
+		t.Fatalf("seeding the conversation: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		joined:    []string{testChannel, otherChannel},
+		channelHistory: map[string][]candidate{
+			testChannel:  {ownerMsg("100.000100", "already answered")},
+			otherChannel: nil,
+		},
+		// Only a colleague has said anything since the cursor.
+		replies: []candidate{
+			{Channel: otherChannel, User: colleague, Text: "not for us", TS: "200.000200", ThreadTS: "200.000100"},
+		},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
+		t.Fatalf("Wait() = %v, want nothing: none of it is the owner's", texts(msgs))
+	}
+
+	b.mu.Lock()
+	cursor := b.threadCursors[threadKey{otherChannel, "200.000100"}]
+	b.mu.Unlock()
+	if cursor != "200.000200" {
+		t.Errorf("the conversation's cursor = %q, want the newest reply the walk read", cursor)
 	}
 }

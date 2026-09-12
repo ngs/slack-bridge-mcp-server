@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,6 +69,11 @@ type Bridge struct {
 	// the connection lives exactly as long as the MCP session.
 	ctx context.Context
 
+	// catchUpSlot serialises catch-up, which is the one place a call goes to
+	// Slack and back before committing. A channel rather than a mutex so that
+	// a caller waiting for its turn can give up when its own context does.
+	catchUpSlot chan struct{}
+
 	mu        sync.Mutex
 	api       API
 	stream    Stream
@@ -75,6 +81,10 @@ type Bridge struct {
 	lock      *Lock
 	connected bool
 	lastTS    string
+	// catchUpEpoch counts the requests. A catch-up clears needCatchUp only if
+	// the epoch has not moved since it started, so a request made while it was
+	// in flight survives it.
+	catchUpEpoch uint64
 	// needCatchUp is set on the first connect and on every reconnect. It is
 	// the flag that makes sleep/wake safe: whatever the WebSocket missed is
 	// still in Slack's history, and the next wait goes and gets it.
@@ -92,10 +102,12 @@ type Bridge struct {
 	// messages: no cursor applies to them, they are never merged with history,
 	// and a reaction older than the home cursor is still news.
 	pendingReactions []Reaction
-	// deferredReactions are reactions that matched no open conversation when
-	// they were judged, held briefly in case the mention that opens one is a
-	// moment behind them. See drainReactions.
-	deferredReactions []heldReaction
+	// heldReactions are the ones that matched no conversation while a catch-up
+	// was outstanding, waiting for the window that may explain them.
+	heldReactions []heldReaction
+	// catchUpRuns counts the catch-ups that have finished. It is how a held
+	// reaction knows its wait is over.
+	catchUpRuns uint64
 	// seenReactions and seenReactionOrder are the window of reactions already
 	// queued, against Slack redelivering an envelope it was not acknowledged
 	// for. They live here rather than on the stream because a reconnect
@@ -106,6 +118,15 @@ type Bridge struct {
 	// stream carries its own marker only as long as it lives, so a loss on a
 	// connection that then died would otherwise go unreported.
 	reactionsDropped bool
+	// stopConnection ends everything the current connection started: the pump
+	// that owns its stream, and the goroutines the connector runs behind it. It
+	// is replaced with each connection and called before the next one starts.
+	stopConnection context.CancelFunc
+	// connCtx is what stopConnection ends. A catch-up follows it as well as its
+	// own caller, so a fetch left behind by a connection that has been replaced
+	// gives up instead of holding the catch-up slot until the tool call that
+	// started it times out.
+	connCtx context.Context
 	// botUserID is this app's own user ID, which is what a mention looks like
 	// in message text. It is learned when the connection opens.
 	botUserID string
@@ -113,8 +134,123 @@ type Bridge struct {
 	// threadCursors is how far each of them has been read. Both are restored
 	// from the state file on connect, so a restart resumes a conversation
 	// instead of waiting to be mentioned again.
-	threads       map[threadKey]bool
-	threadCursors map[threadKey]string
+	threads map[threadKey]bool
+	// closed marks the bridge shut down, so a call still running cannot open a
+	// connection behind Close.
+	closed bool
+	// pendingFull and threadsFull keep each queue's overflow notice to one line
+	// per episode.
+	pendingFull bool
+	threadsFull bool
+	// deliveredMessages remembers what has been handed over, so a message the
+	// socket delivers twice is queued once.
+	//
+	// Slack retries an envelope it has not been acknowledged for, and the
+	// acknowledgement goes out before the message is put on the stream: a
+	// receipt lost on the way back brings the message round again, on this
+	// connection or the next. The cursor cannot answer for it — a live message
+	// is deliberately not filtered by the cursor, because on the run that
+	// seeds it the owner's message can be older than the seed — so what has
+	// actually been delivered is remembered instead.
+	deliveredMessages map[string]struct{}
+	deliveredOrder    []string
+	// orphan is a question whose post was abandoned before its timestamp came
+	// back. It may be standing in the channel with live buttons that nothing
+	// can answer, and the next question looks for it.
+	orphan *orphanQuestion
+	// holeDiscards counts the catch-ups thrown away in a row because a hole
+	// opened while they were reading. One is ordinary; a run of them is a
+	// socket flapping, and what it costs is the messages already queued.
+	holeDiscards int
+	// threadsSkipped marks conversations left unread for want of budget. It is
+	// its own flag rather than another meaning for needCatchUp: what it asks
+	// for is one more walk through the threads, not a re-read of the home
+	// channel and another scan for mentions — and left on needCatchUp it never
+	// cleared, so a session with more open conversations than one pass can read
+	// ran a full catch-up on every wake and held every out-of-scope reaction
+	// for ever.
+	threadsSkipped bool
+	// skippedThreads are the conversations the last walk could not reach, so
+	// the next one starts with them rather than with whatever the map yields
+	// first.
+	skippedThreads map[threadKey]struct{}
+	// connectAnnounced marks this connection's own hello as seen. The socket
+	// announces itself once per connection, after Connect has returned, and
+	// the catch-up that covers what was missed while the session was down is
+	// asked for when the connection is opened rather than when it says hello.
+	connectAnnounced bool
+	// connectHole is the hole count as this connection asked for its own
+	// catch-up. The hello that follows is that request arriving, and this is
+	// what says so: a count that has moved since means something else has
+	// happened, and the hello is not the only thing this connection has to
+	// answer for.
+	connectHole uint64
+	// fetchSinceConnect marks this connection's catch-up as already gone to
+	// Slack. After that a hello is worth a pass of its own: Connect returns
+	// before the socket is up, so a window read in between covers a stretch of
+	// time the socket was not yet relaying — and a message sent in that gap is
+	// in history and nowhere else.
+	fetchSinceConnect bool
+	// overflowNoted marks an overflow the stream is holding that has already
+	// been answered with a request to read the window again. The stream keeps
+	// reporting it until it has room to announce it, and this is what keeps
+	// the pump from raising a fresh hole on every look.
+	overflowNoted atomic.Bool
+	// holeEpoch counts the holes the live stream has been found to have: a
+	// reconnect, an overflow, a message the socket refused. It is stamped on a
+	// catch-up in flight the same way catchUpEpoch is, but it means something
+	// stronger — what that catch-up read cannot be trusted at all, because
+	// nobody knows where the hole is.
+	holeEpoch uint64
+	// seedUnwritten marks a seed established in memory by a call that could
+	// not write it — one whose connection was replaced underneath it. The next
+	// call to commit on the live connection writes it, whether or not it has
+	// anything of its own to record.
+	seedUnwritten bool
+	// cursorSeeded records that the home cursor has been established, which an
+	// empty channel does with an empty timestamp.
+	cursorSeeded bool
+	// preSeedRefused records that the queue overflowed before the cursor
+	// existed, so the seed read over it must not become the cursor.
+	preSeedRefused bool
+	// pumpDone closes when the current connection's pump has stopped. Close
+	// waits on it before the state writer is stopped, so a cursor the pump was
+	// in the middle of recording still reaches the file.
+	pumpDone chan struct{}
+	// stateDirty holds the cursor changes that have not reached the state file,
+	// keyed so that a later change to the same thing replaces an earlier one.
+	// Nothing writes that file from under b.mu: it is the lock the pump holds
+	// while it applies what the socket delivered, and a slow disk beneath it
+	// stops the only reader the connection has. stateWake tells the writer
+	// there is something to take, stopStateWrites tells it to flush and stop,
+	// and stateWritesDone closes once it has.
+	stateDirty map[stateKey]stateWrite
+	// stateWriteFailing keeps a failing state file to one line per episode.
+	stateWriteFailing bool
+	// stateWriteMu guards the fence and the write it fences, so that deciding
+	// a write may start and marking it as started are one step. Held for those
+	// two flags only, never across a write, and never together with b.mu.
+	stateWriteMu sync.Mutex
+	// stateWriting marks a write that is inside the store right now, so
+	// shutdown can wait out the one the fence was too late for.
+	stateWriting bool
+	// stateWriteAttempts counts the writes handed to the store, retries
+	// included. It exists so that a refused write can be seen to have been
+	// tried again rather than merely still queued.
+	stateWriteAttempts atomic.Uint64
+	// stateFenced stops the writer for good, whatever it is in the middle of.
+	// It is set when shutdown has waited as long as it can and is about to
+	// release the lock that keeps another session off this file. Guarded by
+	// stateWriteMu together with stateWriting: a write that has passed the
+	// fence has to be visible to whoever set it.
+	stateFenced bool
+	// stateClosed marks the writer as flushed and stopped, so a call still
+	// running at shutdown does not start another one behind it.
+	stateClosed     bool
+	stateWake       chan struct{}
+	stopStateWrites chan struct{}
+	stateWritesDone chan struct{}
+	threadCursors   map[threadKey]string
 	// mentionCursor is how far through time the search for missed mentions has
 	// looked.
 	mentionCursor string
@@ -143,6 +279,35 @@ type Bridge struct {
 	// is outstanding: a second question while one is pending is refused rather
 	// than queued, so a click is never ambiguous.
 	ask *pendingAsk
+	// askReserved says a call is on its way to asking, which is what refuses a
+	// second question. It is held from the moment the call is accepted, while
+	// ask itself is published only once the question is about to exist.
+	//
+	// The two are separate because they answer different questions. "May I
+	// ask?" is answered for the whole call; "is this click my answer?" must be
+	// no until there are buttons of this question's own to click — otherwise a
+	// click on an older question still standing in the channel is held as an
+	// early click and replayed against the message that replaces it.
+	askReserved bool
+	// retiredTS holds the questions whose buttons were last sent away, newest
+	// first. Those requests outlive the calls that made them, so the buttons
+	// can still be on the owner's screen while the next question is going up —
+	// and a tap on them is not the next question's answer, whether or not it
+	// has a timestamp of its own yet to be told apart by.
+	//
+	// Two of them, because one call can retire two: the question it asked, and
+	// an abandoned one the search found on its way in. One slot would let the
+	// second overwrite the first, and the first is the one whose update is
+	// likelier to be still in flight.
+	retiredTS [2]string
+	// retiring counts the chat.update calls taking a question's buttons away
+	// that are still in flight. They outlive the call that asked, so Close
+	// waits for them.
+	retiring sync.WaitGroup
+	// retireSealed stops Close's wait from racing a retirement started behind
+	// it. Set under the mutex, so a retirement that got its count in first is
+	// counted and everything after it is not.
+	retireSealed bool
 	// nameCache holds display names resolved for slack_history. It has its own
 	// lock, so a users.info call never happens under b.mu.
 	nameCache *nameCache
@@ -212,7 +377,138 @@ func New(ctx context.Context, cfg Config, connector Connector) *Bridge {
 	if connector == nil {
 		connector = SocketModeConnector{}
 	}
-	return &Bridge{ctx: ctx, cfg: cfg, connector: connector}
+	return &Bridge{
+		ctx:         ctx,
+		cfg:         cfg,
+		connector:   connector,
+		catchUpSlot: make(chan struct{}, 1),
+	}
+}
+
+// requestCatchUpLocked asks for the window to be re-read, and stamps the
+// request so a catch-up already in flight cannot answer it. The caller must
+// hold b.mu.
+//
+// The stamp is what stops a reconnect, an overflow or a refused message from
+// being swallowed: a catch-up that started before the request went to Slack
+// with the old window in mind, and clearing the flag on its way back would
+// leave nothing to fetch what it never asked for.
+func (b *Bridge) requestCatchUpLocked() {
+	b.needCatchUp = true
+	b.catchUpEpoch++
+	b.notifyPendingLocked()
+}
+
+// noteDeliveredLocked remembers a batch on its way to the agent. The caller
+// must hold b.mu.
+func (b *Bridge) noteDeliveredLocked(batches ...[]Message) {
+	for _, batch := range batches {
+		for _, m := range batch {
+			if m.TS == "" {
+				continue
+			}
+			key := deliveredKey(m)
+			if _, ok := b.deliveredMessages[key]; ok {
+				continue
+			}
+			if b.deliveredMessages == nil {
+				b.deliveredMessages = make(map[string]struct{}, messageDedupWindow)
+			}
+			b.deliveredMessages[key] = struct{}{}
+			b.deliveredOrder = append(b.deliveredOrder, key)
+			if len(b.deliveredOrder) > messageDedupWindow {
+				delete(b.deliveredMessages, b.deliveredOrder[0])
+				b.deliveredOrder = b.deliveredOrder[1:]
+			}
+		}
+	}
+}
+
+// undeliveredLocked drops the messages that have been handed over already. The
+// caller must hold b.mu.
+func (b *Bridge) undeliveredLocked(msgs []Message) []Message {
+	if len(b.deliveredMessages) == 0 || len(msgs) == 0 {
+		return msgs
+	}
+	kept := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if b.alreadyDeliveredLocked(m) {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return kept
+}
+
+// alreadyDeliveredLocked reports whether this message has been handed over
+// already. The caller must hold b.mu.
+func (b *Bridge) alreadyDeliveredLocked(m Message) bool {
+	if m.TS == "" {
+		return false
+	}
+	_, ok := b.deliveredMessages[deliveredKey(m)]
+	return ok
+}
+
+// requestCatchUpForHoleLocked asks for the window to be re-read because the
+// live stream has a hole in it: a reconnect, an overflow, a stream that has
+// refused a message and could not say so. The caller must hold b.mu.
+//
+// A hole is different in kind from a refusal, and the difference decides what a
+// catch-up in flight may do with what it read. Nobody knows where a hole is, so
+// a catch-up that was reading while one opened cannot tell whether what it has
+// belongs before or after it: it throws the lot away and goes again. A message
+// this bridge refused for want of room is the other way round — the queue was
+// full, so the refused message is newer than everything in it, and everything
+// read alongside it is still good.
+func (b *Bridge) requestCatchUpForHoleLocked() {
+	b.holeEpoch++
+	b.requestCatchUpLocked()
+}
+
+// requestCatchUpForRefusalLocked asks for the window to be re-read because a
+// queue was full. The caller must hold b.mu.
+//
+// The stamp moves for every refusal, as it does for every hole. What it buys
+// here is smaller and still necessary: a catch-up already in flight went to
+// Slack before this message was refused, so it may hand over everything it
+// read — the refused message is newer than all of it — but it may not clear the
+// flag, or nobody would go back for the one that did not fit.
+func (b *Bridge) requestCatchUpForRefusalLocked() {
+	b.requestCatchUpLocked()
+}
+
+// waitForPump waits for a pump to finish, briefly. Nothing about shutdown
+// should hang on it: the wait exists so a cursor being recorded reaches the
+// writer before the writer is told to stop, and that is the work of a moment.
+func waitForPump(done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	timeout := time.NewTimer(pumpStopWait)
+	defer timeout.Stop()
+	select {
+	case <-done:
+	case <-timeout.C:
+		log.Printf("gave up waiting for the connection reader to stop")
+	}
+}
+
+// pumpStopWait is how long shutdown waits for the pump to notice it is over.
+const pumpStopWait = 2 * time.Second
+
+// stopConnectionLocked ends the connection being replaced, if there is one: its
+// pump, and the Socket Mode goroutines under it. The caller must hold b.mu.
+//
+// It does not wait for any of them to notice. What matters is that nothing is
+// left reading a stream nobody is using, or holding a WebSocket open on a
+// connection that has been replaced.
+func (b *Bridge) stopConnectionLocked() {
+	if b.stopConnection == nil {
+		return
+	}
+	b.stopConnection()
+	b.stopConnection = nil
 }
 
 // Status is what slack_status reports.
@@ -266,6 +562,30 @@ func (b *Bridge) Status() Status {
 func (b *Bridge) Close() error {
 	b.mu.Lock()
 	b.connected = false
+	// A seed established in memory by a call whose connection was replaced is
+	// paid by whichever call commits next — and a session that ends first has
+	// no next call. Paid here instead, while the writer is still running and
+	// before the terminal flag that would refuse it.
+	//
+	// Unpaid it is messages skipped rather than repeated: the file stays
+	// unseeded, so the next process seeds again at whatever the channel's head
+	// is by then and treats everything sent in between as the channel's past.
+	b.writeSeedDebtLocked(b.cfg.Channel)
+	// No more retirements are tracked from here, so the wait below cannot race
+	// a goroutine being started behind it.
+	b.retireSealed = true
+	// Nothing is listening after this, so nothing should be reading the socket
+	// either — nor holding it open. The generation moves with it, so a call
+	// still in flight commits nothing on the way out: its cursor would be
+	// written by a writer that is stopping, and a cursor that moves without
+	// being written is messages skipped after a restart.
+	b.stopConnectionLocked()
+	b.connGeneration++
+	// Terminal from here. A call still running could otherwise reach ensure
+	// after this, open a connection, and leave a pump reading into a bridge
+	// whose state writer has stopped.
+	b.closed = true
+	pumpStopped := b.pumpDone
 	b.stopIndicatorLocked()
 	done := b.indicatorDone
 	lock := b.lock
@@ -280,6 +600,13 @@ func (b *Bridge) Close() error {
 
 	b.writePresence(presence)
 
+	// The pump first, then the writer it hands cursors to. In that order,
+	// because a pump still running can record one more — and a writer already
+	// stopped would leave it in a queue nobody is reading, which is a
+	// conversation the owner has to open again after a restart.
+	waitForPump(pumpStopped)
+	writerStopped, mayReleaseLock := b.stopStateWriter()
+
 	if done != nil {
 		timeout := time.NewTimer(shutdownIndicatorWait)
 		defer timeout.Stop()
@@ -290,16 +617,76 @@ func (b *Bridge) Close() error {
 		}
 	}
 
+	// A question's buttons are taken away by a request that deliberately
+	// outlives the call that asked it, so one can still be in flight here.
+	// Waited for, bounded, because the process is about to exit and a chat.
+	// update that never went out leaves buttons in the channel for good.
+	b.awaitRetirements()
+
 	if lock == nil {
 		return nil
 	}
+	if !writerStopped {
+		// The writer has been fenced: it will not write again, whatever it was
+		// holding. Said plainly because what it was holding is now work to be
+		// done again after a restart.
+		log.Printf("the state file writer was stopped before it finished; what it had not written will be read again after a restart")
+	}
+	if !mayReleaseLock {
+		// A write is still inside the store and cannot be called back. The
+		// lock is what keeps the next session from reading a file this one can
+		// still rewrite, so it is held until that write is over — and released
+		// from there rather than here, because an open file nobody refers to
+		// any more is closed by the runtime, and closing it releases the very
+		// lock being held.
+		go b.releaseWhenWritesEnd(lock)
+		return nil
+	}
 	return lock.Release()
+}
+
+// lockHoldReport is how long a lock is held for a write before the wait is
+// worth a line in the log. It is not a deadline: letting go while that write is
+// still running is the one thing the lock is being held for.
+const lockHoldReport = time.Minute
+
+// releaseWhenWritesEnd holds the single-instance lock until the write that
+// outlasted shutdown has finished, and only then lets it go. The reference
+// matters as much as the timing: an os.File that becomes unreachable is closed
+// by the runtime, and the close releases the lock.
+func (b *Bridge) releaseWhenWritesEnd(lock *Lock) {
+	// No deadline. A write still inside the store can rename the file at any
+	// moment, and the lock is the only thing standing between that rename and
+	// the session that would otherwise have taken this file over: giving up on
+	// the wait gives up on the guarantee. The wait ends when the write does,
+	// and if it never does the process is going nowhere either.
+	reported := false
+	started := time.Now()
+	for {
+		b.stateWriteMu.Lock()
+		writing := b.stateWriting
+		b.stateWriteMu.Unlock()
+		if !writing {
+			break
+		}
+		if !reported && time.Since(started) > lockHoldReport {
+			reported = true
+			log.Printf("a state file write has been running for over a minute; the single-instance lock is being held until it ends, so another session cannot start against this directory")
+		}
+		time.Sleep(stateWriteIdlePoll)
+	}
+	if err := lock.Release(); err != nil {
+		log.Printf("could not release the single-instance lock after the last state file write: %s", logSafe(err.Error(), maxLoggedError))
+	}
 }
 
 // ensure performs the lazy connect: validate configuration, take the
 // single-instance lock, load the persisted cursor, and open Slack. It is
 // idempotent. The caller must hold b.mu.
 func (b *Bridge) ensure() error {
+	if b.closed {
+		return errors.New("the bridge is shut down")
+	}
 	if b.connected {
 		return nil
 	}
@@ -328,6 +715,16 @@ func (b *Bridge) ensure() error {
 		}
 		b.lastTS = lastTS
 
+		// A cursor is one way of knowing the channel has been looked at; the
+		// mark is the other, and the only one an empty channel leaves. Without
+		// it a restart would seed again and take the first message posted
+		// while the session was down for the channel's past.
+		seeded, err := b.store.Seeded(b.cfg.Channel)
+		if err != nil {
+			return err
+		}
+		b.cursorSeeded = lastTS != "" || seeded
+
 		mentionCursor, err := b.store.MentionCursor()
 		if err != nil {
 			return err
@@ -339,10 +736,35 @@ func (b *Bridge) ensure() error {
 		}
 	}
 
-	api, stream, err := b.connector.Connect(b.ctx, b.cfg)
+	// The connection gets a context of its own, so that stopping it stops
+	// everything it started: the pump here, and the Socket Mode goroutines the
+	// connector runs. Bounded by the session's context, so the session ending
+	// still ends all of it.
+	// The old connection stops being the live one before it is cancelled, not
+	// after the replacement is open. Cancelling does not stop a pump the
+	// instant it is called, and a Connect that fails leaves no replacement to
+	// take over: between the two, an old pump that was still going would have
+	// been applying events as the live connection, and a catch-up in flight on
+	// it would have found itself current and handed back the cancellation of a
+	// connection nobody was waiting on any more.
+	if b.stopConnection != nil {
+		b.connGeneration++
+	}
+	b.stopConnectionLocked()
+	connCtx, stopConnection := context.WithCancel(b.ctx)
+
+	api, stream, err := b.connector.Connect(connCtx, b.cfg)
 	if err != nil {
+		stopConnection()
 		return err
 	}
+	b.stopConnection = stopConnection
+	b.connCtx = connCtx
+	// This connection has not said hello yet, has read nothing, and has thrown
+	// nothing away.
+	b.connectAnnounced = false
+	b.fetchSinceConnect = false
+	b.holeDiscards = 0
 
 	b.api = api
 	// Its own user ID is how the bridge recognises a mention. Without it the
@@ -353,13 +775,51 @@ func (b *Bridge) ensure() error {
 	b.connected = true
 	// A fresh connection is the one moment the scopes can have changed, so the
 	// catch-up outside the home channel is offered another go — and anything the
-	// old connection is still doing no longer speaks for this one.
+	// old connection is still doing no longer speaks for this one. The count is
+	// also what every part of this connection is identified by, so it moves
+	// before anything is started on it.
 	b.connGeneration++
+	generation := b.connGeneration
+
+	// One goroutine owns the socket from here. It runs on the connection's
+	// context rather than a call's, so a wait that is cancelled does not take
+	// the connection down with it — and it stops when the connection does, so
+	// two pumps can never write into the same queues.
+	pumpDone := make(chan struct{})
+	b.pumpDone = pumpDone
+	go func() {
+		defer close(pumpDone)
+		b.pump(connCtx, generation, stream)
+	}()
 	// The first catch-up covers everything missed since the last session;
-	// StreamConnected events later cover reconnects.
-	b.needCatchUp = true
+	// StreamConnected events later cover reconnects. A hole, because that is
+	// what a session that was not running is — and remembered, so the hello
+	// this connection is about to send is known for what it is.
+	b.requestCatchUpForHoleLocked()
+	b.connectHole = b.holeEpoch
 	return nil
 }
+
+// lastLookSlotWait is how long the drain at the deadline will wait for its turn
+// at catch-up. The deadline has already passed by then, so this is a courtesy
+// rather than a budget: long enough for a slot that is about to come free,
+// short enough that the answer is still prompt.
+const lastLookSlotWait = 250 * time.Millisecond
+
+// lastLookGrace is how long the drain at the deadline may spend on Slack once
+// it has its turn. The deadline has passed by then, so the whole of the last
+// look is a courtesy — bounded here so that it stays one.
+const lastLookGrace = time.Second
+
+// maxPendingMessages bounds the messages waiting to be handed over. What it
+// protects against is a session left working for hours while a busy channel
+// fills the heap behind it.
+//
+// It sits well inside what one catch-up can fetch — maxHistoryPages pages of
+// historyPageLimit each — because a refused message is recovered by re-reading
+// the window from the cursor, and that window has to hold everything still
+// queued as well as everything refused.
+const maxPendingMessages = 512
 
 // WaitResult is what slack_wait returns.
 type WaitResult struct {
@@ -403,13 +863,8 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		b.mu.Unlock()
 		return WaitResult{}, err
 	}
-	stream := b.stream
+	generation := b.connGeneration
 	b.mu.Unlock()
-
-	// Reactions arrive on a channel of their own, so a backlog of messages
-	// cannot fill the queue a vote lands in. A stream that predates them has
-	// none, and a nil channel simply never fires.
-	reactions := reactionsOf(stream)
 
 	// Subscribed before the first drain, so a message absorbed by another call
 	// between the drain and the select is a wakeup rather than a message this
@@ -419,37 +874,82 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	waitEnds := time.Now().Add(timeout)
+
+	// drainWithin runs a catch-up that may not outlive this call's own
+	// deadline: neither the wait for its turn, nor the requests it makes once
+	// it has one. A fetch cut short that way is not an error and not a loss —
+	// nothing is committed until the messages are handed over, so the next
+	// call reads the same window — and the empty answer is the one this call
+	// promised by that time.
+	drainWithin := func(budget, slotWait time.Duration) ([]Message, []Reaction, error) {
+		drainCtx, cancelDrain := context.WithTimeout(ctx, budget)
+		defer cancelDrain()
+
+		msgs, reactions, err := b.drainCatchUp(drainCtx, generation, true, slotWait)
+		if err != nil && ctx.Err() == nil && drainCtx.Err() != nil {
+			return nil, nil, nil
+		}
+		return msgs, reactions, err
+	}
 
 	for {
-		// Sweep what is already on the wire before deciding what this batch
-		// contains. Messages and reactions arrive on channels of their own, and
-		// without this a message ready at the same instant as a reaction would
-		// go back alone — leaving the agent counting a vote it had already been
-		// sent, one call later.
-		b.drainStream(stream, reactions)
+		// Before anything is taken off a queue. A caller that has given up
+		// should not consume a batch on its way out: those messages are the
+		// owner's, and the next call is the one that will answer them.
+		if err := ctx.Err(); err != nil {
+			return WaitResult{}, err
+		}
 
 		// Catch-up first: a pending backlog outranks waiting for something
 		// new, and on a reconnect it is the only place missed messages are.
-		msgs, err := b.drainCatchUp(ctx)
+		// Everything the socket has delivered is already in the queues, put
+		// there by the pump, so there is nothing to sweep here.
+		// The slot is waited for only as long as this call has left: another
+		// call's slow request must not make this one answer late.
+		budget := time.Until(waitEnds)
+		msgs, drained, err := drainWithin(budget, budget)
 		if err != nil {
 			return WaitResult{}, err
 		}
-		// Again, because catch-up goes to Slack and back: emoji that arrived
-		// while it was fetching history belong in the batch it produced.
-		b.drainStream(stream, reactions)
-		drained := b.drainReactions()
 		if len(msgs) > 0 || len(drained) > 0 {
-			return b.deliver(ctx, stream, msgs, drained), nil
+			return b.deliver(ctx, generation, msgs, drained), nil
 		}
 
-		// A pending question owns the click channel. Reading it here as well
-		// would mean a click could be taken by this goroutine and handed
-		// across to the question, and the question's own deadline cannot see
-		// a click that is still in transit. A nil channel blocks forever,
-		// which is exactly "leave those to the asker".
-		clicks := stream.Interactions()
-		if b.askPending() {
-			clicks = nil
+		// The caller giving up comes first. Cancelling this call cancels the
+		// session's context in the usual arrangement, which ends the pump,
+		// which says the connection is gone — and answering "the connection
+		// closed" to a caller that has cancelled describes the consequence
+		// rather than the cause.
+		if err := ctx.Err(); err != nil {
+			return WaitResult{}, err
+		}
+		// Only once there is nothing to hand over. Anything the dying
+		// connection had already delivered is in the queues above, and
+		// reporting the disconnection before taking it would throw away what
+		// the owner actually sent.
+		if b.streamGone(generation) {
+			// One last look at the queues, without Slack. The drain above can
+			// come back empty without having merged them — its budget ran out
+			// while a history request was still open, or it never got its turn
+			// — and what the connection delivered before it died is in those
+			// queues, received and not yet handed over. Reporting the closure
+			// over the top of it would throw away the owner's own messages.
+			//
+			// No cursor moves, as in a storm: this pass read nothing, so it
+			// cannot say where history has been read to.
+			msgs, drained := b.takeQueues(generation)
+			if len(msgs) > 0 || len(drained) > 0 {
+				return b.deliver(ctx, generation, msgs, drained), nil
+			}
+			return WaitResult{}, errors.New("the Slack connection closed")
+		}
+
+		// A loss is news on its own. Without this the wait would go back to
+		// sleep on a full-length deadline, holding a marker that says the
+		// agent's count is wrong and that nothing else is going to mention.
+		if b.takeReactionsDropped(generation) {
+			return WaitResult{Messages: []Message{}, ReactionsDropped: true}, nil
 		}
 
 		select {
@@ -461,72 +961,46 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// any point during the poll, including the instant the timer fires
 			// and including from another call entirely, and reporting an empty
 			// timeout on top of one would hold it back for another full poll
-			// while the owner waits on a reply. The wire is swept here for the
-			// same reason it is swept at the top of the loop: a reaction ready
-			// at the same instant as the timer is one the agent can have now.
-			b.drainStream(stream, reactions)
-
-			msgs, err := b.drainCatchUp(ctx)
+			// while the owner waits on a reply.
+			if err := ctx.Err(); err != nil {
+				return WaitResult{}, err
+			}
+			msgs, drained, err := drainWithin(lastLookSlotWait+lastLookGrace, lastLookSlotWait)
 			if err != nil {
 				return WaitResult{}, err
 			}
-			b.drainStream(stream, reactions)
-			drained := b.drainReactions()
 			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
 				// timed_out of true alongside messages would be read as "call
 				// again", which is the one thing that must not happen to
 				// messages already handed over.
-				return b.deliver(ctx, stream, msgs, drained), nil
+				return b.deliver(ctx, generation, msgs, drained), nil
+			}
+			// A connection that ended while the last history request was in
+			// flight is news, and a quiet timeout would leave it for whoever
+			// called next.
+			if b.streamGone(generation) {
+				// The same last look as the loop above: this pass read
+				// nothing, and what the connection delivered before it died is
+				// in the queues.
+				msgs, drained := b.takeQueues(generation)
+				if len(msgs) > 0 || len(drained) > 0 {
+					return b.deliver(ctx, generation, msgs, drained), nil
+				}
+				return WaitResult{}, errors.New("the Slack connection closed")
 			}
 			return WaitResult{
 				Messages: []Message{},
 				// A wait with nothing to hand over still has to say a
 				// reaction was lost: that is precisely when the agent's count
 				// is wrong and nothing else would tell it.
-				ReactionsDropped: b.takeReactionsDropped(stream),
+				ReactionsDropped: b.takeReactionsDropped(generation),
 				TimedOut:         true,
 			}, nil
 
 		case <-sub:
-			// Something reached the queue. Round the loop to drain it.
-
-		case r, ok := <-reactions:
-			if !ok {
-				// The socket is gone. The events channel closing is what
-				// reports that; this one simply stops firing, so the select
-				// does not spin on a closed channel.
-				reactions = nil
-				continue
-			}
-			b.absorbReaction(r)
-
-		case in, ok := <-clicks:
-			if !ok {
-				b.drainStream(stream, reactions)
-				b.noteStreamClosed(stream)
-				return WaitResult{}, errors.New("the Slack connection closed")
-			}
-			// A click arriving while nobody is asking anything is answered by
-			// whoever is: routing it here keeps slack_wait from starving the
-			// click channel while it holds the connection.
-			b.routeInteraction(in)
-
-		case evt, ok := <-stream.Events():
-			if !ok {
-				// Whatever emoji are still buffered were received before the
-				// socket died, so they are kept for the next call rather than
-				// dying with the connection. The events channel is drained
-				// first even though it is the one that just closed: what is
-				// still in its buffer can be the mention a buffered reaction
-				// has to be judged against.
-				b.drainStream(stream, reactions)
-				b.noteStreamClosed(stream)
-				return WaitResult{}, errors.New("the Slack connection closed")
-			}
-			if err := b.absorb(evt); err != nil {
-				return WaitResult{}, err
-			}
+			// Something reached the queue, or the connection ended. Round the
+			// loop, which drains the first and reports the second.
 		}
 	}
 }
@@ -541,7 +1015,7 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 // The indicator is started where the owner is looking: the newest message is
 // the one they just sent, so its channel and thread are the conversation they
 // are waiting on.
-func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, reactions []Reaction) WaitResult {
+func (b *Bridge) deliver(ctx context.Context, generation uint64, msgs []Message, reactions []Reaction) WaitResult {
 	// Only messages start the clock. A reaction is not something the owner is
 	// waiting on an answer to, and marking one as received would put a receipt
 	// emoji on a message for every emoji anybody else put on it.
@@ -558,7 +1032,7 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 	return WaitResult{
 		Messages:         msgs,
 		Reactions:        b.nameReactions(ctx, reactions),
-		ReactionsDropped: b.takeReactionsDropped(stream),
+		ReactionsDropped: b.takeReactionsDropped(generation),
 	}
 }
 
@@ -570,13 +1044,17 @@ func (b *Bridge) deliver(ctx context.Context, stream Stream, msgs []Message, rea
 // second then cleared the flag unconditionally, the next call would open a
 // third connection while the replacement was still consuming events, and the
 // owner's messages would arrive on a socket nobody reads.
-func (b *Bridge) noteStreamClosed(stream Stream) {
+func (b *Bridge) noteStreamClosed(generation uint64, stream Stream) {
 	// Whatever this connection lost is still the agent's to hear about, and the
 	// stream that recorded it is going away. It is taken here rather than in
 	// any one caller because the socket closes its channels together and a call
 	// can notice any of them first: this is the one place every disconnect
 	// passes through. It is taken even when the stream has already been
 	// replaced — the loss happened either way.
+	// The stream that is closing, not the one the bridge holds: a connection
+	// that has already been replaced still lost what it lost, and its marker
+	// has nowhere else to go. Asked outside the lock, because it is a question
+	// for somebody else's implementation.
 	dropped := streamDroppedReactions(stream)
 
 	b.mu.Lock()
@@ -585,27 +1063,23 @@ func (b *Bridge) noteStreamClosed(stream Stream) {
 	if dropped {
 		b.reactionsDropped = true
 	}
-	if b.stream == stream {
+	if !b.stale(generation) {
 		b.connected = false
 	}
+	// A blocked call is waiting for something to happen, and this is something:
+	// it rounds its loop, finds the queues empty and the connection gone, and
+	// says so instead of sitting out its whole timeout on a dead socket.
+	b.notifyPendingLocked()
 }
 
-// askPending reports whether a slack_ask question is waiting for a click.
-func (b *Bridge) askPending() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.ask != nil
-}
-
-// absorb folds one stream event into the bridge's pending state.
+// absorbLocked folds one stream event into the bridge's pending state. The
+// caller must hold b.mu, which is how a reaction and the messages ahead of it
+// are applied as one step.
 //
-// Both slack_wait and slack_ask read the stream, so a message goes to the same
-// place whichever of them happened to pick it up: the queue the next
-// slack_wait drains.
-func (b *Bridge) absorb(evt StreamEvent) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+// The pump is the only caller: it applies what the socket delivers, and the
+// queues it writes are what slack_wait and slack_ask read. Nothing here decides
+// who receives a message — only where it waits until somebody does.
+func (b *Bridge) absorbLocked(evt StreamEvent) {
 	switch evt.Kind {
 	case StreamMessage:
 		// The socket relays every owner message in every channel the bot is in,
@@ -613,23 +1087,109 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 		// This is where that is decided.
 		msg, ok := b.classifyLocked(evt.Message)
 		if !ok {
-			return nil
+			return
 		}
-		if msg.Channel == "" || msg.Channel == b.cfg.Channel {
-			b.pending = append(b.pending, msg)
-		} else {
-			b.pendingThreads = append(b.pendingThreads, msg)
+		if b.alreadyDeliveredLocked(msg) {
+			// The same message twice. Slack retries an envelope it has not
+			// been acknowledged for, and the receipt can be lost after the
+			// message itself arrived — so this is the owner's message coming
+			// round again, not a second one.
+			return
 		}
+		// The socket's buffer used to be the limit, because nothing moved a
+		// message off it until a call asked; the pump moves every one, so the
+		// limit has to be here instead.
+		//
+		// What is already queued stays. Dropping it would throw away messages
+		// that were received, and the newest is the one history is most
+		// certain to still have. The two queues are counted apart so that a
+		// flood in the home channel cannot crowd out a reply in a conversation
+		// elsewhere: those are the ones history is least able to give back,
+		// since that catch-up is best effort and stands down entirely when a
+		// scope is missing.
+		home := msg.Channel == "" || msg.Channel == b.cfg.Channel
+		queue, full := &b.pendingThreads, &b.threadsFull
+		if home {
+			queue, full = &b.pending, &b.pendingFull
+		}
+		if len(*queue) >= maxPendingMessages {
+			b.requestCatchUpForRefusalLocked()
+			if home && !b.cursorSeeded {
+				// Refused before the home cursor exists. The seed about to be
+				// established would filter this message out as older than
+				// itself, so the seed is given up on instead: the cursor is
+				// taken from the messages actually handed over, and catch-up
+				// reads everything after them.
+				//
+				// Only for the home channel. A reply queued elsewhere has
+				// nothing to do with that cursor, and giving up the seed for
+				// one would replay the home channel's history as new.
+				b.preSeedRefused = true
+			}
+			// One line per episode, not one per message. This runs under the
+			// lock the pump holds, and a flood that logged every refusal would
+			// turn the overflow into the thing that stopped the socket.
+			if !*full {
+				*full = true
+				log.Printf("a pending message queue is full at %d; further messages will be re-read from history", maxPendingMessages)
+			}
+			return
+		}
+		// Cleared for this queue only: the two fill and drain independently,
+		// and one of them taking a message says nothing about the other.
+		*full = false
+		*queue = append(*queue, msg)
 		b.notifyPendingLocked()
-	case StreamConnected, StreamDropped:
-		// Both mean the live stream may have a hole in it. History is the
-		// authority, so go re-read the window after the cursor.
-		b.needCatchUp = true
-		// A hole is a reason to go and look as much as a message is: what
-		// history has to offer is exactly what a blocked call is waiting for.
-		b.notifyPendingLocked()
+	case StreamDropped:
+		// The stream announcing a message it refused. If the pump already saw
+		// that refusal by asking — it polls, because the announcement needs
+		// room on the very channel that had none — this is the same hole
+		// arriving a second time, and raising another would throw away a
+		// second catch-up for one lost message.
+		if b.overflowNoted.Swap(false) {
+			return
+		}
+		b.requestCatchUpForHoleLocked()
+
+	case StreamConnected:
+		// Every connection announces itself once, and the catch-up for that is
+		// asked for where the connection is opened — so this first hello is
+		// that request arriving, not a reconnect on top of it. Raising a hole
+		// here would discard the first catch-up of every session, every time.
+		//
+		// Only while that catch-up has not gone to Slack yet. Connect returns
+		// before the socket is up, so a window read before this hello covers a
+		// stretch of time the socket was not relaying: a message sent in that
+		// gap is in history and nowhere else, and the pass this hello asks for
+		// is the only thing that goes back for it. Socket Mode replays
+		// nothing.
+		firstHello := !b.connectAnnounced
+		b.connectAnnounced = true
+		if firstHello && b.holeEpoch == b.connectHole {
+			if !b.fetchSinceConnect {
+				// Nothing has happened to this connection since it asked for
+				// its own catch-up, and that catch-up has not looked yet — so
+				// this is that request saying hello, and it will be answered
+				// by a read that already covers the socket being up.
+				return
+			}
+			// The catch-up has already looked, and what it read stops where it
+			// looked: the socket was not relaying yet, so a message sent
+			// between that read and this hello is in history and nowhere else.
+			// Another read covers it.
+			//
+			// A refusal rather than a hole. There is no gap in what has been
+			// applied — the socket has delivered nothing yet — so a catch-up
+			// in flight may still hand over everything it read. It only may
+			// not call the window finished.
+			b.requestCatchUpForRefusalLocked()
+			return
+		}
+		// A reconnect underneath a connection that was never replaced — the
+		// socket library's own — means the live stream may have a hole in it.
+		// History is the authority, so go re-read the window after the cursor.
+		b.requestCatchUpForHoleLocked()
 	}
-	return nil
 }
 
 // drainCatchUp runs catch-up when it is due, merges the result with anything
@@ -638,88 +1198,467 @@ func (b *Bridge) absorb(evt StreamEvent) error {
 // The cursor is advanced and persisted only once the messages are about to be
 // returned, so a failure anywhere earlier leaves the bridge ready to fetch
 // them again on the next call rather than skipping past them.
-func (b *Bridge) drainCatchUp(ctx context.Context) ([]Message, error) {
+func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReactions bool, slotWait time.Duration) ([]Message, []Reaction, error) {
+	// One at a time. Two calls reading the same window would both fetch it and,
+	// behind a gap — where the cursor deliberately stays put — both deliver it,
+	// handing the owner's messages over twice. The wait costs nothing that was
+	// not going to be spent: the second call was about to make the same
+	// request, and by the time it has its turn the first has moved the cursor
+	// past what it took.
+	//
+	// A caller that gives up while waiting says so rather than waiting out
+	// somebody else's slow request: its own deadline is the one it promised.
+	wait := time.NewTimer(slotWait)
+	defer wait.Stop()
+	select {
+	case b.catchUpSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-wait.C:
+		// Somebody else's request is still out, and this call has its own
+		// deadline to keep. What is already in the queues does not depend on
+		// that request, though: it came off this connection's socket and is
+		// waiting to be handed over, and making it wait for a history call it
+		// has nothing to do with is how a message the owner sent sits behind
+		// somebody else's slow Slack.
+		//
+		// No cursor moves with it, as in a storm: this call read nothing, so
+		// it cannot say where history has been read to. The window is read
+		// again by whoever gets the slot, and what comes back has been handed
+		// over already.
+		msgs, reactions := b.queuedWithoutReading(generation, takeReactions)
+		return msgs, reactions, nil
+	}
+	defer func() { <-b.catchUpSlot }()
+
 	b.mu.Lock()
+	if b.stale(generation) {
+		// The connection this call belongs to has been replaced while it
+		// waited for its turn. Everything it read would be thrown away at the
+		// commit below, and reading it would hold the slot the replacement's
+		// own catch-up is waiting for.
+		b.mu.Unlock()
+		return nil, nil, nil
+	}
 	needCatchUp := b.needCatchUp
+	// Threads left unread ask for a walk of their own. It is a smaller errand
+	// than a catch-up: no window, no scan, only the conversations that were
+	// skipped.
+	threadsOnly := !needCatchUp && b.threadsSkipped
+	if needCatchUp || threadsOnly {
+		// About to go to Slack. From here this connection's hello is worth a
+		// pass of its own, because what is read now cannot cover the time
+		// after it.
+		b.fetchSinceConnect = true
+	}
+	epoch := b.catchUpEpoch
+	holes := b.holeEpoch
+	seeded := b.cursorSeeded
 	api := b.api
-	generation := b.connGeneration
 	lastTS := b.lastTS
 	channel := b.cfg.Channel
 	owner := b.cfg.Owner
+	connCtx := b.connCtx
 	b.mu.Unlock()
 
-	var fetched, conversations []Message
+	// The fetch follows the connection as well as its caller. What it reads on
+	// a connection that has been replaced is committed nowhere — the check
+	// below throws all of it away — and until it returns it holds the slot the
+	// new connection's own catch-up is waiting for. Ending it with the
+	// connection is what keeps one slow request on a dead connection from
+	// standing in front of the live one.
+	ctx, endFetch := context.WithCancel(ctx)
+	defer endFetch()
+	if connCtx != nil {
+		defer context.AfterFunc(connCtx, endFetch)()
+	}
+
+	// A fetch that was cut short this way has nothing to report: the caller's
+	// own context is still good, and the answer to a connection that ended
+	// underneath it is the empty one its replacement will fill in.
+	abandoned := func(err error) bool {
+		if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
+			return false
+		}
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.stale(generation)
+	}
+
+	// What the scan outside the home channel would change is staged here and
+	// committed below, under the same generation check as everything else.
+	scan := &scanChanges{}
+
+	var (
+		fetched, conversations []Message
+		// looked is how far the read of the home channel got, counting every
+		// message in the pages it read rather than only the ones it may hand
+		// over.
+		looked string
+		// walked is how far the thread walk read, which is kept apart from
+		// looked because it can reach past the moment the pass started.
+		walked string
+		// truncated marks a read that ran out of pages before it ran out of
+		// window.
+		truncated bool
+		// seeding marks the first run against a channel, where the cursor is
+		// being established rather than read from.
+		seeding bool
+	)
+	if threadsOnly {
+		var err error
+		conversations, err = b.catchUpSkippedThreads(ctx, api, owner, generation, scan)
+		if err != nil {
+			if abandoned(err) {
+				return nil, nil, nil
+			}
+			return nil, nil, err
+		}
+	}
+
 	if needCatchUp {
-		if lastTS == "" {
+		if !seeded {
 			// First run against this channel: seeding from the newest
 			// message means a fresh install starts a conversation rather
 			// than replaying the channel's entire history into the agent.
-			seeded, err := b.seedCursor(ctx, api, channel)
+			seeded, err := b.seedCursor(ctx, api, generation, channel)
 			if err != nil {
-				return nil, err
+				if abandoned(err) {
+					return nil, nil, nil
+				}
+				return nil, nil, err
 			}
 			lastTS = seeded
+			seeding = true
 		} else {
-			var err error
-			fetched, err = catchUp(ctx, api, channel, owner, lastTS)
+			got, err := catchUp(ctx, api, channel, owner, lastTS)
 			if err != nil {
-				return nil, err
+				if abandoned(err) {
+					return nil, nil, nil
+				}
+				return nil, nil, err
+			}
+			fetched, looked, truncated = got.messages, got.read, got.truncated
+			walked = got.threadsRead
+			if truncated {
+				// More window than one pass can read, and the pages it read
+				// are the newest of it: what was not reached is older than
+				// everything delivered, so no later pass can get back to it —
+				// asking for one would only read these same pages again.
+				//
+				// This is the bound the design has always had on how far back
+				// a single catch-up will go. What is new is saying so.
+				log.Printf("catch-up read the newest %d messages and stopped; anything older in the window was not delivered, including messages refused for want of room while the flood lasted",
+					maxHistoryPages*historyPageLimit)
 			}
 		}
 
 		// Everywhere else: the conversations opened by a mention, and any
 		// mention that opened one while nobody was listening.
 		var err error
-		conversations, err = b.catchUpConversations(ctx, api, owner, generation)
+		conversations, err = b.catchUpConversations(ctx, api, owner, generation, scan)
 		if err != nil {
-			return nil, err
+			if abandoned(err) {
+				return nil, nil, nil
+			}
+			return nil, nil, err
 		}
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// A drain that started on a connection since replaced does not get to say
-	// the replacement has caught up: what it read came from the installation as
-	// it was, and the new connection has its own catch-up to run — the one that
-	// finds what a reinstall has just made readable. The messages it did read
-	// are still handed over; only the flag is left alone.
-	if needCatchUp && generation == b.connGeneration {
-		b.needCatchUp = false
-		if b.lastTS == "" {
-			b.lastTS = lastTS
+	// A drain that started on a connection since replaced commits nothing at
+	// all. What it read came from the installation as it was, and the queues it
+	// would merge are being filled by the connection that replaced it: taking
+	// them here hands the new connection's messages to a call that is about to
+	// be told its own connection is gone, and leaves the cursor where it was so
+	// they come back twice. Worse for a reply in a conversation outside the
+	// home channel, where the catch-up that would find it again is best effort.
+	//
+	// The replacement asks for its own catch-up on connect, and that one reads
+	// the window with the installation as it now is.
+	if generation != b.connGeneration {
+		// One exception, and it commits nothing: a cursor that has never been
+		// set. The seed says where this session found the channel, and the
+		// replacement would otherwise seed again against a channel that has
+		// moved on — treating everything sent in between as history and
+		// delivering none of it. Kept in memory only; the write belongs to the
+		// call that hands the messages over.
+		if seeding && !b.cursorSeeded && !b.closed {
+			b.establishSeedLocked(channel, lastTS, false)
+			// Nothing here may write, and the call that takes over may have
+			// nothing to hand over — an empty home channel, or replies and no
+			// messages — in which case it commits no cursor of its own. The
+			// debt is recorded so that whichever call commits next pays it:
+			// unpaid, a restart seeds again and reads everything sent while
+			// this session was down as the channel's past.
+			b.seedUnwritten = true
+		}
+		return nil, nil, nil
+	}
+
+	// A hole opened while this was reading. Nobody knows where it is, so
+	// nothing read here can be trusted to belong after it: the lot is thrown
+	// away and the request stands for the next call, which reads the window
+	// with the hole already in the past.
+	//
+	// It costs one round trip, and it is the whole of the rule. What replaced
+	// it — delivering the fetch while holding the cursor back over a queue
+	// that was kept — handed the same messages over again on every pass, and
+	// under a queue that stayed full it never stopped.
+	if holes != b.holeEpoch {
+		// Twice over is a storm, not an accident. A socket that flaps faster
+		// than a catch-up takes would otherwise keep throwing every pass away,
+		// and a message the owner sent — sitting in the queue, already
+		// received — would wait for the flapping to stop.
+		//
+		// So the second discard in a row hands over the queue and nothing
+		// else. Those messages came off the socket, which is what makes them
+		// safe: whatever the hole swallowed, it did not swallow these. What
+		// was fetched is still dropped, and the cursor still does not move, so
+		// nothing steps over the hole — the next pass reads that window again
+		// and the delivered window keeps it from arriving twice.
+		if b.holeDiscards > 0 && len(b.pending)+len(b.pendingThreads) > 0 {
+			b.holeDiscards = 0
+			return b.handOverQueuesLocked(takeReactions)
+		}
+		b.holeDiscards++
+
+		if seeding && !b.cursorSeeded && !b.closed {
+			// The seed is not part of what was read; it is where the channel
+			// was when this session found it, which no hole changes. Kept, so
+			// the next pass does not seed again against a channel that has
+			// moved on — in memory, with the write left to whoever commits.
+			b.establishSeedLocked(channel, lastTS, false)
+			b.seedUnwritten = true
+		}
+		return nil, nil, nil
+	}
+
+	if needCatchUp || threadsOnly {
+		// What the scan found, under this check like everything else: a
+		// conversation it opened, one it gave up on, and how far it looked are
+		// all true of the installation it ran with.
+		b.commitScanLocked(scan)
+
+		// The cursor first, and whatever else has been asked for since. A seed
+		// is a fact about the channel — where it was when this session found
+		// it — and dropping it because something asked for another catch-up
+		// meanwhile would leave the cursor unset, to be seeded again against a
+		// channel that has moved on.
+		if seeding && !b.cursorSeeded {
+			b.establishSeedLocked(channel, lastTS, true)
+		}
+		// The flag, only if nothing has asked again since this one started. A
+		// message refused while history was in flight is a request this
+		// catch-up never saw: what it read is still good — the refused message
+		// is newer than everything queued, so the cursor may move over the
+		// queue without stepping past it — but the refused message itself is
+		// only in the window, and clearing the flag would leave nobody to
+		// fetch it.
+		//
+		// The epoch is compared again here, not just at the top: establishing a
+		// seed over a refusal asks for another pass of its own, and clearing
+		// the flag on the way past would answer that request with this window.
+		if epoch == b.catchUpEpoch {
+			b.needCatchUp = false
+		}
+		// Finished, whether or not it cleared the flag: the window was read,
+		// which is what a reaction waiting for an explanation was waiting for.
+		b.catchUpRuns++
+	}
+
+	// Threads the walk could not reach. Recorded on their own flag, which asks
+	// for another walk and nothing else.
+	if needCatchUp || threadsOnly {
+		// News, when it becomes true: a call already blocked has nothing in
+		// either queue to wake it, and the replies these conversations hold
+		// would wait out its whole timeout otherwise.
+		//
+		// And again after every walk that leaves some behind. Those walks read
+		// the skipped set and nothing else, so the set shrinks by the budget
+		// each time and the waking stops after as many turns as it takes to
+		// empty it. A full catch-up works the set out afresh, so for those the
+		// news is the change.
+		if scan.skipped && (!b.threadsSkipped || threadsOnly) {
+			b.notifyPendingLocked()
+		}
+		b.threadsSkipped = scan.skipped
+		b.skippedThreads = nil
+		if len(scan.skippedKeys) > 0 {
+			b.skippedThreads = make(map[threadKey]struct{}, len(scan.skippedKeys))
+			for _, key := range scan.skippedKeys {
+				b.skippedThreads[key] = struct{}{}
+			}
 		}
 	}
 
-	// Live events and history overlap around a reconnect; merging deduplicates
-	// by timestamp and drops anything at or before the cursor.
-	home := mergeMessages(b.lastTS, fetched, b.pending)
-	b.pending = nil
+	// A pass that reached here is a pass that was not thrown away.
+	b.holeDiscards = 0
 
-	threads := b.mergeThreadMessagesLocked(conversations, b.pendingThreads)
+	// The seed another call established in memory and could not write. Paid
+	// here, where the connection is the live one and the lock is held, and
+	// before any of the early returns below.
+	b.writeSeedDebtLocked(channel)
+
+	// Live events and history overlap around a reconnect; merging deduplicates
+	// by timestamp. Only what history returned is filtered by the cursor: a
+	// message the socket delivered is not the channel's past, whatever its
+	// timestamp says, and on the run that seeds the cursor it can be older
+	// than the seed and still be the message this session was started for.
+	live, liveThreads := b.pending, b.pendingThreads
+
+	// What has already been handed over is not fetched again. The cursor
+	// catches most of it, but a storm hands the queue over without moving one
+	// — so history returns those messages on the next pass, and this is what
+	// stops them arriving a second time.
+	read, readThreads := fetched, conversations
+	fetched = b.undeliveredLocked(fetched)
+	conversations = b.undeliveredLocked(conversations)
+
+	home := mergeLive(b.lastTS, fetched, live)
+	threads := b.mergeThreadMessagesLocked(conversations, liveThreads)
+	b.pending = nil
 	b.pendingThreads = nil
 
-	if len(home) == 0 && len(threads) == 0 {
-		return nil, nil
+	// Taken here, under the same lock, rather than by a second call. Two waits
+	// running together could otherwise split a pair the pump applied as one:
+	// the first takes the message and yields, the second takes the reaction
+	// that came with it, and each hands over half.
+	//
+	// Only for a caller that delivers them. A question collects the messages
+	// that arrived while it was up and returns them with its answer, but it
+	// has nowhere to put a reaction — taking one here would be taking it off
+	// the wait that reports them.
+	var reactions []Reaction
+	if takeReactions {
+		reactions = b.drainReactionsLocked()
 	}
 
-	if len(home) > 0 {
-		newest := home[len(home)-1].TS
+	// Remembered before it goes, so a redelivered envelope is recognised as
+	// the message it already is.
+	b.noteDeliveredLocked(home, threads)
+
+	// The cursor moves over everything this pass read, not only over what it
+	// handed on. Nothing is being held back behind it — a hole would have
+	// thrown the whole pass away above, and a refusal leaves nothing older
+	// than the queue unread — and what it read but did not hand on was
+	// dropped for one reason: it had been handed over already.
+	//
+	// The distinction is the storm's. A pass that hands the queue over without
+	// moving the cursor leaves those messages in the window, and the pass that
+	// comes after finds them there and drops them as delivered; taking the
+	// cursor from what survived that would leave it behind them for good.
+	// The channel surface only, on both counts. What a batch carries from
+	// inside a thread is in no history page, so it says nothing about how far
+	// history has been read — and a reply the walk brought back can be newer
+	// than everything the pass fetched. Those go through walked below, which
+	// is bounded for exactly that reason.
+	newest := newestSurfaceTS(home)
+	if last := newestSurfaceTS(read); tsLess(newest, last) {
+		newest = last
+	}
+	// And past the pages themselves. A read that found only other people's
+	// messages has still read them, and a cursor left behind them is a page
+	// the next hole fetches again to learn the same thing.
+	if tsLess(newest, looked) {
+		newest = looked
+	}
+	// And past the replies the thread walk read — every reply it saw, whoever
+	// wrote it, and only on a pass nothing interrupted.
+	//
+	// The walk is the one read that can reach past the moment the pass began:
+	// a reply posted while it was running is newer than every page of channel
+	// history this pass fetched, and it is in none of them. It is bounded to
+	// the start of the pass for that reason, so this can only be a moment the
+	// history read already covers.
+	//
+	// The epoch is the second bound, and what it covers is the interruptions
+	// this pass was told about while it ran. A message refused for want of
+	// room is what makes the cursor safe to move over the queue at all, and it
+	// is safe only as far as this pass read: a cursor taken from a reply of
+	// the same age as the refused message would step over a channel message
+	// nothing ever read, and nothing would go back for it. So when something
+	// has asked for another catch-up since this one started, the walk's reach
+	// waits — and the pass that answers it walks the same threads once more
+	// and moves the cursor then.
+	//
+	// The two do not stand in for each other. An interruption that only comes
+	// to light after this pass has committed — a socket that died without
+	// saying so, a first hello still on its way — is in neither epoch, and the
+	// bound above is the only thing holding there. That bound is taken from
+	// this machine's clock, so it holds as long as the clock is not running
+	// more than walkReachSlack ahead of Slack's.
+	if epoch == b.catchUpEpoch && tsLess(newest, walked) {
+		newest = walked
+	}
+
+	// The thread cursors, before anything can return. A pass that reads a
+	// conversation and finds only what has been delivered already hands
+	// nothing over — and it still has to record how far it read, or the next
+	// one starts in the same place and reads it again.
+	//
+	// A conversation the walk could not reach keeps its cursor, whatever this
+	// pass hands over from it. The socket can deliver a reply in a conversation
+	// the walk skipped, and moving the cursor to that reply steps over
+	// everything the walk was going to go back for — which is the promise the
+	// skipped list makes. The reply is still handed over; only the cursor
+	// waits, and the walk that reads that conversation moves it.
+	missed := make(map[threadKey]struct{}, len(scan.skippedKeys))
+	for _, key := range scan.skippedKeys {
+		missed[key] = struct{}{}
+	}
+	reached := func(m Message) bool {
+		_, skipped := missed[threadKey{m.Channel, m.ThreadTS}]
+		return !skipped
+	}
+
+	for _, m := range threads {
+		if reached(m) {
+			b.noteThreadDeliveredLocked(m)
+		}
+	}
+	// The replies this pass read and did not hand on, for the same reason: they
+	// were handed on by the pass that gave up in the storm, and a cursor left
+	// behind them would fetch them again on every hole.
+	for _, m := range readThreads {
+		if reached(m) && b.alreadyDeliveredLocked(m) {
+			b.noteThreadDeliveredLocked(m)
+		}
+	}
+	// And how far each conversation the walk reached was read, which counts
+	// every reply rather than only the owner's. A conversation where somebody
+	// else has been talking has been read; left behind, it is the same replies
+	// fetched again on every catch-up, for ever.
+	// No need to ask whether the walk reached these: a conversation is either
+	// read or skipped, and only the ones it read are recorded here.
+	for _, mark := range scan.threadsRead {
+		b.noteThreadReadLocked(mark.key, mark.read)
+	}
+
+	if newest != "" {
+		// Never backwards. On the run that seeds the cursor, a message the pump
+		// took while history was being read can be older than the seed, and
+		// moving the cursor back to it would have the next reconnect re-read
+		// the channel's past.
+		if tsLess(newest, b.lastTS) {
+			newest = b.lastTS
+		}
 		if b.store != nil {
-			if err := b.store.SetLastTS(channel, newest); err != nil {
-				// Keep the messages rather than dropping them: a stale cursor
-				// costs a duplicate after a restart, losing them costs the
-				// owner a reply.
-				log.Printf("could not persist the cursor: %v", err)
-			}
+			// A stale cursor costs a duplicate after a restart; the messages
+			// reach the agent either way.
+			b.recordStateWriteLocked(stateWrite{
+				stateKey: stateKey{kind: writeLastTS, channel: channel},
+				ts:       newest,
+			})
 		}
 		b.lastTS = newest
 	}
-	for _, m := range threads {
-		b.noteThreadDeliveredLocked(m)
+	if len(home) == 0 && len(threads) == 0 {
+		return nil, reactions, nil
 	}
-
-	return mergeConversations(home, threads), nil
+	return mergeConversations(home, threads), reactions, nil
 }
 
 // mergeThreadMessagesLocked combines what the threads outside the home channel
@@ -760,8 +1699,17 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	if m.Channel == "" || m.ThreadTS == "" || m.TS == "" {
 		return
 	}
+	b.noteThreadReadLocked(threadKey{m.Channel, m.ThreadTS}, m.TS)
+}
 
-	key := threadKey{m.Channel, m.ThreadTS}
+// noteThreadReadLocked moves a conversation's cursor to a reply that has been
+// read, whether or not it was handed over. The caller must hold b.mu.
+func (b *Bridge) noteThreadReadLocked(key threadKey, ts string) {
+	if key.channel == "" || key.threadTS == "" || ts == "" {
+		return
+	}
+
+	m := Message{Channel: key.channel, ThreadTS: key.threadTS, TS: ts}
 	if current := b.threadCursors[key]; current != "" && !tsLess(current, m.TS) {
 		return
 	}
@@ -773,9 +1721,175 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	if b.store == nil {
 		return
 	}
-	if err := b.store.SetThread(m.Channel, m.ThreadTS, m.TS); err != nil {
-		log.Printf("could not persist a conversation cursor: %v", err)
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeThread, channel: m.Channel, threadTS: m.ThreadTS},
+		ts:       m.TS,
+	})
+}
+
+// oldestPendingLocked reports the timestamp of the oldest home message waiting
+// to be handed over, or empty if there is none. The caller must hold b.mu.
+func (b *Bridge) oldestPendingLocked() string {
+	oldest := ""
+	for _, m := range b.pending {
+		if oldest == "" || tsLess(m.TS, oldest) {
+			oldest = m.TS
+		}
 	}
+	return oldest
+}
+
+// queuedWithoutReading hands over what is already in the queues, for a call
+// that could not get its turn at catch-up. It reads nothing and moves no
+// cursor.
+func (b *Bridge) queuedWithoutReading(generation uint64, takeReactions bool) ([]Message, []Reaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(generation) {
+		return nil, nil
+	}
+	// The emoji queues count too, for a caller that takes them. A reaction is
+	// delivered on its own, so a wait that gave up its turn at catch-up and
+	// found only reactions waiting would otherwise sit out its whole timeout
+	// with the answer already in the bridge.
+	if len(b.pending) == 0 && len(b.pendingThreads) == 0 && (!takeReactions || !b.reactionsWaitingLocked()) {
+		return nil, nil
+	}
+	msgs, reactions, _ := b.handOverQueuesLocked(takeReactions)
+	return msgs, reactions
+}
+
+// takeQueues hands over what the connection delivered before it died, without
+// reading anything: the closure is about to be reported, and what is in the
+// queues was received.
+func (b *Bridge) takeQueues(generation uint64) ([]Message, []Reaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(generation) {
+		// The queues belong to the connection that replaced this one.
+		return nil, nil
+	}
+	msgs, reactions, _ := b.handOverQueuesLocked(true)
+	return msgs, reactions
+}
+
+// handOverQueuesLocked hands over what the socket has already delivered,
+// without moving any cursor. The caller must hold b.mu.
+//
+// It is the way out of a storm. Nothing here was fetched, so nothing here can
+// be on the far side of the hole that keeps interrupting: these messages came
+// off this connection, into these queues, before the pass that is giving up
+// looked at them. The cursors stay where they are, which means the window will
+// be read again — and what it returns will have been handed over already, which
+// is what the delivered window is for.
+func (b *Bridge) handOverQueuesLocked(takeReactions bool) ([]Message, []Reaction, error) {
+	home := mergeMessages("", b.pending)
+	threads := b.mergeThreadMessagesLocked(b.pendingThreads)
+	b.pending = nil
+	b.pendingThreads = nil
+
+	var reactions []Reaction
+	if takeReactions {
+		reactions = b.drainReactionsLocked()
+	}
+
+	// No cursor moves here, the thread ones included: a hole of unknown
+	// position may sit behind a reply older than the newest of these, and a
+	// cursor stepped over it is a reply nobody ever receives. The window comes
+	// round again, and the delivered window is what keeps it from arriving
+	// twice.
+	b.noteDeliveredLocked(home, threads)
+	if len(home) == 0 && len(threads) == 0 {
+		return nil, reactions, nil
+	}
+	return mergeConversations(home, threads), reactions, nil
+}
+
+// writeSeedDebtLocked records a seed that was established in memory by a call
+// that could not write it. The caller must hold b.mu and must be on the live
+// connection.
+func (b *Bridge) writeSeedDebtLocked(channel string) {
+	if !b.seedUnwritten || b.store == nil || b.closed {
+		return
+	}
+	b.seedUnwritten = false
+
+	if b.lastTS == "" {
+		// An empty channel leaves no cursor, only the mark that says it was
+		// looked at.
+		b.recordStateWriteLocked(stateWrite{
+			stateKey: stateKey{kind: writeSeeded, channel: channel},
+		})
+		return
+	}
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeLastTS, channel: channel},
+		ts:       b.lastTS,
+	})
+}
+
+// establishSeedLocked records where this session found the channel. The caller
+// must hold b.mu.
+//
+// The seed is the cursor, and the messages taken from the socket while it was
+// being read are not filtered by it: they arrived after the session started,
+// and they are older than a mark that describes the past. That is what the
+// merge's rule about live messages is for. Without the seed as the cursor,
+// catch-up would have no bound and would read the channel's whole history back
+// as new.
+//
+// commit is false for a call that can no longer deliver: the cursor is kept in
+// memory so a replacement does not seed again against a channel that has moved
+// on, and the write is left to whoever hands the messages over.
+func (b *Bridge) establishSeedLocked(channel, seed string, commit bool) {
+	if b.preSeedRefused {
+		// The refused messages are only recoverable by reading the window
+		// again, so the request for that must outlive this call: the drain
+		// that seeded is the one that would otherwise clear it. A refusal
+		// rather than a hole — what this pass read is still good, and the
+		// cursor it is about to establish is behind the refused messages.
+		b.needCatchUp = true
+		b.catchUpEpoch++
+
+		// The queue filled while the seed was being read, so messages were
+		// refused. They are newer than everything queued, and the queue is
+		// what the session has actually seen — so the cursor goes behind the
+		// oldest of those instead of on the seed, and catch-up reads forward
+		// from there. Nothing before this session is in that window: the
+		// oldest queued message arrived on this connection.
+		if oldest := b.oldestPendingLocked(); oldest != "" {
+			seed = predecessorTS(oldest)
+		}
+	}
+
+	b.cursorSeeded = true
+	b.lastTS = seed
+	b.preSeedRefused = false
+
+	if !commit {
+		// This call cannot write: what it found is kept in memory, and the
+		// call that hands the messages over records it.
+		return
+	}
+	if seed == "" {
+		// The channel was empty, so there is no cursor to write — but that it
+		// was looked at is worth recording all the same. Without it a restart
+		// would seed again, and the first message posted in the meantime would
+		// be read as the channel's past and never delivered.
+		b.recordStateWriteLocked(stateWrite{
+			stateKey: stateKey{kind: writeSeeded, channel: channel},
+		})
+		return
+	}
+	// Written here rather than where it was read, so it cannot reach the file
+	// ahead of the messages that arrived while it was being read — those are
+	// older than the seed and a restart would filter them out.
+	b.recordStateWriteLocked(stateWrite{
+		stateKey: stateKey{kind: writeLastTS, channel: channel},
+		ts:       seed,
+	})
 }
 
 // seedCursor records where the conversation already is, without returning any
@@ -788,7 +1902,7 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 // hand the owner's own history back to them as if it were new. So the seed is
 // the newest timestamp anywhere in the scanned window — surface messages and
 // their latest replies alike.
-func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (string, error) {
+func (b *Bridge) seedCursor(ctx context.Context, api API, generation uint64, channel string) (string, error) {
 	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
 		return "", err
@@ -808,13 +1922,18 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 	if ts == "" {
 		return "", nil
 	}
-	if b.store != nil && ts != "" {
-		if err := b.store.SetLastTS(channel, ts); err != nil {
-			log.Printf("could not persist the initial cursor: %v", err)
-		}
-	}
+	// Deliberately not written here. State writes are asynchronous, and a seed
+	// that reached the file before the messages queued during it were handed
+	// over would, after a crash, filter exactly those messages out as older
+	// than the cursor. The call that commits the batch writes it.
 	return ts, nil
 }
+
+// walkReachSlack is how far back the bound on the thread walk's reach is taken
+// from this machine's clock. The moment is local and the timestamps are
+// Slack's, and being early costs a thread read again on the next pass while
+// being late costs a message. Same reasoning as orphanClockSlack, same size.
+const walkReachSlack = 5 * time.Second
 
 // catchUp returns the owner messages Slack has that the caller has not seen.
 // conversations.history returns every author in the channel, so the same owner
@@ -824,13 +1943,18 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, channel string) (strin
 // ever returns channel-surface messages, so a reply the owner typed inside a
 // thread while the bridge was away is invisible to it. The second pass goes
 // and finds those.
-func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
+func catchUp(ctx context.Context, api API, channel, owner, after string) (window, error) {
 	if api == nil {
-		return nil, errors.New("the bridge is not connected to Slack")
+		return window{}, errors.New("the bridge is not connected to Slack")
 	}
+
+	// Taken before the first request, and used to bound how far the thread
+	// walk is allowed to say this pass reached. See window.threadsRead.
+	began := slackTS(time.Now().Add(-walkReachSlack))
 
 	var (
 		messages []Message
+		read     string
 		cursor   string
 	)
 	for page := 0; page < maxHistoryPages; page++ {
@@ -841,10 +1965,17 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 			Limit:   historyPageLimit,
 		})
 		if err != nil {
-			return nil, err
+			return window{}, err
 		}
 
 		for _, c := range resp.Messages {
+			// Every message counts towards how far this read got, not only the
+			// ones it can hand over. A page of a colleague's messages is a
+			// page that has been looked at: leaving the cursor behind it means
+			// the next hole reads it again to learn the same thing.
+			if c.TS != "" && tsLess(read, c.TS) {
+				read = c.TS
+			}
 			if msg, ok := accept(c, channel, owner); ok {
 				messages = append(messages, msg)
 			}
@@ -856,13 +1987,52 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 		}
 	}
 
-	replies, err := catchUpThreads(ctx, api, channel, owner, after)
+	replies, readThreads, err := catchUpThreads(ctx, api, channel, owner, after)
 	if err != nil {
-		return nil, err
+		return window{}, err
 	}
-
+	// Not past the moment this pass began. A reply posted while the walk was
+	// running is in none of the history pages above, and a channel message
+	// posted alongside it is in none of them either — so a cursor taken from
+	// the reply would claim the surface had been read up to a moment nothing
+	// read it to. The reply is still handed over; only the claim is trimmed,
+	// and the next pass reads that thread once more.
+	if tsLess(began, readThreads) {
+		readThreads = began
+	}
+	// A cursor left over means the walk stopped at its page bound with more
+	// window behind it. The caller is told so it can come back: the cursor
+	// moves only through what was delivered, so another pass continues from
+	// there rather than starting again.
 	// History pages arrive newest-first; mergeMessages sorts and deduplicates.
-	return mergeMessages(after, messages, replies), nil
+	return window{
+		messages:    mergeMessages(after, messages, replies),
+		read:        read,
+		threadsRead: readThreads,
+		truncated:   cursor != "",
+	}, nil
+}
+
+// window is what one read of the home channel found: the messages it may hand
+// over, how far it looked, and whether it ran out of pages before it ran out of
+// window.
+//
+// The two timestamps are not the same. What may be handed over is the owner's
+// messages; how far it looked counts every message in every page it read, so
+// that a page of somebody else's conversation moves the cursor past itself
+// rather than being read again by the next pass that comes along.
+// The thread walk's reach is kept apart from both, and bounded. A reply posted
+// while the walk was running belongs to no page of channel history this pass
+// fetched, and neither does a channel message posted in the same moment — so a
+// cursor taken from that reply would claim the surface had been read to a
+// moment nothing read it to, and step over the channel message for good. It is
+// cut back to the moment the pass began for that reason, and the caller
+// applies even that only on a pass nothing interrupted.
+type window struct {
+	messages    []Message
+	read        string
+	threadsRead string
+	truncated   bool
 }
 
 // catchUpThreads recovers thread replies newer than the cursor.
@@ -882,17 +2052,21 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) ([]Mess
 // rest, so their replies are not recovered later either. Both are logged, and
 // the threads read are the ones nearest the top of the channel, which is where
 // a conversation the owner is actually having will be.
-func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, error) {
+// It reports how far it read as well as what it collected. Every reply it saw
+// counts, not only the owner's: a thread the owner has not spoken in since the
+// cursor is still a thread that has been read, and a cursor left behind its
+// newest reply makes latest_reply say "news here" on every later pass.
+func catchUpThreads(ctx context.Context, api API, channel, owner, after string) ([]Message, string, error) {
 	if after == "" {
 		// A first run seeds the cursor from the newest message instead of
 		// replaying, and reading every thread in the channel would be exactly
 		// the replay that avoids.
-		return nil, nil
+		return nil, "", nil
 	}
 
 	page, err := api.History(ctx, HistoryRequest{Channel: channel, Limit: threadScanLimit})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if page.HasMore {
 		// The channel is busier than the scan window. Threads older than these
@@ -918,6 +2092,7 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 
 	var (
 		messages []Message
+		read     string
 		walked   int
 		skipped  int
 	)
@@ -928,14 +2103,15 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 		}
 		walked++
 
-		replies, err := readThread(ctx, api, channel, owner, parent.TS, after)
+		got, err := readThread(ctx, api, channel, owner, parent.TS, after)
+		replies := got.messages
 		if err != nil {
 			if !errors.Is(err, ErrThreadUnreadable) {
 				// Slack said "not now" rather than "not there". Failing the
 				// whole catch-up is what keeps it retryable: the cursor stays
 				// where it is, and the next attempt asks for the same window
 				// again instead of stepping over replies it never read.
-				return nil, err
+				return nil, "", err
 			}
 			// A thread that no longer exists will not exist next time either,
 			// and failing forever on it would wedge every later message
@@ -944,6 +2120,9 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 			continue
 		}
 		messages = append(messages, replies...)
+		if tsLess(read, got.read) {
+			read = got.read
+		}
 	}
 
 	if skipped > 0 {
@@ -952,7 +2131,7 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 		log.Printf("catch-up read %d threads and skipped %d with newer replies; replies in the skipped threads will not be delivered",
 			walked, skipped)
 	}
-	return messages, nil
+	return messages, read, nil
 }
 
 // readThread collects the owner's replies in one thread, newer than after,
@@ -964,9 +2143,10 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 // again. The page budget is set where a thread stops being a conversation
 // someone had and starts being a data set — and reaching it is reported, since
 // the same loss applies there.
-func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) ([]Message, error) {
+func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) (threadRead, error) {
 	var (
 		messages []Message
+		read     string
 		cursor   string
 	)
 	for page := 0; page < maxThreadCatchUpPages; page++ {
@@ -978,10 +2158,17 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 			Limit:    historyPageLimit,
 		})
 		if err != nil {
-			return nil, err
+			return threadRead{}, err
 		}
 
 		for _, c := range replies.Messages {
+			// Every reply counts towards how far this read got, not only the
+			// ones it can hand over: a conversation where somebody else has
+			// been talking has been read, and a cursor left behind it is the
+			// same replies fetched again on every catch-up.
+			if c.TS != "" && tsLess(read, c.TS) {
+				read = c.TS
+			}
 			if msg, ok := accept(c, channel, owner); ok {
 				messages = append(messages, msg)
 			}
@@ -989,13 +2176,29 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 
 		cursor = replies.NextCursor
 		if cursor == "" {
-			return messages, nil
+			return threadRead{messages: messages, read: read}, nil
 		}
 	}
 
-	log.Printf("stopped reading a thread after %d pages of replies; anything past that is older than the new cursor and will not be delivered",
+	// Replies come back oldest first, so what is left is newer than everything
+	// read. In a conversation outside the home channel that is the end of it:
+	// the cursor stops at the newest reply this walk reached, and the rest is
+	// waiting there for the walk after it. The home channel keeps one cursor
+	// for the whole pass, so anything newer in the same pass carries it past
+	// these replies — which is the bound the design note describes for that
+	// side.
+	log.Printf("stopped reading a thread after %d pages of replies; the rest waits for the next walk, unless something newer in the same pass has carried the home channel's cursor past it",
 		maxThreadCatchUpPages)
-	return messages, nil
+	return threadRead{messages: messages, read: read}, nil
+}
+
+// threadRead is one read of a conversation: the replies it may hand over, and
+// how far it got. The two are not the same — a conversation where somebody
+// else has been talking has been read whether or not any of it was the
+// owner's — and the cursor follows the second.
+type threadRead struct {
+	messages []Message
+	read     string
 }
 
 // ClampTimeout turns the tool's timeout_seconds argument into a duration,
@@ -1161,6 +2364,13 @@ func (b *Bridge) startIndicatorAt(startedAt time.Time, channel, threadTS string)
 func (b *Bridge) startIndicatorLocked(startedAt time.Time, channel, threadTS string) {
 	b.stopIndicatorLocked()
 	if b.cfg.IndicatorDisabled || b.api == nil {
+		return
+	}
+	if b.closed {
+		// The session is over. A call that had already taken a batch can still
+		// be handing it over as Close returns, and an indicator started here
+		// would be a goroutine and a message in the channel that outlive the
+		// shutdown that waited for everything else.
 		return
 	}
 

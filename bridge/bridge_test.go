@@ -26,6 +26,14 @@ type fakeAPI struct {
 	channelHistory map[string][]candidate
 	// historyErr, when set, fails the next History call.
 	historyErr error
+	// historyGate, when set, holds every History call open until the test
+	// closes it.
+	historyGate chan struct{}
+	// beforeHistoryReturns runs inside History, once the request has been
+	// recorded and before the page goes back. It is how a test makes something
+	// happen while one particular read is in flight — the search for an
+	// abandoned question, say, which its bounded window identifies.
+	beforeHistoryReturns func(HistoryRequest)
 	// channelHistoryErr fails History for one channel only, which is how a
 	// scope the app has in its home channel and nowhere else behaves.
 	channelHistoryErr map[string]error
@@ -62,6 +70,12 @@ type fakeAPI struct {
 	// is what makes each one distinct.
 	postCount  int
 	questionTS string
+	// questionDelay makes posting a question take time, so a test can watch a
+	// call give up on it.
+	questionDelay time.Duration
+	// resolveGate, when set, holds every chat.update that retires a question
+	// open until the test closes it.
+	resolveGate chan struct{}
 	// beforeQuestionReturns runs inside PostQuestion, after Slack would have
 	// created the message but before the caller learns its ts.
 	beforeQuestionReturns func()
@@ -138,11 +152,32 @@ func (f *fakeAPI) historyForLocked(channel string) []candidate {
 	return f.channelHistory[channel]
 }
 
-func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, error) {
+func (f *fakeAPI) History(ctx context.Context, req HistoryRequest) (HistoryPage, error) {
+	f.mu.Lock()
+	// Recorded before the gate, so a test holding catch-up open can see that it
+	// has started.
+	f.historyCalls = append(f.historyCalls, req)
+	gate := f.historyGate
+	hook := f.beforeHistoryReturns
+	f.mu.Unlock()
+	if hook != nil {
+		hook(req)
+	}
+	if gate != nil {
+		// Held open so a test can make something happen while catch-up is in
+		// flight, which is otherwise a window too small to aim at. The context
+		// still ends it, as the real request would: a caller that has given up
+		// — or a connection that has been replaced — is not waiting on Slack.
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return HistoryPage{}, ctx.Err()
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.historyCalls = append(f.historyCalls, req)
 	if f.historyErr != nil {
 		return HistoryPage{}, f.historyErr
 	}
@@ -169,12 +204,28 @@ func (f *fakeAPI) History(_ context.Context, req HistoryRequest) (HistoryPage, e
 		reversed = append(reversed, matched[i])
 	}
 
-	hasMore := false
-	if req.Limit > 0 && len(reversed) > req.Limit {
-		reversed = reversed[:req.Limit]
-		hasMore = true
+	// Paged the way Slack pages: a cursor into the newest-first list, and a
+	// next one whenever there is more behind the page being returned.
+	start := 0
+	if req.Cursor != "" {
+		parsed, err := strconv.Atoi(req.Cursor)
+		if err != nil {
+			return HistoryPage{}, fmt.Errorf("bad cursor %q", req.Cursor)
+		}
+		start = parsed
 	}
-	return HistoryPage{Messages: reversed, HasMore: hasMore}, nil
+	if start > len(reversed) {
+		start = len(reversed)
+	}
+	reversed = reversed[start:]
+
+	page := HistoryPage{Messages: reversed}
+	if req.Limit > 0 && len(reversed) > req.Limit {
+		page.Messages = reversed[:req.Limit]
+		page.HasMore = true
+		page.NextCursor = strconv.Itoa(start + req.Limit)
+	}
+	return page, nil
 }
 
 func (f *fakeAPI) Replies(_ context.Context, req RepliesRequest) (HistoryPage, error) {
@@ -290,11 +341,22 @@ func (f *fakeAPI) PostPlain(_ context.Context, channel, threadTS, text string) (
 	return ts, nil
 }
 
-func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
+func (f *fakeAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error) {
 	f.mu.Lock()
 	f.questions = append(f.questions, questionCall{Channel: channel, ThreadTS: threadTS, Question: q})
 	hook, ts, err := f.beforeQuestionReturns, f.questionTS, f.questionErr
+	delay := f.questionDelay
 	f.mu.Unlock()
+
+	// A Slack that takes its time, and a caller that can give up on it — which
+	// is what the question's own timeout does.
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 
 	// The message exists in Slack before this call returns, so a test can use
 	// the hook to click on it while the caller is still waiting.
@@ -307,7 +369,21 @@ func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Qu
 	return ts, nil
 }
 
-func (f *fakeAPI) ResolveQuestion(_ context.Context, channel, ts, text string) error {
+func (f *fakeAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) error {
+	f.mu.Lock()
+	gate := f.resolveGate
+	f.mu.Unlock()
+
+	if gate != nil {
+		// Held open so a test can watch a caller give up on retiring a
+		// question, the way it would on a Slack that has stopped answering.
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -369,6 +445,97 @@ type fakeStream struct {
 	reactions    chan Reaction
 	// reactionsDropped stands in for a queue that overflowed.
 	reactionsDropped atomic.Bool
+	// pendingOverflow stands in for a message refused for want of room that
+	// the stream has not been able to announce yet.
+	pendingOverflow atomic.Bool
+	// eventsClosed marks the message half as closed, so the hello a fresh
+	// connection sends is not sent onto a closed channel.
+	eventsClosed atomic.Bool
+	// finished stands in for the producer having stopped, which the real
+	// stream reports before it closes anything.
+	finished          chan struct{}
+	closeFinishedOnce sync.Once
+	// hung marks a producer that never finishes: nothing is announced and no
+	// channel is closed, which is what a socket wedged inside a send looks
+	// like from the bridge.
+	hung atomic.Bool
+
+	// closeEventsOnce and friends make closing idempotent: the connector
+	// closes everything when the connection's context is cancelled, the way
+	// the real socket does, and a test may have closed one of them already.
+	closeEventsOnce       sync.Once
+	closeInteractionsOnce sync.Once
+	closeReactionsOnce    sync.Once
+}
+
+// PendingOverflow reports a refused message the stream has not announced.
+func (s *fakeStream) PendingOverflow() bool { return s.pendingOverflow.Load() }
+
+// Finished closes when the producer has stopped.
+func (s *fakeStream) Finished() <-chan struct{} { return s.finished }
+
+// hang makes the stream one whose producer never finishes: it says it will
+// announce the end, and then does not, and its channels stay open. It is what a
+// socket wedged inside a send looks like from here.
+func (s *fakeStream) hang() {
+	s.hung.Store(true)
+}
+
+// noteFinished says the producer has stopped, which the real stream does
+// before it closes any channel. A hung stream never gets there.
+func (s *fakeStream) noteFinished() {
+	if s.hung.Load() {
+		return
+	}
+	s.closeFinishedOnce.Do(func() { close(s.finished) })
+}
+
+// closeEvents ends the message half of the stream.
+func (s *fakeStream) closeEvents() {
+	if s.hung.Load() {
+		return
+	}
+	s.closeEventsOnce.Do(func() {
+		s.noteFinished()
+		s.eventsClosed.Store(true)
+		close(s.events)
+	})
+}
+
+// sayHello puts the announcement a socket makes when it comes up on the
+// stream, unless this one has been closed — a test that closed it before
+// connecting is describing a socket that never came up at all.
+func (s *fakeStream) sayHello() {
+	if s.eventsClosed.Load() {
+		return
+	}
+	select {
+	case s.events <- StreamEvent{Kind: StreamConnected}:
+	default:
+	}
+}
+
+// closeInteractions ends the click half.
+func (s *fakeStream) closeInteractions() {
+	s.closeInteractionsOnce.Do(func() {
+		// Any channel closing means the real stream's consumer has returned,
+		// so the fake says so too. A test that closes one channel is
+		// describing a producer that has stopped.
+		s.noteFinished()
+		close(s.interactions)
+	})
+}
+
+// closeAll ends the whole stream, in the order the real one does: reactions,
+// then clicks, then the events channel a disconnection is reported from.
+func (s *fakeStream) closeAll() {
+	if s.hung.Load() {
+		return
+	}
+	s.noteFinished()
+	s.closeReactionsOnce.Do(func() { close(s.reactions) })
+	s.closeInteractions()
+	s.closeEvents()
 }
 
 func newFakeStream() *fakeStream {
@@ -376,6 +543,7 @@ func newFakeStream() *fakeStream {
 		events:       make(chan StreamEvent, 16),
 		interactions: make(chan Interaction, 16),
 		reactions:    make(chan Reaction, 16),
+		finished:     make(chan struct{}),
 	}
 }
 
@@ -393,18 +561,35 @@ type fakeConnector struct {
 	api    *fakeAPI
 	stream *fakeStream
 	err    error
+	// quiet holds back the hello, for a test that wants to send it itself and
+	// choose when.
+	quiet bool
 
 	mu    sync.Mutex
 	calls int
 }
 
-func (c *fakeConnector) Connect(context.Context, Config) (API, Stream, error) {
+func (c *fakeConnector) Connect(ctx context.Context, _ Config) (API, Stream, error) {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
 
 	if c.err != nil {
 		return nil, nil, c.err
+	}
+	// The real connector's stream closes its channels when the connection's
+	// context is cancelled, and the pump waits for that on its way out. A fake
+	// that never closed would make every shutdown wait out that deadline.
+	go func() {
+		<-ctx.Done()
+		c.stream.closeAll()
+	}()
+	// The socket says hello as soon as it is up, which is after Connect has
+	// returned and while the first catch-up is in flight. The bridge knows
+	// that hello for the catch-up it already asked for, so a test that wants a
+	// reconnect has to send a second one — which is what a reconnect is.
+	if !c.quiet {
+		c.stream.sayHello()
 	}
 	return c.api, c.stream, nil
 }
@@ -508,9 +693,12 @@ func TestFirstWaitReturnsTheBacklogMissedWhileDown(t *testing.T) {
 	if got := b.Status().LastTS; got != "100.000300" {
 		t.Errorf("last_ts = %q, want 100.000300", got)
 	}
-	if got, _ := store.LastTS(testChannel); got != "100.000300" {
-		t.Errorf("persisted last_ts = %q, want 100.000300 so a restart does not replay", got)
-	}
+	// The state file is written by a goroutine of its own, off the paths that
+	// must not wait for a disk, so it catches up a moment after the delivery.
+	eventuallyOnDisk(t, "the cursor to reach the state file", func() bool {
+		got, _ := store.LastTS(testChannel)
+		return got == "100.000300"
+	})
 
 	// Nothing new has happened, so the next wait should block rather than
 	// hand the same messages over again.
@@ -843,7 +1031,7 @@ func TestWaitFailsWhenTheClickChannelCloses(t *testing.T) {
 	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
 	defer func() { _ = b.Close() }()
 
-	close(stream.interactions)
+	stream.closeInteractions()
 
 	done := make(chan error, 1)
 	go func() {
@@ -879,21 +1067,23 @@ func TestAStaleStreamClosingDoesNotInvalidateTheReplacement(t *testing.T) {
 	}
 
 	// A replacement connection is installed, as a reconnect would.
-	replacement := newFakeStream()
 	b.mu.Lock()
-	b.stream = replacement
+	stale := b.connGeneration
+	b.stream = newFakeStream()
+	b.connGeneration++
+	live := b.connGeneration
 	b.connected = true
 	b.mu.Unlock()
 
-	// The straggler now notices the old stream closing.
-	b.noteStreamClosed(old)
+	// The straggler now notices the old connection closing.
+	b.noteStreamClosed(stale, old)
 
 	if !b.Status().Connected {
-		t.Error("Status() reports disconnected after a stale stream closed, which would open a second socket alongside the live one")
+		t.Error("Status() reports disconnected after a stale connection closed, which would open a second socket alongside the live one")
 	}
 
 	// The live one closing is a different matter.
-	b.noteStreamClosed(replacement)
+	b.noteStreamClosed(live, b.currentStream())
 	if b.Status().Connected {
 		t.Error("Status() still reports connected after the current stream closed")
 	}
@@ -909,7 +1099,7 @@ func TestWaitFailsWhenTheStreamClosesForGood(t *testing.T) {
 	b := New(context.Background(), cfg, &fakeConnector{api: &fakeAPI{}, stream: stream})
 	defer func() { _ = b.Close() }()
 
-	close(stream.events)
+	stream.closeEvents()
 
 	if _, err := b.Wait(context.Background(), MaxWaitTimeout); err == nil {
 		t.Error("Wait() = nil error after the stream closed, want the disconnection reported")
@@ -1003,4 +1193,20 @@ func TestWaitHonoursContextCancellation(t *testing.T) {
 	if _, err := b.Wait(ctx, MaxWaitTimeout); !errors.Is(err, context.Canceled) {
 		t.Errorf("Wait() error = %v, want context.Canceled", err)
 	}
+}
+
+// currentStream reports the stream the bridge is on, for tests that drive the
+// disconnect notice directly.
+func (b *Bridge) currentStream() Stream {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stream
+}
+
+// replyCallsSnapshot copies the thread reads, so a test can count them without
+// holding the fake's lock.
+func (f *fakeAPI) replyCallsSnapshot() []RepliesRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]RepliesRequest(nil), f.replyCalls...)
 }

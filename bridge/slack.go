@@ -212,6 +212,63 @@ type ReactionStream interface {
 	ReactionsDropped() bool
 }
 
+// StreamFinisher is the optional half of Stream that says when its producer
+// has stopped: once Finished is closed, nothing more will be put on any of the
+// stream's channels.
+//
+// It exists for the moment a connection ends. The channels closing says the
+// same thing eventually, but a producer can be between its last send and its
+// close for as long as the socket library takes — and a reaction queued in
+// that moment, on a connection nobody is reading any more, is a vote in no
+// history that nothing would go back for. Waiting on this rather than on a
+// timer is what makes the difference between "it has finished" and "it has
+// not finished yet".
+//
+// Reached by type assertion, like the rest: a stream that does not implement
+// it is waited for on the timer, as before.
+type StreamFinisher interface {
+	// Finished closes when the producer has stopped, before the stream's
+	// channels are closed.
+	Finished() <-chan struct{}
+}
+
+// streamFinished returns a stream's producer-finished channel, or nil if it has
+// none. A nil channel blocks for ever in a select, which is exactly "this
+// stream never says".
+func streamFinished(stream Stream) <-chan struct{} {
+	f, ok := stream.(StreamFinisher)
+	if !ok {
+		return nil
+	}
+	return f.Finished()
+}
+
+// OverflowReporter is the optional half of Stream that says whether it has
+// refused a message it has not yet reported. A stream reports an overflow by
+// putting a StreamDropped event on its events channel — which it can only do
+// once that channel has room, and the overflow happened because it had none.
+// Between the two the bridge would otherwise believe it had missed nothing, and
+// a reaction judged in that window is judged against the conversations a
+// message it never saw would have opened.
+//
+// Reached by type assertion, like the reaction half: a stream that predates it
+// simply never reports one.
+type OverflowReporter interface {
+	// PendingOverflow reports whether a message has been refused and not yet
+	// announced. It does not clear the record: the announcement does.
+	PendingOverflow() bool
+}
+
+// streamPendingOverflow asks a stream whether it is holding an overflow it has
+// not been able to report yet.
+func streamPendingOverflow(stream Stream) bool {
+	o, ok := stream.(OverflowReporter)
+	if !ok {
+		return false
+	}
+	return o.PendingOverflow()
+}
+
 // reactionsOf returns a stream's reaction channel, or nil if it has none. A nil
 // channel blocks for ever in a select, which is exactly "this stream never
 // delivers reactions".
