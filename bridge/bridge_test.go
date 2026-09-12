@@ -415,6 +415,10 @@ type fakeStream struct {
 	// stream reports before it closes anything.
 	finished          chan struct{}
 	closeFinishedOnce sync.Once
+	// hung marks a producer that never finishes: nothing is announced and no
+	// channel is closed, which is what a socket wedged inside a send looks
+	// like from the bridge.
+	hung atomic.Bool
 
 	// closeEventsOnce and friends make closing idempotent: the connector
 	// closes everything when the connection's context is cancelled, the way
@@ -430,14 +434,27 @@ func (s *fakeStream) PendingOverflow() bool { return s.pendingOverflow.Load() }
 // Finished closes when the producer has stopped.
 func (s *fakeStream) Finished() <-chan struct{} { return s.finished }
 
+// hang makes the stream one whose producer never finishes: it says it will
+// announce the end, and then does not, and its channels stay open. It is what a
+// socket wedged inside a send looks like from here.
+func (s *fakeStream) hang() {
+	s.hung.Store(true)
+}
+
 // noteFinished says the producer has stopped, which the real stream does
-// before it closes any channel.
+// before it closes any channel. A hung stream never gets there.
 func (s *fakeStream) noteFinished() {
+	if s.hung.Load() {
+		return
+	}
 	s.closeFinishedOnce.Do(func() { close(s.finished) })
 }
 
 // closeEvents ends the message half of the stream.
 func (s *fakeStream) closeEvents() {
+	if s.hung.Load() {
+		return
+	}
 	s.closeEventsOnce.Do(func() {
 		s.noteFinished()
 		s.eventsClosed.Store(true)
@@ -472,6 +489,9 @@ func (s *fakeStream) closeInteractions() {
 // closeAll ends the whole stream, in the order the real one does: reactions,
 // then clicks, then the events channel a disconnection is reported from.
 func (s *fakeStream) closeAll() {
+	if s.hung.Load() {
+		return
+	}
 	s.noteFinished()
 	s.closeReactionsOnce.Do(func() { close(s.reactions) })
 	s.closeInteractions()

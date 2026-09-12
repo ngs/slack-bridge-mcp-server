@@ -445,7 +445,12 @@ func awaitStreamClose(events <-chan StreamEvent, finished <-chan struct{}) (late
 	// waiting it out here cannot make a shutdown slower than it was.
 	wait := streamCloseWait
 	if finished != nil {
-		wait = pumpStopWait
+		// Long, because there is something definite to wait for — and a step
+		// short of the wait shutdown spends on the pump, so a producer that
+		// never finishes ends this before Close gives up on it rather than at
+		// the same moment. Which of the two logged first was otherwise a
+		// matter of scheduling.
+		wait = pumpStopWait - streamCloseWait
 	}
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
@@ -521,12 +526,21 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	if lost {
 		b.reactionsDropped = true
 	}
-	// The producer had not finished when the wait for it ran out, so it can
-	// still put a reaction on a channel nobody will read again — and one that
-	// fits sets no marker of its own. Before the staleness check, because by
-	// the time a connection is being ended it has almost always been replaced
-	// already: a check after it would never run.
+
+	// A producer that had not finished when the wait for it ran out can still
+	// put a reaction on a channel nobody will read again, and one that fits
+	// sets no marker of its own. Only for a stream that says when it stops:
+	// one that does not has been waited for as long as it can be, and calling
+	// every slow close a loss is how the marker stops meaning anything.
 	//
+	// Before the staleness check, and that is the whole of why it is here. By
+	// the time a connection is being ended it has been replaced already —
+	// every path that ends one moves the generation before or as it cancels —
+	// so a check below would never run at all.
+	if !closed && streamFinished(stream) != nil {
+		b.reactionsDropped = true
+	}
+
 	if b.stale(generation) {
 		// A connection that has already been replaced hands nothing over:
 		// what is left on its channels belongs to a connection nobody owns,
@@ -611,15 +625,6 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		b.absorbReactionLocked(r)
 	}
 	if len(reactions) > 0 {
-		b.noteReactionsDroppedLocked()
-	}
-
-	// A producer that had not finished when the wait for it ran out can still
-	// put a reaction on a channel nobody will read again, and one that fits
-	// sets no marker of its own. Only for a stream that says when it stops:
-	// one that does not has been waited for as long as it can be, and calling
-	// every slow close a loss is how the marker stops meaning anything.
-	if !closed && streamFinished(stream) != nil {
 		b.noteReactionsDroppedLocked()
 	}
 

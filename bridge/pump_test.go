@@ -3380,3 +3380,73 @@ func TestAStreamThatSaysWhenItStopsIsWaitedFor(t *testing.T) {
 		t.Error("a producer that said it had finished was reported as a loss")
 	}
 }
+
+// The report of a producer that would not finish has to happen before the
+// staleness check, because by the time a connection is being ended it has been
+// replaced already: every path that ends one moves the generation before or as
+// it cancels. Put after that check, the report never runs at all — which is
+// where it sat, twice, before this.
+func TestAHungProducerIsReportedOnAConnectionAlreadyReplaced(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	stale := b.currentGeneration() - 1
+
+	// A stream that says when it stops and then does not, on a connection that
+	// has already been replaced — and nothing left on its channels, so the
+	// stale branch itself has nothing to report.
+	hung := newFakeStream()
+	events := make(chan StreamEvent)
+	reactions := make(chan Reaction)
+
+	b.finishStream(stale, hung, events, nil, reactions, nil)
+
+	if !b.droppedReactionMark() {
+		t.Error("a producer that never finished was not reported; the report sits after a check that has already failed by then")
+	}
+}
+
+// And the same thing through the paths a session actually takes: a reconnect,
+// and a shutdown. Both move the generation as they cancel, so both arrive at
+// the teardown with the connection already replaced.
+func TestAHungProducerIsReportedThroughTheOrdinaryPaths(t *testing.T) {
+	t.Run("on a reconnect", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		b, _, stream := mentionBridge(ctx, t)
+		if result := waitOnce(ctx, t, b); !result.TimedOut {
+			t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+		}
+
+		// The socket stops answering: it says it will announce the end and
+		// never does, and its channels stay open.
+		stream.hang()
+		b.forceReconnect()
+
+		eventually(t, "the connection reader to give up on the producer", b.droppedReactionMark)
+	})
+
+	t.Run("on a shutdown", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		b, _, stream := mentionBridge(ctx, t)
+		if result := waitOnce(ctx, t, b); !result.TimedOut {
+			t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+		}
+
+		stream.hang()
+		if err := b.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		if !b.droppedReactionMark() {
+			t.Error("a shutdown that gave up on the producer said nothing about what it might have been holding")
+		}
+	})
+}
