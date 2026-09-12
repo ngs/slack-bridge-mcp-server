@@ -79,12 +79,6 @@ func TestCatchUpRecoversARepliedThreadWhileDisconnected(t *testing.T) {
 		t.Errorf("recovered reply thread_ts = %q, want 100.000200", threadReply.ThreadTS)
 	}
 
-	// A thread reply is often the newest thing in the channel, which is
-	// exactly what the cursor should now be pointing at.
-	if got := b.Status().LastTS; got != "100.000400" {
-		t.Errorf("last_ts = %q, want it advanced past the recovered reply", got)
-	}
-
 	// And it is not fetched a second time.
 	second, err := b.Wait(ctx, 20*testGrace)
 	if err != nil {
@@ -92,6 +86,18 @@ func TestCatchUpRecoversARepliedThreadWhileDisconnected(t *testing.T) {
 	}
 	if !second.TimedOut {
 		t.Errorf("second Wait() = %+v, want a timeout; the reply was already delivered", second)
+	}
+
+	// A thread reply is often the newest thing in the channel, which is
+	// exactly what the cursor should end up pointing at.
+	//
+	// Read after the second pass rather than the first. The walk can reach
+	// past the moment its own pass began, so how far it got is applied only on
+	// a pass nothing asked to have repeated — and the first pass of a session
+	// is asked to be repeated whenever the socket says hello after the window
+	// was read, which is a race with this test rather than what it is about.
+	if got := b.Status().LastTS; got != "100.000400" {
+		t.Errorf("last_ts = %q, want it advanced past the recovered reply", got)
 	}
 	if got := api.snapshotReactions(); len(got) != 0 {
 		t.Errorf("reactions = %+v with auto-ack off, want none", got)
@@ -484,6 +490,17 @@ func TestCatchUpPagesAThreadToItsEnd(t *testing.T) {
 	}
 	if len(result.Messages) != 13 {
 		t.Fatalf("Wait() returned %d messages, want the parent and all 12 replies", len(result.Messages))
+	}
+
+	// One more pass, and nothing new in it: the walk's reach lands on a pass
+	// nothing asked to have repeated, and the first pass of a session is asked
+	// to be repeated whenever the socket says hello after the window was read.
+	second, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if !second.TimedOut {
+		t.Errorf("second Wait() = %v, want a timeout; every reply was already delivered", texts(second.Messages))
 	}
 	if got := b.Status().LastTS; got != "100.000311" {
 		t.Errorf("last_ts = %q, want the newest reply; anything less means replies were skipped", got)

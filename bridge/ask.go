@@ -592,7 +592,13 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 	me := b.botUserID
 	b.mu.Unlock()
 
-	if orphan == nil || api == nil {
+	if orphan == nil {
+		return
+	}
+	if api == nil {
+		// Nothing was looked at, so nothing was learned. Put back for a call
+		// that has a connection to look with.
+		b.keepOrphanQuestion(orphan)
 		return
 	}
 	if me == "" {
@@ -607,6 +613,9 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 	// looking for a question that may never have landed is not worth the
 	// timeout the caller was promised.
 	if budget <= 0 {
+		// Not looked at either, so the next question with time to spare is the
+		// one to look. No attempt counted: nothing was spent on this.
+		b.keepOrphanQuestion(orphan)
 		return
 	}
 	if budget > orphanSearchWait {
@@ -651,6 +660,16 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 	// left, or Slack will not take it, the question goes back on the shelf and
 	// the next one tries again — which is the difference between a message
 	// somebody else will go back for and one nobody will.
+	//
+	// Remembered as retired before the request goes out, the same way a
+	// question this call owns is. Whether or not Slack takes it, those buttons
+	// are not the next question's answer — and this call is about to post that
+	// question, in the window where a tap on the old one cannot be told apart
+	// by timestamp.
+	b.mu.Lock()
+	b.retiredTS = found
+	b.mu.Unlock()
+
 	if err := b.tryResolve(api, orphan.channel, found, orphanExpiredText, time.Until(ends)); err != nil {
 		orphan.attempts++
 		if !errors.Is(err, context.DeadlineExceeded) || orphan.attempts > maxOrphanAttempts {

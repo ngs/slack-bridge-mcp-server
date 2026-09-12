@@ -3678,3 +3678,147 @@ func TestARefusedMessageSurvivesAThreadWalkThatReachedPastIt(t *testing.T) {
 		t.Errorf("second batch = %v, want the message that was refused; the cursor followed a reply posted while the walk was running and stepped over it", texts(second))
 	}
 }
+
+// The twin of the test above with the owner doing the talking. It is the more
+// ordinary case by far — the owner replying in a thread while the channel
+// floods is exactly what a busy conversation looks like — and it takes a
+// different route to the cursor: their reply is handed over, so it reaches the
+// cursor through the batch rather than through how far the walk read.
+//
+// Fail-first: with the cursor taken from the newest message in the batch
+// rather than the newest message on the channel surface, it lands on the
+// owner's reply and the refused message is never seen again.
+func TestARefusedMessageSurvivesTheOwnersOwnReplyBehindIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{botUserID: testBotUser}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	var history []candidate
+	for i := 0; i <= maxPendingMessages; i++ {
+		ts := fmt.Sprintf("100.%06d", i+1000)
+		history = append(history, ownerMsg(ts, "flood"))
+		b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: ts, Channel: testChannel, User: testOwner, Text: "flood",
+		}})
+	}
+	history = append(history, candidate{
+		Channel: testChannel, User: colleague, Text: "a thread",
+		TS: "100.005000", LatestReply: "100.020000", ReplyCount: 1,
+	})
+	if !b.catchUpDue() || b.pendingHomeCount() != maxPendingMessages {
+		t.Fatalf("setup: catch-up due = %v, queued = %d", b.catchUpDue(), b.pendingHomeCount())
+	}
+
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.history = history
+	// The owner, talking in the thread rather than on the channel.
+	api.replies = []candidate{reply("100.020000", "100.005000", "answering in the thread")}
+	api.historyGate = gate
+	calls := len(api.historyCalls)
+	api.mu.Unlock()
+
+	generation := b.currentGeneration()
+	first := make(chan []Message, 1)
+	go func() {
+		msgs, _, err := b.drainCatchUp(ctx, generation, true, 5*time.Second)
+		if err != nil {
+			t.Errorf("drainCatchUp() error = %v", err)
+		}
+		first <- msgs
+	}()
+
+	eventually(t, "the catch-up to reach Slack", func() bool { return len(api.calls()) > calls })
+
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.009999", Channel: testChannel, User: testOwner, Text: "refused",
+	}})
+	close(gate)
+	delivered := <-first
+
+	// The reply is handed over either way. It is only the cursor that must not
+	// follow it.
+	replied := false
+	for _, m := range delivered {
+		if m.TS == "100.020000" {
+			replied = true
+		}
+	}
+	if !replied {
+		t.Fatalf("the owner's thread reply was not handed over: %v", texts(delivered))
+	}
+
+	api.mu.Lock()
+	api.historyGate = nil
+	api.history = append(history, ownerMsg("100.009999", "refused"))
+	api.mu.Unlock()
+
+	second, _, err := b.drainCatchUp(ctx, generation, true, 5*time.Second)
+	if err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+	if len(second) != 1 || second[0].TS != "100.009999" {
+		t.Errorf("second batch = %v, want the message that was refused; the cursor followed the owner's own reply and stepped over it", texts(second))
+	}
+}
+
+// The walk can read a reply posted while it was running, and a channel message
+// posted in that same moment is in none of the pages the pass fetched either.
+// So how far the walk says the pass reached is cut back to the moment the pass
+// began — otherwise the cursor claims the surface has been read to a point
+// nothing read it to.
+//
+// Fail-first: without the bound, the cursor below lands on a reply timestamped
+// after the pass started.
+func TestTheThreadWalkCannotSayThePassReachedPastItsOwnStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Timestamps on this machine's clock, because that is what the bound is
+	// taken from: a reply Slack stamps after the pass began.
+	parent := slackTS(time.Now().Add(-time.Minute))
+	ahead := slackTS(time.Now().Add(time.Hour))
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, slackTS(time.Now().Add(-2*time.Minute))); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		history: []candidate{{
+			Channel: testChannel, User: colleague, Text: "a thread",
+			TS: parent, LatestReply: ahead, ReplyCount: 1,
+		}},
+		replies: []candidate{colleagueReply(ahead, parent, "posted while the walk was running")},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout; nothing here is the owner's", result)
+	}
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("second Wait() = %+v, want a timeout", result)
+	}
+
+	if got := b.Status().LastTS; !tsLess(got, ahead) {
+		t.Errorf("last_ts = %q, want it behind the reply at %q: a channel message sent in that same moment is in no page this pass read, and the cursor would step over it", got, ahead)
+	}
+}

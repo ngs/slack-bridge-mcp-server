@@ -1548,8 +1548,13 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// moving the cursor leaves those messages in the window, and the pass that
 	// comes after finds them there and drops them as delivered; taking the
 	// cursor from what survived that would leave it behind them for good.
-	newest := newestTS(home)
-	if last := newestTS(read); tsLess(newest, last) {
+	// The channel surface only, on both counts. What a batch carries from
+	// inside a thread is in no history page, so it says nothing about how far
+	// history has been read — and a reply the walk brought back can be newer
+	// than everything the pass fetched. Those go through walked below, which
+	// is bounded for exactly that reason.
+	newest := newestSurfaceTS(home)
+	if last := newestSurfaceTS(read); tsLess(newest, last) {
 		newest = last
 	}
 	// And past the pages themselves. A read that found only other people's
@@ -1558,23 +1563,24 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	if tsLess(newest, looked) {
 		newest = looked
 	}
-	// And past the replies the thread walk read — but only on a pass nothing
-	// interrupted.
+	// And past the replies the thread walk read — every reply it saw, whoever
+	// wrote it, and only on a pass nothing interrupted.
 	//
 	// The walk is the one read that can reach past the moment the pass began:
 	// a reply posted while it was running is newer than every page of channel
-	// history this pass fetched, and it is in none of them. On a quiet pass
-	// that is harmless, because the socket was delivering everything else all
-	// along. It is not harmless when a message was refused for want of room —
-	// the refusal is what makes the cursor safe to move over the queue, and it
-	// is safe only as far as the read went. A cursor taken from the walk would
-	// step over a channel message of the same age that nothing ever read, and
-	// nothing would go back for it.
+	// history this pass fetched, and it is in none of them. It is bounded to
+	// the start of the pass for that reason, so this can only be a moment the
+	// history read already covers.
 	//
-	// So the walk's reach is applied only when nothing has asked for another
-	// catch-up since this one started, which is what the epoch says. When
-	// something has, the pass that answers it walks the same threads once more
-	// and moves the cursor then.
+	// The epoch is the second bound, and it is the one that holds when the
+	// clocks disagree. A message refused for want of room is what makes the
+	// cursor safe to move over the queue at all, and it is safe only as far as
+	// this pass read: a cursor taken from a reply of the same age as the
+	// refused message would step over a channel message nothing ever read, and
+	// nothing would go back for it. So when something has asked for another
+	// catch-up since this one started, the walk's reach waits — and the pass
+	// that answers it walks the same threads once more and moves the cursor
+	// then.
 	if epoch == b.catchUpEpoch && tsLess(newest, walked) {
 		newest = walked
 	}
@@ -1914,6 +1920,12 @@ func (b *Bridge) seedCursor(ctx context.Context, api API, generation uint64, cha
 	return ts, nil
 }
 
+// walkReachSlack is how far back the bound on the thread walk's reach is taken
+// from this machine's clock. The moment is local and the timestamps are
+// Slack's, and being early costs a thread read again on the next pass while
+// being late costs a message. Same reasoning as orphanClockSlack, same size.
+const walkReachSlack = 5 * time.Second
+
 // catchUp returns the owner messages Slack has that the caller has not seen.
 // conversations.history returns every author in the channel, so the same owner
 // filter the live stream applies has to be applied here too.
@@ -1926,6 +1938,10 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) (window
 	if api == nil {
 		return window{}, errors.New("the bridge is not connected to Slack")
 	}
+
+	// Taken before the first request, and used to bound how far the thread
+	// walk is allowed to say this pass reached. See window.threadsRead.
+	began := slackTS(time.Now().Add(-walkReachSlack))
 
 	var (
 		messages []Message
@@ -1966,6 +1982,15 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) (window
 	if err != nil {
 		return window{}, err
 	}
+	// Not past the moment this pass began. A reply posted while the walk was
+	// running is in none of the history pages above, and a channel message
+	// posted alongside it is in none of them either — so a cursor taken from
+	// the reply would claim the surface had been read up to a moment nothing
+	// read it to. The reply is still handed over; only the claim is trimmed,
+	// and the next pass reads that thread once more.
+	if tsLess(began, readThreads) {
+		readThreads = began
+	}
 	// A cursor left over means the walk stopped at its page bound with more
 	// window behind it. The caller is told so it can come back: the cursor
 	// moves only through what was delivered, so another pass continues from
@@ -1987,12 +2012,13 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) (window
 // messages; how far it looked counts every message in every page it read, so
 // that a page of somebody else's conversation moves the cursor past itself
 // rather than being read again by the next pass that comes along.
-// The thread walk's reach is kept apart from both. It is the one timestamp a
-// read can produce that is newer than the moment the read started: a reply
-// posted while the walk was running belongs to no page of channel history, and
-// a cursor taken from it would step over a channel message of the same age
-// that this pass never saw. Which is exactly the case a refusal leaves behind,
-// so the caller applies it only on a pass nothing interrupted.
+// The thread walk's reach is kept apart from both, and bounded. A reply posted
+// while the walk was running belongs to no page of channel history this pass
+// fetched, and neither does a channel message posted in the same moment — so a
+// cursor taken from that reply would claim the surface had been read to a
+// moment nothing read it to, and step over the channel message for good. It is
+// cut back to the moment the pass began for that reason, and the caller
+// applies even that only on a pass nothing interrupted.
 type window struct {
 	messages    []Message
 	read        string

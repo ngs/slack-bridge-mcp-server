@@ -259,13 +259,30 @@ func splitTS(ts string) (seconds, sequence int64, ok bool) {
 // enough to be free.
 const messageDedupWindow = 1024
 
-// newestTS reports the last timestamp in a batch the merge has sorted, or
-// empty for an empty one.
-func newestTS(msgs []Message) string {
-	if len(msgs) == 0 {
-		return ""
+// newestSurfaceTS reports the newest channel-surface timestamp in a batch,
+// skipping the replies it carries from inside threads, or empty when there are
+// none.
+//
+// The home cursor is a statement about what conversations.history has been
+// read to, and a thread reply is in no history page. It can also be newer than
+// anything the pass fetched — a reply posted while the thread walk was
+// running — so a cursor taken from one claims the channel has been read up to
+// a moment it has not. How far the walk reached is reported on its own, and
+// bounded on its own.
+//
+// It scans rather than taking the last: the batch is sorted by timestamp, and
+// the newest thing in it may well be one of the replies being skipped.
+func newestSurfaceTS(msgs []Message) string {
+	newest := ""
+	for _, m := range msgs {
+		if m.ThreadTS != "" && m.ThreadTS != m.TS {
+			continue
+		}
+		if tsLess(newest, m.TS) {
+			newest = m.TS
+		}
 	}
-	return msgs[len(msgs)-1].TS
+	return newest
 }
 
 // deliveredKey identifies a message across connections. A timestamp is unique

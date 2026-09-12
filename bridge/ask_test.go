@@ -2066,3 +2066,118 @@ func TestAnAbandonedQuestionSurvivesASearchTheCallerGaveUpOn(t *testing.T) {
 		t.Error("the question left standing by an abandoned post still has its buttons")
 	}
 }
+
+// A question found by the search for an abandoned one is retired the same way,
+// and the same thing can go wrong with it: Slack may not take the update, or
+// may take its time over it, and those buttons are still on the owner's screen
+// while this call posts a question of its own. Taps on them are not its answer.
+//
+// Fail-first: without remembering what the search sent away, the taps below
+// fill the buffer that covers the posting window and the owner's own click is
+// dropped.
+func TestTapsOnAnAbandonedQuestionDoNotCrowdOutTheNextAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+
+	orphanTS := slackTS(time.Now())
+	// Slack never answers the update that would retire it, so its buttons stay
+	// live while the next question goes up.
+	stuck := make(chan struct{})
+	defer close(stuck)
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.resolveGate = stuck
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.beforeQuestionReturns = func() {
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, orphanTS, 0))
+		}
+		b.routeInteraction(click(testOwner, askTS, 1))
+	}
+	api.mu.Unlock()
+
+	// Generous, because the search and the retirement come out of it first.
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("Ask() = %+v, want the owner's click on the new question honoured as choice 1", result)
+	}
+}
+
+// A call with no time left does not look for an abandoned question, and a call
+// with no connection cannot. Neither has learned anything about it, so neither
+// is the one to decide it is gone.
+//
+// Fail-first: without the put-back, one question asked with a timeout too
+// short to look is enough to forget the abandoned one for good.
+func TestAnAbandonedQuestionSurvivesACallWithNoTimeToLook(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+	if !b.hasOrphanQuestion() {
+		t.Fatal("setup: the abandoned post was not remembered")
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.mu.Unlock()
+
+	// A question whose timeout is already spent by the time it gets here. It
+	// says so and posts nothing.
+	if result, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  -time.Second,
+	}); err != nil || !result.TimedOut {
+		t.Fatalf("Ask() = %+v, err = %v, want a timeout without posting", result, err)
+	}
+
+	if !b.hasOrphanQuestion() {
+		t.Error("the abandoned question was forgotten by a call that never looked for it; its buttons stay in the channel and nothing looks again")
+	}
+}

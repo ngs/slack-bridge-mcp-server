@@ -492,16 +492,22 @@ Two invariants hold across all of it, whatever is arriving:
   on every catch-up. The home channel's thread walk counts the same way: a
   thread whose only newer reply is a colleague's hands nothing over, and left
   out of how far the pass got, `latest_reply` goes on saying "news here" and
-  every later catch-up spends a round trip learning it again. With one
-  exception, and it belongs to the walk alone: it is the only read that can
-  reach past the moment its own pass began, because a reply posted while it was
-  running is in no page of channel history that pass fetched. On a pass that
-  something interrupted — a message refused for want of room, above all — a
-  cursor taken from such a reply would step over a channel message of the same
-  age that nothing read. So the walk's reach is applied only when nothing has
-  asked for another catch-up since this one started; when something has, the
-  pass that answers it walks the same threads once more and moves the cursor
-  then.
+  every later catch-up spends a round trip learning it again.
+- **The home cursor is a statement about channel history, so only the channel
+  surface sets it.** A thread reply is in no history page — whoever wrote it,
+  and whether the pass handed it over or merely read it — so it cannot say how
+  far history has been read. The walk reports its reach separately, and that
+  reach is bounded twice over. It is cut back to the moment the pass began,
+  because a reply posted while the walk was running is in none of the pages the
+  pass fetched and neither is a channel message posted in the same moment: a
+  cursor taken from the reply would step over that message for good. And it is
+  applied only when nothing has asked for another catch-up since the pass
+  started, which is what keeps it behind a message refused for want of room —
+  the refusal is what makes the cursor safe to move over the queue at all, and
+  it is safe only as far as this pass read. When something has asked, the pass
+  that answers it walks the same threads once more and moves the cursor then:
+  one extra read, with the delivered window keeping the replies from arriving
+  twice.
 - **The home cursor follows what a pass read, and stops at what it did not hand
   over.** Every message in every page counts towards how far a read got, so a
   page of somebody else's conversation moves the cursor past itself; a message
@@ -681,9 +687,16 @@ is worse than a question never asked. If there is not enough left the question g
 back on the shelf and the next call tries again, three times over before it is
 let go of; a Slack that refuses the retirement outright is not tried again at
 all. The search itself is put back on the same terms: a caller that gives up
-part-way through one, or a search that runs out of budget, has learned nothing
-about the question — treating that as final would leave the buttons in the
-channel with nothing ever looking for them again.
+part-way through one, a search that runs out of budget, a call with no time to
+look or no connection to look with — none of them has learned anything about
+the question, and treating that as final would leave the buttons in the channel
+with nothing ever looking for them again.
+
+What the search does retire is remembered the same way a question the call owns
+is, before the request goes out and whether or not Slack takes it. Those
+buttons are on the owner's screen while this very call posts a question of its
+own, in the window where a tap on the old one cannot be told apart by
+timestamp.
 
 One thing it can get wrong, harmlessly: if the post never landed but an earlier
 question of the bridge's is still live inside the window — one whose own
