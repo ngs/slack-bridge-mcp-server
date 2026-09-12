@@ -175,6 +175,12 @@ type Bridge struct {
 	// the catch-up that covers what was missed while the session was down is
 	// asked for when the connection is opened rather than when it says hello.
 	connectAnnounced bool
+	// connectHole is the hole count as this connection asked for its own
+	// catch-up. The hello that follows is that request arriving, and this is
+	// what says so: a count that has moved since means something else has
+	// happened, and the hello is not the only thing this connection has to
+	// answer for.
+	connectHole uint64
 	// overflowNoted marks an overflow the stream is holding that has already
 	// been answered with a request to read the window again. The stream keeps
 	// reporting it until it has room to announce it, and this is what keeps
@@ -728,8 +734,10 @@ func (b *Bridge) ensure() error {
 	}()
 	// The first catch-up covers everything missed since the last session;
 	// StreamConnected events later cover reconnects. A hole, because that is
-	// what a session that was not running is.
+	// what a session that was not running is — and remembered, so the hello
+	// this connection is about to send is known for what it is.
 	b.requestCatchUpForHoleLocked()
+	b.connectHole = b.holeEpoch
 	return nil
 }
 
@@ -862,6 +870,19 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 		// reporting the disconnection before taking it would throw away what
 		// the owner actually sent.
 		if b.streamGone(generation) {
+			// One last look at the queues, without Slack. The drain above can
+			// come back empty without having merged them — its budget ran out
+			// while a history request was still open, or it never got its turn
+			// — and what the connection delivered before it died is in those
+			// queues, received and not yet handed over. Reporting the closure
+			// over the top of it would throw away the owner's own messages.
+			//
+			// No cursor moves, as in a storm: this pass read nothing, so it
+			// cannot say where history has been read to.
+			msgs, drained := b.takeQueues(generation)
+			if len(msgs) > 0 || len(drained) > 0 {
+				return b.deliver(ctx, generation, msgs, drained), nil
+			}
 			return WaitResult{}, errors.New("the Slack connection closed")
 		}
 
@@ -1076,7 +1097,11 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		// missed.
 		firstHello := !b.connectAnnounced
 		b.connectAnnounced = true
-		if firstHello && b.needCatchUp {
+		if firstHello && b.holeEpoch == b.connectHole {
+			// Nothing has happened to this connection since it asked for its
+			// own catch-up, so this is that request saying hello. Whether the
+			// catch-up has run by now is beside the point — it was asked for,
+			// and asking again would read the same window twice.
 			return
 		}
 		// A reconnect underneath a connection that was never replaced — the
@@ -1540,6 +1565,21 @@ func (b *Bridge) oldestPendingLocked() string {
 		}
 	}
 	return oldest
+}
+
+// takeQueues hands over what the connection delivered before it died, without
+// reading anything: the closure is about to be reported, and what is in the
+// queues was received.
+func (b *Bridge) takeQueues(generation uint64) ([]Message, []Reaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(generation) {
+		// The queues belong to the connection that replaced this one.
+		return nil, nil
+	}
+	msgs, reactions, _ := b.handOverQueuesLocked(true)
+	return msgs, reactions
 }
 
 // handOverQueuesLocked hands over what the socket has already delivered,

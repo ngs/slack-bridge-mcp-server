@@ -101,7 +101,12 @@ func indicatorBridgeWith(ctx context.Context, t *testing.T, history []candidate)
 	api := &fakeAPI{history: history, postTS: "100.000900"}
 
 	stream := newFakeStream()
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	// Without the socket's hello. These tests measure a race inside the
+	// indicator — the label waking its goroutine against the reply that ends
+	// the turn — and an extra event on the way in weighs the scheduler on one
+	// side of it. The race is the pre-existing flake these tests are known
+	// for, and it is not this connection's hello that causes it.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
 	t.Cleanup(func() { _ = b.Close() })
 	return b, api, stream
 }

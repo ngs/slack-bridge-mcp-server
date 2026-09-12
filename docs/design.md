@@ -484,9 +484,13 @@ It is held for one catch-up, in a queue of its own, and then judged again. Still
 matching nothing, it is dropped without a word — it is somebody else's emoji in
 a channel the session is only sitting in, which is a tally rather than an event,
 and `slack_reactions` reads tallies. The separate queue is what keeps those from
-crowding out the reactions waiting to be delivered, or from setting the marker
-that tells the agent its count is wrong; when it is full the oldest goes, as
-everywhere else. One turn of grace applies even with no catch-up outstanding,
+crowding out the reactions waiting to be delivered. When it is full the oldest
+goes, as everywhere else, and that one loss is reported: a reaction judged out
+of scope is a tally and says nothing, but one dropped for want of room was being
+kept because a catch-up might yet put it in scope, so what went may be a vote
+the agent would have been given. The line is between judging and running out of
+room — a marker set by every out-of-scope emoji in every channel the session is
+sitting in would mean nothing at all. One turn of grace applies even with no catch-up outstanding,
 because the moment between a refusal and its announcement is exactly the moment
 where nothing has been asked for yet.
 

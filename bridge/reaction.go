@@ -290,6 +290,14 @@ func (b *Bridge) drainReactionsLocked() []Reaction {
 			// reaction waiting on a mention that a hole swallowed is one of
 			// the newer ones, and the older it is the likelier it belongs to
 			// nothing at all.
+			//
+			// And the agent is told, which is the one place these say so.
+			// Judging one of these as out of scope is not a loss — it is a
+			// tally, and the marker would mean nothing if every such reaction
+			// set it. Running out of room is different: what goes was being
+			// kept precisely because a catch-up might yet put it in scope, so
+			// what is lost may be a vote the agent would have been given.
+			b.noteReactionsDroppedLocked()
 			held = held[1:]
 		}
 		held = append(held, heldReaction{r: r, at: b.catchUpRuns})

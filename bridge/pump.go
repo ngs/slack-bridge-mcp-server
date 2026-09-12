@@ -88,7 +88,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 		// of them.
 		applied, keep := b.applyReady(generation, events, reactions, carried)
 		carried = keep
-		if applied == maxSweep {
+		if applied >= maxSweep {
 			// A flood defers the reactions, and nothing else. Clicks have no
 			// order to keep with messages and no history to be recovered from,
 			// and a shutdown that waited for the flood to end would be a
@@ -240,9 +240,10 @@ func (b *Bridge) applyReady(generation uint64, events <-chan StreamEvent, reacti
 	keep = carried
 	b.underLive(generation, func() {
 		applied = drainLocked(events, maxSweep, b.absorbLocked)
-		if applied == maxSweep {
-			return
-		}
+		// Even at the bound. Reaching it is not proof that more is waiting,
+		// and the reaction step is where that question is asked — skipping it
+		// here would let go of the lock with reactions deferred behind a
+		// channel that is already empty.
 		more, left := b.takeReactionsLocked(events, reactions, carried, maxSweep-applied)
 		applied += more
 		keep = left
@@ -270,10 +271,22 @@ func (b *Bridge) takeReactionsLocked(events <-chan StreamEvent, reactions <-chan
 	drainLocked(reactions, maxPendingReactions, func(r Reaction) { ready = append(ready, r) })
 
 	applied = drainLocked(events, room, b.absorbLocked)
-	if applied == room && room > 0 {
-		// Messages are still waiting, which is the one thing a reaction may
-		// not be judged in front of. They wait together.
-		return applied, b.carryLocked(carried, ready)
+	if applied == room {
+		// The sweep spent its whole quota, which says nothing about whether
+		// anything is left: it may have taken the last message there was. One
+		// more receive is what tells the two apart, and the answer decides
+		// whether these reactions may be judged now.
+		//
+		// It matters because the lock is about to be let go. A reaction
+		// deferred while the channel is empty is one a call can miss while
+		// taking the messages it belongs with — the pair the pump exists to
+		// keep together, split by a bound rather than by a message.
+		if b.anotherEventLocked(events) {
+			applied++
+			// Messages are still waiting, which is the one thing a reaction
+			// may not be judged in front of. They wait together.
+			return applied, b.carryLocked(carried, ready)
+		}
 	}
 
 	// Carried before the channel's, because they were taken first.
@@ -284,6 +297,23 @@ func (b *Bridge) takeReactionsLocked(events <-chan StreamEvent, reactions <-chan
 		b.absorbReactionLocked(r)
 	}
 	return applied, nil
+}
+
+// anotherEventLocked applies one more message if the channel has one, and
+// reports whether it did. It is the probe at a sweep's bound: a quota spent is
+// not the same as a channel with more in it. The caller must hold b.mu.
+func (b *Bridge) anotherEventLocked(events <-chan StreamEvent) bool {
+	select {
+	case evt, ok := <-events:
+		if !ok {
+			// Closed, and drained: there is nothing more to wait for.
+			return false
+		}
+		b.absorbLocked(evt)
+		return true
+	default:
+		return false
+	}
 }
 
 // carryOne holds one reaction over to the next turn, within the bound.
@@ -390,14 +420,12 @@ func (b *Bridge) applyEventLocked(evt StreamEvent, events <-chan StreamEvent, re
 	// the one just taken would otherwise be queued while that mention is still
 	// unapplied — and judged against a conversation that has not opened yet.
 	applied := drainLocked(events, maxSweep, b.absorbLocked)
-	if applied == maxSweep {
-		return carried
-	}
 
 	// The carried ones go in here too, under this lock. Leaving them for the
 	// next turn would let a call drain the message just applied without the
 	// reaction that arrived with it, which is the split this design exists to
-	// remove.
+	// remove. At the bound as well: whether anything is still waiting is the
+	// reaction step's question, and it answers it by looking.
 	_, keep = b.takeReactionsLocked(events, reactions, carried, maxSweep-applied)
 	return keep
 }
@@ -436,6 +464,19 @@ func awaitStreamClose(events <-chan StreamEvent) (late []StreamEvent, closed boo
 		case <-deadline.C:
 			return late, false
 		}
+	}
+
+	// The bound was reached, which says the channel was busy rather than that
+	// it is still open. One more look, without waiting: a stream that closed
+	// after handing over exactly this many is a clean close, and calling it a
+	// timeout would report reactions lost that never were.
+	select {
+	case evt, ok := <-events:
+		if !ok {
+			return late, true
+		}
+		late = append(late, evt)
+	default:
 	}
 	return late, false
 }

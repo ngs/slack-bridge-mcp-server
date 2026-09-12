@@ -408,6 +408,9 @@ type fakeStream struct {
 	// pendingOverflow stands in for a message refused for want of room that
 	// the stream has not been able to announce yet.
 	pendingOverflow atomic.Bool
+	// eventsClosed marks the message half as closed, so the hello a fresh
+	// connection sends is not sent onto a closed channel.
+	eventsClosed atomic.Bool
 
 	// closeEventsOnce and friends make closing idempotent: the connector
 	// closes everything when the connection's context is cancelled, the way
@@ -422,7 +425,23 @@ func (s *fakeStream) PendingOverflow() bool { return s.pendingOverflow.Load() }
 
 // closeEvents ends the message half of the stream.
 func (s *fakeStream) closeEvents() {
-	s.closeEventsOnce.Do(func() { close(s.events) })
+	s.closeEventsOnce.Do(func() {
+		s.eventsClosed.Store(true)
+		close(s.events)
+	})
+}
+
+// sayHello puts the announcement a socket makes when it comes up on the
+// stream, unless this one has been closed — a test that closed it before
+// connecting is describing a socket that never came up at all.
+func (s *fakeStream) sayHello() {
+	if s.eventsClosed.Load() {
+		return
+	}
+	select {
+	case s.events <- StreamEvent{Kind: StreamConnected}:
+	default:
+	}
 }
 
 // closeInteractions ends the click half.
@@ -460,6 +479,9 @@ type fakeConnector struct {
 	api    *fakeAPI
 	stream *fakeStream
 	err    error
+	// quiet holds back the hello, for a test that wants to send it itself and
+	// choose when.
+	quiet bool
 
 	mu    sync.Mutex
 	calls int
@@ -480,6 +502,13 @@ func (c *fakeConnector) Connect(ctx context.Context, _ Config) (API, Stream, err
 		<-ctx.Done()
 		c.stream.closeAll()
 	}()
+	// The socket says hello as soon as it is up, which is after Connect has
+	// returned and while the first catch-up is in flight. The bridge knows
+	// that hello for the catch-up it already asked for, so a test that wants a
+	// reconnect has to send a second one — which is what a reconnect is.
+	if !c.quiet {
+		c.stream.sayHello()
+	}
 	return c.api, c.stream, nil
 }
 
