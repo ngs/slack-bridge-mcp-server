@@ -167,7 +167,12 @@ func (b *Bridge) seenReactionLocked(r Reaction) bool {
 func (b *Bridge) noteReactionsDropped() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	b.reactionsDropped = true
+	// A loss is something to hear about as much as a reaction is: a wait
+	// blocked on a long timeout would otherwise sit out the whole of it before
+	// telling the agent its count is wrong.
+	b.notifyPendingLocked()
 }
 
 // drainReactions takes everything queued for the next delivery.
@@ -184,6 +189,13 @@ func (b *Bridge) drainReactions(generation uint64) []Reaction {
 	if b.stale(generation) {
 		return nil
 	}
+	return b.drainReactionsLocked()
+}
+
+// drainReactionsLocked is drainReactions for a caller that already holds b.mu
+// and has checked its generation — which is how a batch of messages and the
+// reactions that arrived with them leave the queues as one step.
+func (b *Bridge) drainReactionsLocked() []Reaction {
 
 	if len(b.pendingReactions) == 0 {
 		return nil

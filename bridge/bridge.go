@@ -559,15 +559,21 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 	defer deadline.Stop()
 
 	for {
+		// Before anything is taken off a queue. A caller that has given up
+		// should not consume a batch on its way out: those messages are the
+		// owner's, and the next call is the one that will answer them.
+		if err := ctx.Err(); err != nil {
+			return WaitResult{}, err
+		}
+
 		// Catch-up first: a pending backlog outranks waiting for something
 		// new, and on a reconnect it is the only place missed messages are.
 		// Everything the socket has delivered is already in the queues, put
 		// there by the pump, so there is nothing to sweep here.
-		msgs, err := b.drainCatchUp(ctx, generation)
+		msgs, drained, err := b.drainCatchUp(ctx, generation, true)
 		if err != nil {
 			return WaitResult{}, err
 		}
-		drained := b.drainReactions(generation)
 		if len(msgs) > 0 || len(drained) > 0 {
 			return b.deliver(ctx, generation, msgs, drained), nil
 		}
@@ -598,11 +604,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// and including from another call entirely, and reporting an empty
 			// timeout on top of one would hold it back for another full poll
 			// while the owner waits on a reply.
-			msgs, err := b.drainCatchUp(ctx, generation)
+			if err := ctx.Err(); err != nil {
+				return WaitResult{}, err
+			}
+			msgs, drained, err := b.drainCatchUp(ctx, generation, true)
 			if err != nil {
 				return WaitResult{}, err
 			}
-			drained := b.drainReactions(generation)
 			if len(msgs) > 0 || len(drained) > 0 {
 				// Delivered is delivered, however close to the bell it was. A
 				// timed_out of true alongside messages would be read as "call
@@ -740,12 +748,16 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		}
 		if len(*queue) >= maxPendingMessages {
 			b.requestCatchUpLocked()
-			if !b.cursorSeeded {
-				// Refused before the cursor exists. The seed about to be
+			if home && !b.cursorSeeded {
+				// Refused before the home cursor exists. The seed about to be
 				// established would filter this message out as older than
 				// itself, so the seed is given up on instead: the cursor is
 				// taken from the messages actually handed over, and catch-up
 				// reads everything after them.
+				//
+				// Only for the home channel. A reply queued elsewhere has
+				// nothing to do with that cursor, and giving up the seed for
+				// one would replay the home channel's history as new.
 				b.preSeedRefused = true
 			}
 			// One line per episode, not one per message. This runs under the
@@ -777,7 +789,7 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 // The cursor is advanced and persisted only once the messages are about to be
 // returned, so a failure anywhere earlier leaves the bridge ready to fetch
 // them again on the next call rather than skipping past them.
-func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message, error) {
+func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReactions bool) ([]Message, []Reaction, error) {
 	b.mu.Lock()
 	needCatchUp := b.needCatchUp
 	epoch := b.catchUpEpoch
@@ -792,6 +804,10 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 	// committed below, under the same generation check as everything else.
 	scan := &scanChanges{}
 
+	// gapped marks a catch-up that was asked for again while this one was in
+	// flight, which means there is a hole somewhere after the window it read.
+	var gapped bool
+
 	var (
 		fetched, conversations []Message
 		// seeding marks the first run against a channel, where the cursor is
@@ -805,7 +821,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 			// than replaying the channel's entire history into the agent.
 			seeded, err := b.seedCursor(ctx, api, generation, channel)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			lastTS = seeded
 			seeding = true
@@ -813,7 +829,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 			var err error
 			fetched, err = catchUp(ctx, api, channel, owner, lastTS)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 
@@ -822,7 +838,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		var err error
 		conversations, err = b.catchUpConversations(ctx, api, owner, generation, scan)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -846,7 +862,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		// moved on — treating everything sent in between as history and
 		// delivering none of it. Kept in memory only; the write belongs to the
 		// call that hands the messages over.
-		if seeding && !b.cursorSeeded {
+		if seeding && !b.cursorSeeded && !b.closed {
 			b.lastTS = lastTS
 			b.cursorSeeded = true
 			// The messages taken while that seed was being read are still
@@ -855,7 +871,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 			// what filters them out.
 			b.seedMergePending = true
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	if needCatchUp {
@@ -901,6 +917,14 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		// answer that request with a window that did not include it.
 		if epoch == b.catchUpEpoch {
 			b.needCatchUp = false
+		} else {
+			// There is a gap, somewhere after what this fetch covered. The
+			// live messages queued behind it are newer than the gap, and
+			// handing them over would move the cursor past it — so they stay
+			// where they are, and the catch-up that has been asked for reads
+			// the window again with them still in the queue. What was fetched
+			// is delivered: that window has no gap in it.
+			gapped = true
 		}
 	}
 
@@ -918,14 +942,36 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		cursor = ""
 		b.seedMergePending = false
 	}
-	home := mergeMessages(cursor, fetched, b.pending)
-	b.pending = nil
+
+	live := b.pending
+	if gapped {
+		// Left in the queue rather than merged: see above.
+		live = nil
+	}
+	home := mergeMessages(cursor, fetched, live)
+	if !gapped {
+		b.pending = nil
+	}
 
 	threads := b.mergeThreadMessagesLocked(conversations, b.pendingThreads)
 	b.pendingThreads = nil
 
+	// Taken here, under the same lock, rather than by a second call. Two waits
+	// running together could otherwise split a pair the pump applied as one:
+	// the first takes the message and yields, the second takes the reaction
+	// that came with it, and each hands over half.
+	//
+	// Only for a caller that delivers them. A question collects the messages
+	// that arrived while it was up and returns them with its answer, but it
+	// has nowhere to put a reaction — taking one here would be taking it off
+	// the wait that reports them.
+	var reactions []Reaction
+	if takeReactions {
+		reactions = b.drainReactionsLocked()
+	}
+
 	if len(home) == 0 && len(threads) == 0 {
-		return nil, nil
+		return nil, reactions, nil
 	}
 
 	if len(home) > 0 {
@@ -951,7 +997,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64) ([]Message
 		b.noteThreadDeliveredLocked(m)
 	}
 
-	return mergeConversations(home, threads), nil
+	return mergeConversations(home, threads), reactions, nil
 }
 
 // mergeThreadMessagesLocked combines what the threads outside the home channel

@@ -491,10 +491,21 @@ counted apart, so a flood in one cannot crowd out the other — and the replies
 outside the home channel are the ones that matter most here, because that
 catch-up is best effort and stands down entirely when a scope is missing.
 
+A delivery takes both queues in one step, under the lock. Two waits running
+together could otherwise split a pair the pump applied as one: the first takes
+the message and yields, the second takes the reaction that came with it, and
+each hands over half. A question is the exception — it collects the messages
+that arrived while it was up and has nowhere to put a reaction, so it leaves
+them for the wait that reports them.
+
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again
 since it started; otherwise a reconnect, or a message refused for want of room,
-would be answered by a fetch that never knew about it.
+would be answered by a fetch that never knew about it. The same epoch decides
+what that fetch may hand over: a request raised while it was in flight means
+there is a hole after the window it read, so the live messages queued behind
+that hole stay queued — delivering them would move the cursor past what the hole
+swallowed.
 
 **One writer for the state file.** Every cursor the bridge keeps — how far the
 home channel has been read, how far each conversation outside it has, how far

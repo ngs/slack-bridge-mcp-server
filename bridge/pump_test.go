@@ -816,7 +816,7 @@ func TestAStaleWaitCommitsNoMessages(t *testing.T) {
 	eventually(t, "the pump to take the message", func() bool { return b.Status().PendingBacklogCount == 1 })
 
 	live := b.currentGeneration()
-	msgs, err := b.drainCatchUp(ctx, live-1)
+	msgs, _, err := b.drainCatchUp(ctx, live-1, true)
 	if err != nil {
 		t.Fatalf("drainCatchUp() error = %v", err)
 	}
@@ -881,5 +881,79 @@ func TestAnEventAppliesTheCarriedReactionWithIt(t *testing.T) {
 	}
 	if kept := b.drainReactions(generation); len(kept) != 1 {
 		t.Errorf("drainReactions() = %+v, want the carried reaction applied with the message it arrived with", kept)
+	}
+}
+
+// A catch-up asked for again while this one was fetching means there is a hole
+// after the window it read. The live messages queued behind that hole are newer
+// than it, and handing them over would move the cursor past it — so that
+// catch-up leaves them where they are, for the one that covers the hole.
+func TestAGappedCatchUpKeepsTheLiveBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// Connect first, so there is a generation and a cursor to work from, and
+	// only then hold history open.
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.historyGate = gate
+	calls := len(api.historyCalls)
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	generation := b.currentGeneration()
+	type batch struct {
+		msgs []Message
+		err  error
+	}
+	done := make(chan batch, 1)
+	go func() {
+		msgs, _, err := b.drainCatchUp(ctx, generation, true)
+		done <- batch{msgs, err}
+	}()
+
+	// A live message, and then the socket reporting a hole — both while the
+	// history request is in flight.
+	eventually(t, "catch-up to reach Slack", func() bool { return len(api.calls()) > calls })
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.000300", Channel: testChannel, User: testOwner, Text: "newer than the hole",
+	}})
+	b.absorb(StreamEvent{Kind: StreamDropped})
+	close(gate)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("drainCatchUp() error = %v", got.err)
+	}
+	for _, m := range got.msgs {
+		if m.TS == "100.000300" {
+			t.Fatal("the message behind the hole was handed over, which moves the cursor past what the hole swallowed")
+		}
+	}
+	if got := b.Status().LastTS; got != "100.000100" {
+		t.Errorf("last_ts = %q, want it left behind the hole", got)
+	}
+	if b.Status().PendingBacklogCount != 1 {
+		t.Error("the message behind the hole was dropped rather than kept for the catch-up that covers it")
 	}
 }

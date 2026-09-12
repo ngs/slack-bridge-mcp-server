@@ -397,7 +397,7 @@ func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Mes
 // that closed has no session left to hand a backlog to, and moving the cursor
 // there would consume messages nobody ever received.
 func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64) []Message {
-	msgs, err := b.drainCatchUp(ctx, generation)
+	msgs, _, err := b.drainCatchUp(ctx, generation, false)
 	if err != nil {
 		log.Printf("could not collect the messages that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
 		return nil
