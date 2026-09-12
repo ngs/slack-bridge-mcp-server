@@ -414,9 +414,16 @@ func TestTheMentionSearchIsBounded(t *testing.T) {
 		t.Errorf("the search read %d channels, want it capped at %d", len(scanned), maxScannedChannels)
 	}
 	// One more than the cap is asked for, because the home channel is skipped
-	// and would otherwise cost one of the twenty.
-	if got := api.joinedCalls; len(got) != 1 || got[0] != maxScannedChannels+1 {
-		t.Errorf("users.conversations calls = %v, want one asking for %d channels", got, maxScannedChannels+1)
+	// and would otherwise cost one of the twenty. Every time it is asked: the
+	// socket's hello brings a second pass, which reads the same way.
+	if len(api.joinedCalls) == 0 {
+		t.Fatal("the search never asked which channels the app is in")
+	}
+	for _, got := range api.joinedCalls {
+		if got != maxScannedChannels+1 {
+			t.Errorf("users.conversations calls = %v, want each asking for %d channels", api.joinedCalls, maxScannedChannels+1)
+			break
+		}
 	}
 }
 

@@ -1112,7 +1112,9 @@ func TestACatchUpBiggerThanOnePassDeliversWhatItReached(t *testing.T) {
 		botUserID:      testBotUser,
 		channelHistory: map[string][]candidate{testChannel: history},
 	}
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	// Without the socket's hello: this is about what one pass reads, and a
+	// hello asks for a pass of its own.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
 	t.Cleanup(func() { _ = b.Close() })
 
 	msgs := waitOnce(ctx, t, b).Messages
@@ -1235,15 +1237,15 @@ func TestAReactionWaitsWhileMessagesAreStillOnTheChannel(t *testing.T) {
 		TS: "200.000200", Channel: otherChannel, User: colleague, Reaction: "white_check_mark", Added: true,
 	}
 
-	// Room for one of the two messages. The sweep spends it, looks once more
-	// to see whether the channel is empty, finds the other — and that is what
-	// makes the reaction wait.
+	// Room for one of the two messages. The sweep spends it, sees that the
+	// channel still has something in it — looking, not taking, because taking
+	// would only move the boundary — and that is what makes the reaction wait.
 	b.mu.Lock()
 	applied, keep := b.takeReactionsLocked(events, reactions, nil, 1)
 	b.mu.Unlock()
 
-	if applied != 2 {
-		t.Fatalf("takeReactionsLocked() applied %d messages, want the one it had room for and the one it found looking", applied)
+	if applied != 1 {
+		t.Fatalf("takeReactionsLocked() applied %d messages, want the one it had room for", applied)
 	}
 	if len(keep) != 1 {
 		t.Errorf("takeReactionsLocked() carried %+v, want the reaction to wait for the message still on the channel", keep)
@@ -2105,7 +2107,9 @@ func TestMoreOpenThreadsThanOnePassReadsStillSettles(t *testing.T) {
 		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
 	}
 	stream := newFakeStream()
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	// Without the socket's hello: this counts what the budget rule costs, and
+	// a hello brings a pass of its own.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
 	t.Cleanup(func() { _ = b.Close() })
 
 	if result := waitOnce(ctx, t, b); !result.TimedOut {
@@ -2149,51 +2153,43 @@ func (b *Bridge) threadsWaiting() bool {
 }
 
 // the socket's own Connected event on first connect discards the
-// initial seed pass.
-func TestAConnectionsOwnHelloDoesNotDiscardItsFirstCatchUp(t *testing.T) {
+// A connection's own hello is the catch-up it already asked for arriving, as
+// long as that catch-up has not gone to Slack yet: raising a hole for it would
+// throw away the read it is about to make. Once the read has happened the same
+// hello means something else, which is the case the test above covers.
+func TestAHelloThatBeatsTheFirstReadIsNotAHole(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cfg := testConfig(t)
-	cfg.IndicatorDisabled = true
-	cfg.AutoAckDisabled = true
-	api := &fakeAPI{
-		botUserID:      testBotUser,
-		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
-		historyGate:    make(chan struct{}),
-	}
-	// The socket says hello as soon as the WebSocket is up, which the fake
-	// connector does too: after Connect has returned, while the first catch-up
-	// is in flight.
-	stream := newFakeStream()
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
-	t.Cleanup(func() { _ = b.Close() })
-
-	done := make(chan WaitResult, 1)
-	go func() {
-		r, _ := b.Wait(ctx, 2*time.Second)
-		done <- r
-	}()
-	eventually(t, "seed to reach Slack", func() bool { return len(api.calls()) >= 1 })
-	// The hello is on its way while the seed is held open, which is the race
-	// this is about.
-	eventually(t, "the pump to have taken the hello", func() bool { return len(stream.events) == 0 })
-	close(api.historyGate)
-	<-done
-	t.Logf("history calls on first connect: %d", len(api.calls()))
-	if n := len(api.calls()); n > 1 {
-		t.Errorf("the seed was read %d times; the hello that follows every connect threw the first away", n)
+	b, _, _ := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
 	}
 
-	// A second hello is a reconnect, and that one is a hole.
-	before := len(api.calls())
-	b.absorb(StreamEvent{Kind: StreamConnected})
-	if !b.catchUpDue() {
-		t.Error("a reconnect under a connection that was never replaced asked for nothing")
+	// A connection that has just asked for its catch-up and not yet looked.
+	b.mu.Lock()
+	b.requestCatchUpForHoleLocked()
+	b.connectHole = b.holeEpoch
+	b.connectAnnounced = false
+	b.fetchSinceConnect = false
+	holes := b.holeEpoch
+	epoch := b.catchUpEpoch
+
+	b.absorbLocked(StreamEvent{Kind: StreamConnected})
+
+	sameHole := b.holeEpoch == holes
+	sameEpoch := b.catchUpEpoch == epoch
+	due := b.needCatchUp
+	b.mu.Unlock()
+
+	if !sameHole {
+		t.Error("the hello raised a hole of its own; the read it belongs to would be thrown away for it")
 	}
-	waitOnce(ctx, t, b)
-	if n := len(api.calls()); n <= before {
-		t.Error("the reconnect read no history; a hello after the first is a hole")
+	if !sameEpoch {
+		t.Error("the hello asked for another catch-up; the one it is announcing has not looked yet")
+	}
+	if !due {
+		t.Error("the catch-up this connection asked for is no longer due")
 	}
 }
 
@@ -2725,10 +2721,60 @@ func TestAClosedConnectionHandsOverWhatItReceivedFirst(t *testing.T) {
 	}
 }
 
+// Connect returns before the socket is up, so a catch-up that runs in between
+// reads a window that stops where it looked — and a message the owner sends
+// before the socket starts relaying is in history and nowhere else. Socket Mode
+// replays nothing, so the hello has to ask for the read that covers it.
+func TestAMessageSentBeforeTheSocketCameUpIsStillRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	stream := newFakeStream()
+	// The hello is held back, so it lands after the first catch-up has read
+	// and committed — which is what a socket slower than a history request
+	// looks like.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	if b.catchUpDue() {
+		t.Fatal("the first catch-up has not committed; this test is about what happens after it has")
+	}
+
+	// Sent while the socket was still coming up: history has it, and the
+	// socket will never relay it.
+	api.mu.Lock()
+	api.channelHistory[testChannel] = append(api.channelHistory[testChannel], ownerMsg("100.000200", "sent before the socket was up"))
+	api.mu.Unlock()
+
+	b.absorb(StreamEvent{Kind: StreamConnected})
+
+	if !b.catchUpDue() {
+		t.Fatal("the hello asked for nothing; the window between the first read and the socket coming up is read by nobody else")
+	}
+	msgs := waitOnce(ctx, t, b).Messages
+	if len(msgs) != 1 || msgs[0].TS != "100.000200" {
+		t.Errorf("Wait() = %v, want the message sent before the socket came up", texts(msgs))
+	}
+}
+
 // A sweep that spends its whole quota has not proved there is more to come: it
-// may have taken the last message there was. Deferring the reactions then lets
-// go of the lock with a pair split in two — the messages ready for whoever
-// asks, the reaction waiting for a turn that has nothing to do.
+// may have taken the last message there was. Deferring the reactions on that
+// assumption lets go of the lock with a pair split in two — the messages ready
+// for whoever asks next, the reaction waiting for a turn with nothing to do.
 func TestASweepThatEmptiesTheChannelAtItsBoundStillJudgesTheReactions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2782,44 +2828,5 @@ func TestAStreamThatClosedAtTheSweepBoundIsACleanClose(t *testing.T) {
 	}
 	if !closed {
 		t.Error("awaitStreamClose() called a closed channel a timeout; every reaction on that connection is then reported lost")
-	}
-}
-
-// The hello a connection sends is the catch-up it already asked for arriving,
-// whether or not that catch-up has finished by the time it lands. Measured
-// against the flag instead, a hello that arrives after the catch-up committed
-// reads as a reconnect — and every session pays for a second full pass,
-// mention scan and all.
-func TestALateHelloIsStillTheConnectionsOwn(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cfg := testConfig(t)
-	cfg.IndicatorDisabled = true
-	cfg.AutoAckDisabled = true
-	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
-		t.Fatalf("seeding the cursor: %v", err)
-	}
-
-	api := &fakeAPI{
-		botUserID:      testBotUser,
-		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
-	}
-	stream := newFakeStream()
-	// Held back, so the hello lands after the first catch-up has committed.
-	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
-	t.Cleanup(func() { _ = b.Close() })
-
-	if result := waitOnce(ctx, t, b); !result.TimedOut {
-		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
-	}
-	if b.catchUpDue() {
-		t.Fatal("the first catch-up has not finished; this test is about what happens after it has")
-	}
-
-	b.absorb(StreamEvent{Kind: StreamConnected})
-
-	if b.catchUpDue() {
-		t.Error("the connection's own hello asked for a second catch-up; the first one was asked for when the connection was opened")
 	}
 }

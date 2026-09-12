@@ -271,22 +271,17 @@ func (b *Bridge) takeReactionsLocked(events <-chan StreamEvent, reactions <-chan
 	drainLocked(reactions, maxPendingReactions, func(r Reaction) { ready = append(ready, r) })
 
 	applied = drainLocked(events, room, b.absorbLocked)
-	if applied == room {
-		// The sweep spent its whole quota, which says nothing about whether
-		// anything is left: it may have taken the last message there was. One
-		// more receive is what tells the two apart, and the answer decides
-		// whether these reactions may be judged now.
+	if applied == room && len(events) > 0 {
+		// The quota is spent and the channel still has something in it.
+		// Looking rather than taking, because taking would only move the
+		// boundary: a receive that emptied the channel would leave the
+		// reactions deferred behind a channel with nothing in it, which is the
+		// split this is here to prevent — the messages ready for whoever asks
+		// next, the reaction waiting for a turn with nothing to do.
 		//
-		// It matters because the lock is about to be let go. A reaction
-		// deferred while the channel is empty is one a call can miss while
-		// taking the messages it belongs with — the pair the pump exists to
-		// keep together, split by a bound rather than by a message.
-		if b.anotherEventLocked(events) {
-			applied++
-			// Messages are still waiting, which is the one thing a reaction
-			// may not be judged in front of. They wait together.
-			return applied, b.carryLocked(carried, ready)
-		}
+		// Messages are still waiting, which is the one thing a reaction may
+		// not be judged in front of. They wait together.
+		return applied, b.carryLocked(carried, ready)
 	}
 
 	// Carried before the channel's, because they were taken first.
@@ -297,23 +292,6 @@ func (b *Bridge) takeReactionsLocked(events <-chan StreamEvent, reactions <-chan
 		b.absorbReactionLocked(r)
 	}
 	return applied, nil
-}
-
-// anotherEventLocked applies one more message if the channel has one, and
-// reports whether it did. It is the probe at a sweep's bound: a quota spent is
-// not the same as a channel with more in it. The caller must hold b.mu.
-func (b *Bridge) anotherEventLocked(events <-chan StreamEvent) bool {
-	select {
-	case evt, ok := <-events:
-		if !ok {
-			// Closed, and drained: there is nothing more to wait for.
-			return false
-		}
-		b.absorbLocked(evt)
-		return true
-	default:
-		return false
-	}
 }
 
 // carryOne holds one reaction over to the next turn, within the bound.

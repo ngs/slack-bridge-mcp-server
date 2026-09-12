@@ -181,6 +181,12 @@ type Bridge struct {
 	// happened, and the hello is not the only thing this connection has to
 	// answer for.
 	connectHole uint64
+	// fetchSinceConnect marks this connection's catch-up as already gone to
+	// Slack. After that a hello is worth a pass of its own: Connect returns
+	// before the socket is up, so a window read in between covers a stretch of
+	// time the socket was not yet relaying — and a message sent in that gap is
+	// in history and nowhere else.
+	fetchSinceConnect bool
 	// overflowNoted marks an overflow the stream is holding that has already
 	// been answered with a request to read the window again. The stream keeps
 	// reporting it until it has room to announce it, and this is what keeps
@@ -703,8 +709,10 @@ func (b *Bridge) ensure() error {
 	}
 	b.stopConnection = stopConnection
 	b.connCtx = connCtx
-	// This connection has not said hello yet, and has thrown nothing away.
+	// This connection has not said hello yet, has read nothing, and has thrown
+	// nothing away.
 	b.connectAnnounced = false
+	b.fetchSinceConnect = false
 	b.holeDiscards = 0
 
 	b.api = api
@@ -921,6 +929,13 @@ func (b *Bridge) Wait(ctx context.Context, timeout time.Duration) (WaitResult, e
 			// flight is news, and a quiet timeout would leave it for whoever
 			// called next.
 			if b.streamGone(generation) {
+				// The same last look as the loop above: this pass read
+				// nothing, and what the connection delivered before it died is
+				// in the queues.
+				msgs, drained := b.takeQueues(generation)
+				if len(msgs) > 0 || len(drained) > 0 {
+					return b.deliver(ctx, generation, msgs, drained), nil
+				}
 				return WaitResult{}, errors.New("the Slack connection closed")
 			}
 			return WaitResult{
@@ -1091,17 +1106,32 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		// that request arriving, not a reconnect on top of it. Raising a hole
 		// here would discard the first catch-up of every session, every time.
 		//
-		// Only while that catch-up is still outstanding. A hello that arrives
-		// after it has run is not the one it was asked for, and the safe
-		// reading of a connection announcing itself is that something was
-		// missed.
+		// Only while that catch-up has not gone to Slack yet. Connect returns
+		// before the socket is up, so a window read before this hello covers a
+		// stretch of time the socket was not relaying: a message sent in that
+		// gap is in history and nowhere else, and the pass this hello asks for
+		// is the only thing that goes back for it. Socket Mode replays
+		// nothing.
 		firstHello := !b.connectAnnounced
 		b.connectAnnounced = true
 		if firstHello && b.holeEpoch == b.connectHole {
-			// Nothing has happened to this connection since it asked for its
-			// own catch-up, so this is that request saying hello. Whether the
-			// catch-up has run by now is beside the point — it was asked for,
-			// and asking again would read the same window twice.
+			if !b.fetchSinceConnect {
+				// Nothing has happened to this connection since it asked for
+				// its own catch-up, and that catch-up has not looked yet — so
+				// this is that request saying hello, and it will be answered
+				// by a read that already covers the socket being up.
+				return
+			}
+			// The catch-up has already looked, and what it read stops where it
+			// looked: the socket was not relaying yet, so a message sent
+			// between that read and this hello is in history and nowhere else.
+			// Another read covers it.
+			//
+			// A refusal rather than a hole. There is no gap in what has been
+			// applied — the socket has delivered nothing yet — so a catch-up
+			// in flight may still hand over everything it read. It only may
+			// not call the window finished.
+			b.requestCatchUpForRefusalLocked()
 			return
 		}
 		// A reconnect underneath a connection that was never replaced — the
@@ -1156,6 +1186,12 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// than a catch-up: no window, no scan, only the conversations that were
 	// skipped.
 	threadsOnly := !needCatchUp && b.threadsSkipped
+	if needCatchUp || threadsOnly {
+		// About to go to Slack. From here this connection's hello is worth a
+		// pass of its own, because what is read now cannot cover the time
+		// after it.
+		b.fetchSinceConnect = true
+	}
 	epoch := b.catchUpEpoch
 	holes := b.holeEpoch
 	seeded := b.cursorSeeded
