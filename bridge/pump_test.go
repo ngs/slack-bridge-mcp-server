@@ -607,6 +607,10 @@ func TestACancelledWaitReportsTheCancellationNotTheDisconnection(t *testing.T) {
 		done <- err
 	}()
 	eventually(t, "the wait to be listening", func() bool { return b.activeWaitCount() > 0 })
+	// And settled into its sleep. The count goes up before the first look at
+	// the queues, and a loss recorded before that look is one the wait finds
+	// for itself — which is not what this test is about.
+	time.Sleep(200 * time.Millisecond)
 	cancel()
 
 	select {
@@ -1377,9 +1381,10 @@ func TestReactionsAreReportedWhenTheClosingSweepCannotFinish(t *testing.T) {
 	}
 	generation := b.currentGeneration()
 
-	// More than both sweeps of the closing path together, so the channel
-	// cannot be emptied and the reactions have messages ahead of them.
-	const sent = maxSweep + maxClosingSweep + 1
+	// More than the teardown will take altogether, so the channel cannot be
+	// emptied and the reactions have messages ahead of them that will never be
+	// applied.
+	const sent = maxSweep + maxTeardownSweep + 1
 	events := make(chan StreamEvent, sent)
 	for i := 0; i < sent; i++ {
 		events <- StreamEvent{Kind: StreamMessage, Message: Message{
@@ -1456,5 +1461,136 @@ func TestAWaitAnswersOnTimeEvenWithSlackNotAnswering(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Wait() never came back: its own deadline did not bound the fetch it was waiting on")
+	}
+}
+
+// A message refused for want of room is announced as an event on the channel
+// that had no room, so the announcement waits for the flood to pass. Until it
+// arrives the bridge would believe it had missed nothing, and a reaction judged
+// in that window is judged against the conversations the refused message would
+// have opened. The pump asks the stream instead of waiting to be told.
+func TestAnOverflowIsSeenBeforeTheStreamCanAnnounceIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// Refused, and no room to say so.
+	stream.pendingOverflow.Store(true)
+	// Anything at all, to bring the pump round again.
+	stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.000300", Channel: testChannel, User: testOwner, Text: "the one that fitted",
+	}}
+
+	eventually(t, "the refused message to be asked for", func() bool { return b.catchUpDue() })
+}
+
+// A lost reaction is news in itself. The stream's marker used to be read only
+// by a call that happened to come round, so a wait blocked on a long timeout
+// could sit out the whole of it holding a count it had been told nothing about.
+func TestALostReactionWakesTheWaitThatIsBlocked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	type answer struct {
+		result WaitResult
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		result, err := b.Wait(ctx, 10*time.Second)
+		done <- answer{result, err}
+	}()
+	eventually(t, "the wait to be listening", func() bool { return b.activeWaitCount() > 0 })
+	// And settled into its sleep. The count goes up before the first look at
+	// the queues, and a loss recorded before that look is one the wait finds
+	// for itself — which is not what this test is about.
+	time.Sleep(200 * time.Millisecond)
+
+	// The reaction queue overflowed on the socket's side while the pump was
+	// busy with messages that go nowhere: someone else talking in a channel
+	// the session is not in. Nothing they carry reaches a queue, so nothing
+	// they carry would wake the wait.
+	stream.reactionsDropped.Store(true)
+	for i := 0; i < 8; i++ {
+		stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: fmt.Sprintf("400.%06d", i+1), Channel: otherChannel, User: colleague, Text: "not for us",
+		}}
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Wait() error = %v", got.err)
+		}
+		if !got.result.ReactionsDropped {
+			t.Errorf("Wait() = %+v, want the loss reported rather than waited out", got.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait sat out its timeout holding a loss nobody told it about")
+	}
+}
+
+// The seed's exemption belongs to the messages it was taken alongside, and
+// behind a gap those messages deliberately stay queued. Clearing the exemption
+// on the pass that leaves them there would have the next pass filter them
+// against the seed, and every one of them arrived before it.
+func TestAGappedSeedKeepsTheExemptionForTheQueueItLeftBehind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	gate := make(chan struct{})
+	api := &fakeAPI{
+		botUserID:   testBotUser,
+		historyGate: gate,
+		channelHistory: map[string][]candidate{
+			testChannel: {ownerMsg("100.000100", "before this session"), ownerMsg("100.000200", "also before")},
+		},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	done := make(chan WaitResult, 1)
+	go func() {
+		result, err := b.Wait(ctx, 5*time.Second)
+		if err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+		done <- result
+	}()
+
+	eventually(t, "the seed to reach Slack", func() bool { return len(api.calls()) > 0 })
+	send(stream, testChannel, "100.000150", "", "sent while the cursor was being seeded")
+	eventually(t, "the pump to take it", func() bool { return b.Status().PendingBacklogCount > 0 })
+
+	// A reconnect while the seed is still out: there is a hole after the
+	// window it read, so the queue stays where it is.
+	b.absorb(StreamEvent{Kind: StreamConnected})
+	close(gate)
+
+	// The pass that found the gap leaves the queue alone and asks for another.
+	// That second pass is the one that merges it, and it can only do so if the
+	// exemption survived the first: the message is older than the seed, and
+	// against the seed it would be filtered out as the channel's past.
+	select {
+	case result := <-done:
+		if len(result.Messages) != 1 || result.Messages[0].TS != "100.000150" {
+			t.Fatalf("Wait() returned %v, want the message that arrived while the cursor was being seeded", texts(result.Messages))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait() never returned")
 	}
 }

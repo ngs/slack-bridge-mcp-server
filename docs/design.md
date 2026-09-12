@@ -463,10 +463,21 @@ interface.
 | Reaction | `pendingReactions` | the next `slack_wait` |
 | Button click | routed straight to the pending question | the `slack_ask` waiting for it |
 | Reconnect or overflow | `needCatchUp` | the next call to run catch-up |
+| Overflow the stream cannot announce yet | `needCatchUp`, asked of the stream | the next call to run catch-up |
 | Disconnect | `connected`, cleared | whoever is blocked, as an error |
 
 Every write wakes the subscribers, so a call blocked on an empty queue hears
 about what another call's connection just received.
+
+An overflow is the one thing the stream cannot simply hand over: it is announced
+as an event on the channel that had no room for one. So the pump asks the stream
+each time round whether it is holding a refusal it has not been able to report,
+rather than waiting to be told — between the refusal and the announcement the
+bridge would otherwise believe it had missed nothing, and a reaction judged in
+that window is judged against the conversations a message nobody saw would have
+opened. A reaction that matches nothing is held while a catch-up is outstanding
+for the same reason: the catch-up recovers messages, and nothing recovers
+reactions.
 
 **Ordering.** Messages first, always: the pump applies everything waiting on the
 events channel before it will take a reaction at all, and it applies the pair it

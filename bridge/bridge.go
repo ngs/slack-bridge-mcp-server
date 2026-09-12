@@ -910,6 +910,14 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	defer func() { <-b.catchUpSlot }()
 
 	b.mu.Lock()
+	if b.stale(generation) {
+		// The connection this call belongs to has been replaced while it
+		// waited for its turn. Everything it read would be thrown away at the
+		// commit below, and reading it would hold the slot the replacement's
+		// own catch-up is waiting for.
+		b.mu.Unlock()
+		return nil, nil, nil
+	}
 	needCatchUp := b.needCatchUp
 	epoch := b.catchUpEpoch
 	seeded := b.cursorSeeded
@@ -1081,7 +1089,11 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	cursor := b.lastTS
 	if seeding || b.seedMergePending {
 		cursor = ""
-		b.seedMergePending = false
+		// Only once the queue it exempts has actually been merged. Behind a
+		// gap the live messages stay queued deliberately, and clearing this
+		// would have the next pass filter them against the seed — throwing
+		// away every one that arrived while the seed was being read.
+		b.seedMergePending = gapped
 	}
 
 	// A gap means a hole somewhere after the window this fetch covered. The

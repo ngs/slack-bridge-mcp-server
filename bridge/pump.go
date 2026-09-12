@@ -18,6 +18,12 @@ const maxSweep = 512
 // no history, and nobody will deliver it.
 const maxClosingSweep = 4 * maxSweep
 
+// maxTeardownSweep bounds the messages taken from a closing connection
+// altogether. The socket is stopping, so the channel empties rather than
+// refills, and this is only the promise that a stream which does neither
+// cannot hold the lock for ever.
+const maxTeardownSweep = 16 * maxClosingSweep
+
 // pump owns the live connection.
 //
 // It is the only goroutine that receives from the stream: messages, clicks and
@@ -45,6 +51,21 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 	var carried []Reaction
 
 	for {
+		// What the stream has lost, and what it is about to say it lost, both
+		// read here rather than left for whichever call happens to look.
+		//
+		// A refused message is announced as a StreamDropped event, and it can
+		// only be announced once the channel that had no room has some: until
+		// then the bridge would believe it had missed nothing, and a reaction
+		// judged in that window is judged against the conversations a message
+		// nobody saw would have opened. Asking the stream directly closes that
+		// window.
+		//
+		// A lost reaction is news in itself, and a wait blocked on a long
+		// timeout would otherwise sit out the whole of it before the agent
+		// heard that its count was wrong.
+		b.noteStreamLosses(generation, stream)
+
 		// Messages first, always. The sweep is bounded, so a channel refilled
 		// as fast as it is emptied leaves some behind — and a reaction applied
 		// while a mention was still sitting there would be judged against a
@@ -61,7 +82,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			b.drainReadyClicks(generation, clicks)
 			select {
 			case <-ctx.Done():
-				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
+				b.finishStream(generation, stream, events, clicks, reactions, carried)
 				return
 			default:
 			}
@@ -81,8 +102,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			// in the middle of handing something over: a last look is taken
 			// once it has closed its channels, or once a short wait says it is
 			// not going to.
-			late := awaitStreamClose(events)
-			b.endStream(generation, stream, late, events, clicks, reactions, carried)
+			b.finishStream(generation, stream, events, clicks, reactions, carried)
 			return
 
 		case evt, ok := <-events:
@@ -94,14 +114,20 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 
 		case in, ok := <-clicks:
 			if !ok {
-				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
+				// The clicks close before the events do, and what is still on
+				// the events channel is the owner's messages: waited for, not
+				// abandoned.
+				b.finishStream(generation, stream, events, clicks, reactions, carried)
 				return
 			}
 			b.applyClick(generation, in)
 
 		case r, ok := <-reactions:
 			if !ok {
-				b.endStream(generation, stream, nil, events, clicks, reactions, carried)
+				// The reactions close first of the three, so this is the
+				// earliest notice of a connection ending — and the one with
+				// the most still to come on the other channels.
+				b.finishStream(generation, stream, events, clicks, reactions, carried)
 				return
 			}
 			// Carried rather than applied. The next turn of the loop applies
@@ -117,6 +143,47 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 			carried = b.carryOne(carried, r)
 		}
 	}
+}
+
+// noteStreamLosses folds what the stream has lost, and what it has refused but
+// not yet been able to announce, into the bridge's own state.
+func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
+	// Asked outside the lock: they are questions for somebody else's
+	// implementation of the stream, and one of them clears what it reports.
+	lostReactions := streamDroppedReactions(stream)
+	overflow := streamPendingOverflow(stream)
+	if !lostReactions && !overflow {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(generation) {
+		return
+	}
+	if lostReactions {
+		b.noteReactionsDroppedLocked()
+	}
+	if overflow && !b.needCatchUp {
+		// The messages behind it are only recoverable by reading the window
+		// again, and the reactions that came after them are held until that
+		// has happened. Only when nothing has been asked for already: the
+		// overflow stands until the stream can announce it, and asking again
+		// every time round would keep moving the epoch out from under the
+		// catch-up that is answering it.
+		b.requestCatchUpLocked()
+	}
+}
+
+// finishStream ends a connection whose events channel has not closed yet. The
+// socket closes its channels in order — reactions, then clicks, then events —
+// and it can still be in the middle of that, or of handing something over, so
+// the events are waited for rather than taken as they stand: what is on that
+// channel is the owner's messages, and the closure is not going anywhere.
+func (b *Bridge) finishStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
+	late := awaitStreamClose(events)
+	b.endStream(generation, stream, late, events, clicks, reactions, carried)
 }
 
 // applyReady applies every message already waiting and, once they are
@@ -391,11 +458,23 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// reported as lost rather than quietly abandoned.
 	var ready []Reaction
 	drainLocked(reactions, maxClosingSweep, func(r Reaction) { ready = append(ready, r) })
-	drainLocked(events, maxClosingSweep, b.absorbLocked)
+
+	// Swept until the channel is empty rather than once: the socket is
+	// stopping, so nothing is refilling this, and every message on it is the
+	// owner's. The overall bound is what keeps a stream that never stops from
+	// holding the lock for ever.
+	swept := 0
+	for len(events) > 0 && swept < maxTeardownSweep {
+		taken := drainLocked(events, maxClosingSweep, b.absorbLocked)
+		if taken == 0 {
+			break
+		}
+		swept += taken
+	}
 
 	// The reactions are judged against the messages that came before them, and
 	// a message still on the channel is one that has not had its say. If the
-	// sweep above could not empty it, the reactions are reported as lost
+	// sweeps above could not empty it, the reactions are reported as lost
 	// rather than judged against a connection only half applied — the tally is
 	// still readable, and a reaction dropped as out of scope is not.
 	if len(events) > 0 {
@@ -411,6 +490,14 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	}
 	if len(reactions) > 0 {
 		b.noteReactionsDroppedLocked()
+	}
+
+	// An overflow the stream recorded but never had room to announce. The
+	// messages it refused are in the window and nowhere else, and the cursor
+	// has just moved over the ones that did fit — so the request to read that
+	// window again outlives the connection that lost them.
+	if streamPendingOverflow(stream) {
+		b.requestCatchUpLocked()
 	}
 	b.mu.Unlock()
 	b.noteStreamClosed(generation, stream)

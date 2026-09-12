@@ -118,7 +118,11 @@ func (s *Store) Seeded(channel string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return state.Channels[channel].Seeded, nil
+	// A cursor is the older way of saying the same thing, and a state file
+	// written before the mark existed has only that. Reading it as unseeded
+	// would seed the channel again over a cursor that was already there.
+	ch := state.Channels[channel]
+	return ch.Seeded || ch.LastTS != "", nil
 }
 
 // SetSeeded records that a channel has been looked at. It is for the channel

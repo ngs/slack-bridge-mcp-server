@@ -470,6 +470,11 @@ func (s *socketModeStream) Reactions() <-chan Reaction { return s.reactions }
 // to handing a batch over.
 func (s *socketModeStream) ReactionsDropped() bool { return s.reactionsDropped.Swap(false) }
 
+// PendingOverflow reports a message refused for want of room and not yet
+// announced. The announcement is a StreamDropped event, and it cannot be made
+// until the channel that had no room has some.
+func (s *socketModeStream) PendingOverflow() bool { return s.dropped.Load() }
+
 func (s *socketModeStream) consume(ctx context.Context, client *socketmode.Client) {
 	// Deferred calls run in reverse, so this closes reactions, then
 	// interactions, then events. The events channel is the one the bridge

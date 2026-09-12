@@ -353,3 +353,22 @@ func TestAFailedReopenIsCarriedIntoTheCursorBehindIt(t *testing.T) {
 		t.Errorf("stateDirty = %+v, want the reopen it was queued behind carried into it", got)
 	}
 }
+
+// A state file written before the seeded mark existed records that a channel
+// has been looked at only through its cursor. Reading it as unseeded would seed
+// the channel again over a cursor that was already there.
+func TestAChannelWithACursorCountsAsSeeded(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, StateFileName),
+		[]byte(`{"channels":{"C1":{"last_ts":"100.000100"}}}`), 0o600); err != nil {
+		t.Fatalf("writing the old state file: %v", err)
+	}
+
+	store := NewStore(dir)
+	if seeded, err := store.Seeded("C1"); err != nil || !seeded {
+		t.Errorf("Seeded() = %v (err %v), want a channel with a cursor to count as looked at", seeded, err)
+	}
+	if seeded, err := store.Seeded("C2"); err != nil || seeded {
+		t.Errorf("Seeded() = %v (err %v), want a channel nothing is recorded for to count as unseen", seeded, err)
+	}
+}

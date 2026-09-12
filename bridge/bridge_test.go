@@ -405,6 +405,9 @@ type fakeStream struct {
 	reactions    chan Reaction
 	// reactionsDropped stands in for a queue that overflowed.
 	reactionsDropped atomic.Bool
+	// pendingOverflow stands in for a message refused for want of room that
+	// the stream has not been able to announce yet.
+	pendingOverflow atomic.Bool
 
 	// closeEventsOnce and friends make closing idempotent: the connector
 	// closes everything when the connection's context is cancelled, the way
@@ -413,6 +416,9 @@ type fakeStream struct {
 	closeInteractionsOnce sync.Once
 	closeReactionsOnce    sync.Once
 }
+
+// PendingOverflow reports a refused message the stream has not announced.
+func (s *fakeStream) PendingOverflow() bool { return s.pendingOverflow.Load() }
 
 // closeEvents ends the message half of the stream.
 func (s *fakeStream) closeEvents() {

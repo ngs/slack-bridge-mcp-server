@@ -212,6 +212,32 @@ type ReactionStream interface {
 	ReactionsDropped() bool
 }
 
+// OverflowReporter is the optional half of Stream that says whether it has
+// refused a message it has not yet reported. A stream reports an overflow by
+// putting a StreamDropped event on its events channel — which it can only do
+// once that channel has room, and the overflow happened because it had none.
+// Between the two the bridge would otherwise believe it had missed nothing, and
+// a reaction judged in that window is judged against the conversations a
+// message it never saw would have opened.
+//
+// Reached by type assertion, like the reaction half: a stream that predates it
+// simply never reports one.
+type OverflowReporter interface {
+	// PendingOverflow reports whether a message has been refused and not yet
+	// announced. It does not clear the record: the announcement does.
+	PendingOverflow() bool
+}
+
+// streamPendingOverflow asks a stream whether it is holding an overflow it has
+// not been able to report yet.
+func streamPendingOverflow(stream Stream) bool {
+	o, ok := stream.(OverflowReporter)
+	if !ok {
+		return false
+	}
+	return o.PendingOverflow()
+}
+
 // reactionsOf returns a stream's reaction channel, or nil if it has none. A nil
 // channel blocks for ever in a select, which is exactly "this stream never
 // delivers reactions".
