@@ -506,11 +506,26 @@ conversations raise `threadsSkipped`, and what answers that is a walk through
 those conversations alone — not the window, not the search for mentions, and not
 the conversations the pass before it already read.
 
-**A connection's own hello is not a reconnect.** Every connection announces
-itself once, after `Connect` returns, and the catch-up for what was missed while
-the session was down is asked for where the connection is opened. Treating that
-hello as a hole discarded the first catch-up of every session; it is consumed
-instead, as long as the catch-up it belongs to is still outstanding.
+**A connection's own hello is not a reconnect, and not nothing either.** Every
+connection announces itself once, and the catch-up for what was missed while the
+session was down is asked for where the connection is opened — so treating that
+hello as a hole discarded the first catch-up of every session. It is consumed
+instead, as long as that catch-up has not gone to Slack yet.
+
+Once it has, the same hello means something else. `Connect` returns before the
+socket is up, so a window read before the hello stops where it looked, and
+Socket Mode replays nothing: a message the owner sends between that read and the
+socket coming up is in history and nowhere else. The hello asks for one more
+read, as a refusal rather than a hole — nothing has been missed from the stream,
+so a catch-up in flight may still hand over everything it read; it only may not
+call the window finished.
+
+In practice that second pass is the normal case rather than the exception: the
+history request goes out the moment `Connect` returns, and the socket is usually
+slower than Slack. It costs one more window read per connection, and it is what
+covers a gap nothing else can. Making the first read wait for the hello instead
+— bounded, so a socket that never comes up cannot hold the session — would
+remove both the gap and the second pass, and is the obvious next thing to try.
 
 **Ordering.** Messages first, always: the pump applies everything waiting on the
 events channel before it will take a reaction at all, and it applies the pair it

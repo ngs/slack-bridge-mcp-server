@@ -2156,7 +2156,9 @@ func (b *Bridge) threadsWaiting() bool {
 // A connection's own hello is the catch-up it already asked for arriving, as
 // long as that catch-up has not gone to Slack yet: raising a hole for it would
 // throw away the read it is about to make. Once the read has happened the same
-// hello means something else, which is the case the test above covers.
+// hello means something else: another read, which
+// TestAHelloDuringTheFirstReadAsksForOneMorePass and
+// TestAMessageSentBeforeTheSocketCameUpIsStillRead cover between them.
 func TestAHelloThatBeatsTheFirstReadIsNotAHole(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2829,4 +2831,123 @@ func TestAStreamThatClosedAtTheSweepBoundIsACleanClose(t *testing.T) {
 	if !closed {
 		t.Error("awaitStreamClose() called a closed channel a timeout; every reaction on that connection is then reported lost")
 	}
+}
+
+// The hello lands while the first catch-up is on Slack, which is the ordinary
+// shape of it: Connect returns before the socket is up, and the read that
+// follows goes out immediately. What that read found is still handed over —
+// nothing has been missed from the stream, so there is no hole to place — and
+// the window is read once more, for the stretch between the read and the
+// socket coming up.
+func TestAHelloDuringTheFirstReadAsksForOneMorePass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {
+			ownerMsg("100.000100", "already answered"),
+			ownerMsg("100.000200", "read by the first pass"),
+		}},
+		historyGate: make(chan struct{}),
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	done := make(chan WaitResult, 1)
+	go func() {
+		r, err := b.Wait(ctx, 2*time.Second)
+		if err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+		done <- r
+	}()
+	eventually(t, "the first read to reach Slack", func() bool { return len(api.calls()) >= 1 })
+
+	// The socket comes up while history is held open.
+	b.absorb(StreamEvent{Kind: StreamConnected})
+	b.mu.Lock()
+	holes, due, sinceConnect := b.holeEpoch, b.needCatchUp, b.fetchSinceConnect
+	b.mu.Unlock()
+	t.Logf("after hello in flight: holeEpoch=%d needCatchUp=%v fetchSinceConnect=%v", holes, due, sinceConnect)
+
+	close(api.historyGate)
+	first := <-done
+	t.Logf("first Wait: msgs=%v timed_out=%v history calls=%d", texts(first.Messages), first.TimedOut, len(api.calls()))
+	if len(first.Messages) != 1 || first.Messages[0].TS != "100.000200" {
+		t.Errorf("first Wait() = %v, want what the first pass read handed over (not discarded as a hole)", texts(first.Messages))
+	}
+	if !b.catchUpDue() {
+		t.Error("after a hello in flight the window is not due for another read; the gap message would be left in history")
+	}
+	b.mu.Lock()
+	holesAfter, cursor := b.holeEpoch, b.lastTS
+	b.mu.Unlock()
+	t.Logf("after first Wait: holeEpoch=%d cursor=%s", holesAfter, cursor)
+	if holesAfter != holes {
+		t.Errorf("holeEpoch moved %d -> %d; the hello in flight was treated as a hole", holes, holesAfter)
+	}
+
+	// Newer than the cursor the first pass committed: the pass the hello asked
+	// for has to find it from where the cursor is.
+	api.mu.Lock()
+	api.channelHistory[testChannel] = append(api.channelHistory[testChannel], ownerMsg("100.000300", "sent in the gap"))
+	api.mu.Unlock()
+
+	second := waitOnce(ctx, t, b)
+	t.Logf("second Wait: msgs=%v timed_out=%v history calls=%d", texts(second.Messages), second.TimedOut, len(api.calls()))
+	if len(second.Messages) != 1 || second.Messages[0].TS != "100.000300" {
+		t.Errorf("second Wait() = %v, want the message sent in the gap", texts(second.Messages))
+	}
+	if b.catchUpDue() {
+		t.Error("a third pass is still due after the hello's pass; the flag never settles")
+	}
+}
+
+// Probe (r7): with the fake connector's hello sent inside Connect, how often
+// does the first session read history once (hello consumed) vs twice (hello
+// after the read)? Informational: the real socket is slower than history.
+func TestProbeHowOftenTheHelloBeatsTheFirstRead(t *testing.T) {
+	once, twice, other := 0, 0, 0
+	for i := 0; i < 30; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cfg := testConfig(t)
+		cfg.IndicatorDisabled = true
+		cfg.AutoAckDisabled = true
+		if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+			t.Fatalf("seeding the cursor: %v", err)
+		}
+		api := &fakeAPI{
+			botUserID:      testBotUser,
+			channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+		}
+		b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+		waitOnce(ctx, t, b)
+		// Settle any second pass.
+		waitOnce(ctx, t, b)
+		n := 0
+		for _, c := range api.calls() {
+			if c.Channel == testChannel {
+				n++
+			}
+		}
+		switch n {
+		case 1:
+			once++
+		case 2:
+			twice++
+		default:
+			other++
+		}
+		_ = b.Close()
+		cancel()
+	}
+	t.Logf("home-channel history reads on first connect over 30 sessions: once=%d twice=%d other=%d", once, twice, other)
 }
