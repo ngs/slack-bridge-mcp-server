@@ -831,17 +831,118 @@ func TestAQuestionCollectsTheRepliesAWalkCouldNotReach(t *testing.T) {
 		t.Errorf("Ask() timed out with the reply attached, want the question interrupted by it")
 	}
 
-	// Once per question. The walk is a round trip, and a conversation that
-	// stays out of budget would otherwise buy one on every wakeup.
+	// A wakeup that is not about conversations buys no walk. The walk is a
+	// round trip, and the question looks for skipped conversations once; after
+	// that only a walk that leaves some behind says so again, and each of those
+	// reads the set and shrinks it.
+	api.mu.Lock()
+	api.replies = nil
+	api.mu.Unlock()
+	b.mu.Lock()
+	b.threadsSkipped = true
+	b.skippedThreads = map[threadKey]struct{}{target: {}}
+	b.mu.Unlock()
+
 	reads := len(api.replyCallsSnapshot())
-	if _, err := b.Ask(ctx, AskRequest{
-		Question: "and now?",
-		Options:  []string{"yes", "no"},
-		Timeout:  200 * time.Millisecond,
-	}); err != nil {
-		t.Fatalf("Ask() error = %v", err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  time.Second,
+		}); err != nil {
+			t.Errorf("Ask() error = %v", err)
+		}
+	}()
+	waitForQuestion(b)
+
+	// Woken three times by something that is not a conversation: a loss
+	// marker, which wakes the subscribers and hands over no messages.
+	for i := 0; i < 3; i++ {
+		b.noteReactionsDropped()
+		time.Sleep(20 * time.Millisecond)
 	}
+	<-done
+
 	if got := len(api.replyCallsSnapshot()) - reads; got > maxThreadsPerCatchUp {
 		t.Errorf("the second question cost %d thread reads, want one walk at most", got)
+	}
+}
+
+// More conversations left unread than one walk can read. The first look brings
+// what it can reach, and the walk that leaves some behind says so again — so a
+// reply in the last of them interrupts the question rather than arriving with
+// the timeout it ran out to.
+func TestARepliesBeyondOneWalkStillInterruptTheQuestion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	// Enough that one walk cannot reach them all.
+	cursors := map[threadKey]string{}
+	for i := 0; i < 2*maxThreadsPerCatchUp+1; i++ {
+		ts := "50.0000" + fmt.Sprintf("%02d", i)
+		if err := store.SetThread("CPROJ", ts, "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+		cursors[threadKey{"CPROJ", ts}] = "60.000000"
+	}
+	order := threadWalkOrder(cursors, nil)
+	last := order[len(order)-1]
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		questionTS:     askTS,
+		postTS:         "100.000900",
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The owner says something in the conversation the walks reach last, and
+	// every conversation is waiting again.
+	api.mu.Lock()
+	api.replies = []candidate{
+		{Channel: "CPROJ", User: testOwner, Text: "beyond the first walk", TS: "70.000000", ThreadTS: last.threadTS},
+	}
+	api.mu.Unlock()
+
+	waiting := make(map[threadKey]struct{}, len(cursors))
+	for key := range cursors {
+		waiting[key] = struct{}{}
+	}
+	b.mu.Lock()
+	b.threadsSkipped = true
+	b.skippedThreads = waiting
+	b.mu.Unlock()
+
+	started := time.Now()
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if result.TimedOut {
+		t.Errorf("Ask() timed out after %v, want the reply to interrupt it: one walk cannot reach every conversation", time.Since(started))
+	}
+	if len(result.Messages) != 1 || result.Messages[0].TS != "70.000000" {
+		t.Errorf("Ask() = %v, want the reply from the conversation the walks reach last", texts(result.Messages))
 	}
 }

@@ -1408,7 +1408,13 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// News, when it becomes true: a call already blocked has nothing in
 		// either queue to wake it, and the replies these conversations hold
 		// would wait out its whole timeout otherwise.
-		if scan.skipped && !b.threadsSkipped {
+		//
+		// And again after every walk that leaves some behind. Those walks read
+		// the skipped set and nothing else, so the set shrinks by the budget
+		// each time and the waking stops after as many turns as it takes to
+		// empty it. A full catch-up works the set out afresh, so for those the
+		// news is the change.
+		if scan.skipped && (!b.threadsSkipped || threadsOnly) {
 			b.notifyPendingLocked()
 		}
 		b.threadsSkipped = scan.skipped

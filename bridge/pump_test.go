@@ -3040,3 +3040,32 @@ func TestAWalkThatRanOutOfBudgetWakesTheWaitingCall(t *testing.T) {
 		t.Error("nothing woke: a call already blocked hears about those conversations only when it gives up")
 	}
 }
+
+// A connection that is still the live one, closing slowly with a reaction in
+// its buffer: the reaction is delivered, not mourned. Saying the count might
+// be short over something that was handed over is the false positive the
+// marker cannot afford.
+func TestASlowCloseDeliversTheReactionsItIsHolding(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	generation := b.currentGeneration()
+
+	// The events channel never closes, and a reaction is waiting on the other.
+	events := make(chan StreamEvent)
+	reactions := make(chan Reaction, 1)
+	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true}
+
+	b.finishStream(generation, stream, events, nil, reactions, nil)
+
+	if kept := b.drainReactions(generation); len(kept) != 1 {
+		t.Errorf("drainReactions() = %+v, want the reaction the closing connection was holding", kept)
+	}
+	if b.droppedReactionMark() {
+		t.Error("the reaction was handed over and reported lost at the same time")
+	}
+}

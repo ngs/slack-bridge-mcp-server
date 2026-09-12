@@ -509,8 +509,10 @@ the conversations the pass before it already read.
 Raising it wakes whoever is waiting, and a question counts it as a backlog: the
 replies those conversations hold are in neither queue, and a question asked over
 the top of them is one the owner has already answered somewhere else. A question
-looks once, though. The walk is a round trip, and a conversation that stays out
-of budget would otherwise buy one every time the question woke.
+looks for them once; after that, only a walk that leaves some behind says so
+again. Each of those walks reads the skipped set and nothing else, so the set
+shrinks by the budget every time and the waking stops after as many turns as it
+takes to empty it — a bound rather than a round trip per wakeup.
 
 **A connection's own hello is not a reconnect, and not nothing either.** Every
 connection announces itself once, and the catch-up for what was missed while the

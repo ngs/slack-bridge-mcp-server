@@ -496,13 +496,6 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// the time a connection is being ended it has almost always been replaced
 	// already: a check after it would never run.
 	//
-	// And only when something is actually left with it. A close that is merely
-	// slow abandons nothing, and saying the count might be short every time
-	// the socket took its time is how a marker stops meaning anything — the
-	// agent learns to ignore the one signal that says a vote went missing.
-	if !closed && (len(reactions) > 0 || len(carried) > 0) {
-		b.reactionsDropped = true
-	}
 	if b.stale(generation) {
 		// A connection that has already been replaced hands nothing over:
 		// what is left on its channels belongs to a connection nobody owns,
@@ -514,6 +507,11 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		// abandons nothing, and saying otherwise would send the agent to
 		// re-read a tally that was never wrong, every time the socket
 		// reconnected.
+		// And only when something is actually left with it. A close that is
+		// merely slow abandons nothing, and saying the count might be short
+		// every time the socket took its time is how a marker stops meaning
+		// anything — the agent learns to ignore the one signal that says a
+		// vote went missing.
 		if len(carried) > 0 || len(reactions) > 0 {
 			b.reactionsDropped = true
 		}
@@ -564,6 +562,12 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// sweeps above could not empty it, the reactions are reported as lost
 	// rather than judged against a connection only half applied — the tally is
 	// still readable, and a reaction dropped as out of scope is not.
+	//
+	// This is also the whole of what a producer that would not finish costs on
+	// this path. What it is still holding cannot be seen from here; what it
+	// already handed over is on these channels, and everything on them has
+	// just been taken. A close that is merely slow therefore says nothing —
+	// the reactions in its buffer are delivered, not mourned.
 	if len(events) > 0 {
 		b.noteReactionsDroppedLocked()
 		ready, carried = nil, nil
