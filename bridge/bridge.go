@@ -289,6 +289,15 @@ type Bridge struct {
 	// click on an older question still standing in the channel is held as an
 	// early click and replayed against the message that replaces it.
 	askReserved bool
+	// retiredTS is the question whose buttons were last sent away. That request
+	// outlives the call that made it, so the buttons can still be on the
+	// owner's screen while the next question is going up — and a tap on them is
+	// not the next question's answer, whether or not it has a timestamp of its
+	// own yet to be told apart by.
+	//
+	// One is enough. Anything older was retired by a call that had already
+	// returned before this one started.
+	retiredTS string
 	// retiring counts the chat.update calls taking a question's buttons away
 	// that are still in flight. They outlive the call that asked, so Close
 	// waits for them.
@@ -1284,6 +1293,9 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		// message in the pages it read rather than only the ones it may hand
 		// over.
 		looked string
+		// walked is how far the thread walk read, which is kept apart from
+		// looked because it can reach past the moment the pass started.
+		walked string
 		// truncated marks a read that ran out of pages before it ran out of
 		// window.
 		truncated bool
@@ -1325,6 +1337,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 				return nil, nil, err
 			}
 			fetched, looked, truncated = got.messages, got.read, got.truncated
+			walked = got.threadsRead
 			if truncated {
 				// More window than one pass can read, and the pages it read
 				// are the newest of it: what was not reached is older than
@@ -1544,6 +1557,26 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// the next hole fetches again to learn the same thing.
 	if tsLess(newest, looked) {
 		newest = looked
+	}
+	// And past the replies the thread walk read — but only on a pass nothing
+	// interrupted.
+	//
+	// The walk is the one read that can reach past the moment the pass began:
+	// a reply posted while it was running is newer than every page of channel
+	// history this pass fetched, and it is in none of them. On a quiet pass
+	// that is harmless, because the socket was delivering everything else all
+	// along. It is not harmless when a message was refused for want of room —
+	// the refusal is what makes the cursor safe to move over the queue, and it
+	// is safe only as far as the read went. A cursor taken from the walk would
+	// step over a channel message of the same age that nothing ever read, and
+	// nothing would go back for it.
+	//
+	// So the walk's reach is applied only when nothing has asked for another
+	// catch-up since this one started, which is what the epoch says. When
+	// something has, the pass that answers it walks the same threads once more
+	// and moves the cursor then.
+	if epoch == b.catchUpEpoch && tsLess(newest, walked) {
+		newest = walked
 	}
 
 	// The thread cursors, before anything can return. A pass that reads a
@@ -1933,24 +1966,16 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) (window
 	if err != nil {
 		return window{}, err
 	}
-	// How far the thread walk read counts towards how far this pass read, the
-	// same way a page of somebody else's channel messages does. A thread whose
-	// only newer reply is a colleague's hands nothing over, and a cursor left
-	// behind that reply says the thread has news every time — so the walk goes
-	// back for it on every catch-up, for ever, and learns the same thing.
-	if tsLess(read, readThreads) {
-		read = readThreads
-	}
-
 	// A cursor left over means the walk stopped at its page bound with more
 	// window behind it. The caller is told so it can come back: the cursor
 	// moves only through what was delivered, so another pass continues from
 	// there rather than starting again.
 	// History pages arrive newest-first; mergeMessages sorts and deduplicates.
 	return window{
-		messages:  mergeMessages(after, messages, replies),
-		read:      read,
-		truncated: cursor != "",
+		messages:    mergeMessages(after, messages, replies),
+		read:        read,
+		threadsRead: readThreads,
+		truncated:   cursor != "",
 	}, nil
 }
 
@@ -1962,10 +1987,17 @@ func catchUp(ctx context.Context, api API, channel, owner, after string) (window
 // messages; how far it looked counts every message in every page it read, so
 // that a page of somebody else's conversation moves the cursor past itself
 // rather than being read again by the next pass that comes along.
+// The thread walk's reach is kept apart from both. It is the one timestamp a
+// read can produce that is newer than the moment the read started: a reply
+// posted while the walk was running belongs to no page of channel history, and
+// a cursor taken from it would step over a channel message of the same age
+// that this pass never saw. Which is exactly the case a refusal leaves behind,
+// so the caller applies it only on a pass nothing interrupted.
 type window struct {
-	messages  []Message
-	read      string
-	truncated bool
+	messages    []Message
+	read        string
+	threadsRead string
+	truncated   bool
 }
 
 // catchUpThreads recovers thread replies newer than the cursor.

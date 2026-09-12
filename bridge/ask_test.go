@@ -147,9 +147,16 @@ func TestAskIgnoresClicksThatAreNotTheOwnerAnsweringThisQuestion(t *testing.T) {
 		t.Errorf("Ask() choice_index = %d on a timeout, want -1 so it cannot be read as the first option", result.ChoiceIndex)
 	}
 
-	resolutions := api.snapshotResolutions()
-	if len(resolutions) != 1 || !strings.Contains(resolutions[0].Text, "⌛") {
-		t.Errorf("resolutions = %+v, want the expired question rewritten once", resolutions)
+	// Waited for rather than asserted outright. A question that has run out of
+	// time has nothing left to watch its own retirement with, so the
+	// chat.update is sent and the call returns ahead of it; the buttons still
+	// go, which is what this is checking.
+	eventually(t, "the expired question to be rewritten", func() bool {
+		got := api.snapshotResolutions()
+		return len(got) == 1 && strings.Contains(got[0].Text, "⌛")
+	})
+	if got := len(api.snapshotResolutions()); got != 1 {
+		t.Errorf("the question was rewritten %d times, want once", got)
 	}
 }
 
@@ -169,6 +176,11 @@ func TestAskExpiresTheQuestionOnTimeout(t *testing.T) {
 		t.Fatalf("Ask() = %+v, want a bare timeout", result)
 	}
 
+	// The same wait, for the same reason: the retirement outlives a call with
+	// nothing left to watch it with.
+	eventually(t, "the expired question to be rewritten", func() bool {
+		return len(api.snapshotResolutions()) == 1
+	})
 	resolutions := api.snapshotResolutions()
 	if len(resolutions) != 1 {
 		t.Fatalf("Ask() resolved the question %d times, want 1", len(resolutions))
@@ -1903,5 +1915,154 @@ func TestTheBacklogAQuestionCollectsIsBoundedByWhatIsLeftAfterRetiring(t *testin
 	}
 	if elapsed > timeout+askTimeoutSlack {
 		t.Errorf("Ask() took %v with a timeout of %v; the backlog was collected on a budget the retirement had already spent", elapsed, timeout)
+	}
+}
+
+// Taking the buttons away outlives the call that asked, so the question just
+// answered can still be tappable while the next one is going up. Taps on it
+// are not the next question's answer, and until that question's timestamp
+// comes back there is nothing to tell them apart by — so they fill the buffer
+// that covers the posting window and push out the click the owner meant.
+//
+// Fail-first: without remembering the question whose buttons were sent away,
+// the second question below times out with the owner's click discarded.
+func TestTapsOnTheQuestionJustRetiredDoNotCrowdOutTheNextAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, stream := askBridge(ctx, t)
+
+	// Slack has taken the update that retires the first question and not
+	// answered it, so its buttons are still live when the second goes up.
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.resolveGate = gate
+	api.mu.Unlock()
+	defer close(gate)
+
+	go func() {
+		waitForQuestion(b)
+		stream.interactions <- click(testOwner, askTS, 0)
+	}()
+	if result, err := b.Ask(ctx, AskRequest{
+		Question: "Deploy now?",
+		Options:  []string{"Yes", "No"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil || result.ChoiceIndex != 0 {
+		t.Fatalf("first Ask() = %+v, err = %v, want the click", result, err)
+	}
+
+	const secondTS = "100.000710"
+	api.mu.Lock()
+	api.questionTS = secondTS
+	// The owner tapping the old question's buttons, which are still on their
+	// screen, and then the new one.
+	api.beforeQuestionReturns = func() {
+		for i := 0; i < maxEarlyClicks; i++ {
+			b.routeInteraction(click(testOwner, askTS, 0))
+		}
+		b.routeInteraction(click(testOwner, secondTS, 1))
+	}
+	api.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "And now?",
+		Options:  []string{"Yes", "No"},
+		Timeout:  500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("second Ask() error = %v", err)
+	}
+	if result.TimedOut || result.ChoiceIndex != 1 {
+		t.Errorf("second Ask() = %+v, want the owner's click on the new question honoured as choice 1", result)
+	}
+}
+
+// A search cut short by the caller giving up has learned nothing about the
+// question it was looking for. Treated as a permanent failure it would be the
+// worst of both: the buttons stay in the channel and no later question ever
+// looks for them again.
+//
+// Fail-first: without the put-back, the next question makes no windowed
+// history call at all.
+func TestAnAbandonedQuestionSurvivesASearchTheCallerGaveUpOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	api.mu.Lock()
+	api.questionDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Ask() returned no error, want the post given up on")
+	}
+
+	// It landed after all, at a moment inside the window the search cuts by.
+	orphanTS := slackTS(time.Now())
+	api.mu.Lock()
+	api.questionDelay = 0
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	api.mu.Unlock()
+
+	// A question whose caller walks away while the search is in flight.
+	askCtx, abandon := context.WithCancel(ctx)
+	stuck := make(chan struct{})
+	api.mu.Lock()
+	// The search reaches Slack, the caller gives up, and the request comes
+	// back cancelled rather than with an answer.
+	api.historyGate = stuck
+	api.beforeHistoryReturns = func(req HistoryRequest) {
+		if req.Latest != "" {
+			abandon()
+		}
+	}
+	api.mu.Unlock()
+	if _, err := b.Ask(askCtx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  500 * time.Millisecond,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ask() error = %v, want the cancellation", err)
+	}
+	abandon()
+	close(stuck)
+
+	if !b.hasOrphanQuestion() {
+		t.Fatal("the abandoned question was forgotten by a search that never finished; its buttons stay in the channel and nothing looks for them again")
+	}
+
+	// And the next question does look, and does retire it.
+	api.mu.Lock()
+	api.beforeHistoryReturns = nil
+	api.historyGate = nil
+	api.mu.Unlock()
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "still there?",
+		Options:  []string{"yes", "no"},
+		Timeout:  500 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	retired := false
+	for _, u := range api.snapshotResolutions() {
+		if u.TS == orphanTS {
+			retired = true
+		}
+	}
+	if !retired {
+		t.Error("the question left standing by an abandoned post still has its buttons")
 	}
 }

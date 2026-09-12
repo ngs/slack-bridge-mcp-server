@@ -72,6 +72,11 @@ type AskRequest struct {
 	// Timeout is how long the owner has to answer, and it covers the whole
 	// call: posting the question, waiting for a click, collecting whatever was
 	// said instead of clicking, and taking the buttons away afterwards.
+	//
+	// The last of those is waited for only as long as there is. With nothing
+	// left — a question that ran out of time, say — the request is still sent
+	// and finishes on its own, and the call returns ahead of it rather than
+	// over the timeout it was given.
 	Timeout time.Duration
 	// ThreadTS asks inside a thread instead of on the channel surface.
 	ThreadTS string
@@ -613,6 +618,21 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 
 	found, err := b.findOrphanQuestion(searchCtx, api, orphan, me)
 	if err != nil {
+		// A search that ran out of time, or a caller that gave up during it,
+		// has learned nothing about the question — so it goes back on the
+		// shelf for the next one, the same way a retirement that could not be
+		// finished does. Anything else is Slack saying no, which the next
+		// question is not going to talk it out of.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			orphan.attempts++
+			if orphan.attempts <= maxOrphanAttempts {
+				b.keepOrphanQuestion(orphan)
+				log.Printf("did not finish looking for a question whose post was given up on; the next question will look again: %s", logSafe(err.Error(), maxLoggedError))
+				return
+			}
+			// Tried often enough. A question that cannot be reached is not
+			// worth every later question's budget.
+		}
 		log.Printf("could not look for a question whose post was given up on: %s", logSafe(err.Error(), maxLoggedError))
 		return
 	}
@@ -641,11 +661,18 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 			return
 		}
 		log.Printf("ran out of time retiring a question whose post was given up on; the next question will try again: %s", logSafe(err.Error(), maxLoggedError))
-		b.mu.Lock()
-		if b.orphan == nil {
-			b.orphan = orphan
-		}
-		b.mu.Unlock()
+		b.keepOrphanQuestion(orphan)
+	}
+}
+
+// keepOrphanQuestion puts an abandoned question back for the next call to try,
+// leaving a newer one alone: this call's own post may have been given up on
+// too while it was busy with this, and that one is the more recent loss.
+func (b *Bridge) keepOrphanQuestion(orphan *orphanQuestion) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.orphan == nil {
+		b.orphan = orphan
 	}
 }
 
@@ -890,6 +917,9 @@ func (b *Bridge) retireQuestion(api API, channel, ts, text string) <-chan struct
 	done := make(chan struct{})
 
 	b.mu.Lock()
+	// Remembered before the request goes out, so a tap on these buttons counts
+	// as stale from the moment the bridge decided they were.
+	b.retiredTS = ts
 	counted := !b.retireSealed
 	if counted {
 		b.retiring.Add(1)
@@ -974,6 +1004,20 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 
 	if ask.ts == "" {
 		// The question is posted but its timestamp has not come back yet.
+		//
+		// One stale click can be recognised even here: the question whose
+		// buttons this session has just sent away. That request outlives the
+		// call that made it, so the old buttons can still be tappable while
+		// this question is going up, and taps on them would otherwise fill the
+		// buffer below and push out the click the owner actually meant.
+		//
+		// Only in this window. Once the question has a timestamp of its own,
+		// that timestamp is the authority and the comparison below is the one
+		// that decides.
+		if in.MessageTS != "" && in.MessageTS == b.retiredTS {
+			ask.warn(in)
+			return
+		}
 		// Holding the click keeps it out of the bin until it can be checked
 		// against the message it belongs to; the cap is there because a click
 		// that never matches must not accumulate.

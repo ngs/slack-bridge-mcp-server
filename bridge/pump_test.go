@@ -3586,3 +3586,95 @@ func TestAWaitHandsOverItsQueueWhileAnotherHoldsTheCatchUpSlot(t *testing.T) {
 		t.Errorf("Wait() = %v, want the message already in the queue", texts(msgs))
 	}
 }
+
+// The thread walk is the one read that can reach past the moment its pass
+// began: a reply posted while it is running is in no page of channel history
+// this pass fetched. Letting the cursor follow it is safe on a quiet pass and
+// not safe at all when a message was refused for want of room — the refusal
+// leaves a message nothing has read, and a cursor taken from a reply of the
+// same age steps over it for good.
+//
+// This is the refusal test above with one thread hanging off the channel, and
+// a colleague talking in it while history is in flight.
+//
+// Fail-first: with the walk's reach folded into how far the pass read, the
+// cursor lands on the colleague's reply, the second pass asks Slack for
+// everything after it, and the refused message is never seen again.
+func TestARefusedMessageSurvivesAThreadWalkThatReachedPastIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{botUserID: testBotUser}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	var history []candidate
+	for i := 0; i <= maxPendingMessages; i++ {
+		ts := fmt.Sprintf("100.%06d", i+1000)
+		history = append(history, ownerMsg(ts, "flood"))
+		b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: ts, Channel: testChannel, User: testOwner, Text: "flood",
+		}})
+	}
+	// Somebody else's thread, with somebody else's reply in it — newer than
+	// anything on the channel surface, and nothing this pass may hand over.
+	history = append(history, candidate{
+		Channel: testChannel, User: colleague, Text: "a thread of their own",
+		TS: "100.005000", LatestReply: "100.020000", ReplyCount: 1,
+	})
+	if !b.catchUpDue() || b.pendingHomeCount() != maxPendingMessages {
+		t.Fatalf("setup: catch-up due = %v, queued = %d", b.catchUpDue(), b.pendingHomeCount())
+	}
+
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.history = history
+	api.replies = []candidate{colleagueReply("100.020000", "100.005000", "still talking")}
+	api.historyGate = gate
+	calls := len(api.historyCalls)
+	api.mu.Unlock()
+
+	generation := b.currentGeneration()
+	first := make(chan []Message, 1)
+	go func() {
+		msgs, _, err := b.drainCatchUp(ctx, generation, true, 5*time.Second)
+		if err != nil {
+			t.Errorf("drainCatchUp() error = %v", err)
+		}
+		first <- msgs
+	}()
+
+	eventually(t, "the catch-up to reach Slack", func() bool { return len(api.calls()) > calls })
+
+	// The queue is full, so this one is refused — and the refusal is the whole
+	// reason the cursor may not run ahead of what was read.
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.009999", Channel: testChannel, User: testOwner, Text: "refused",
+	}})
+	close(gate)
+	<-first
+
+	api.mu.Lock()
+	api.historyGate = nil
+	api.history = append(history, ownerMsg("100.009999", "refused"))
+	api.mu.Unlock()
+
+	second, _, err := b.drainCatchUp(ctx, generation, true, 5*time.Second)
+	if err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+	if len(second) != 1 || second[0].TS != "100.009999" {
+		t.Errorf("second batch = %v, want the message that was refused; the cursor followed a reply posted while the walk was running and stepped over it", texts(second))
+	}
+}
