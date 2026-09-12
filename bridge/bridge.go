@@ -1449,10 +1449,6 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		}
 	}
 
-	if len(home) == 0 && len(threads) == 0 && newest == "" {
-		return nil, reactions, nil
-	}
-
 	if newest != "" {
 		// Never backwards. On the run that seeds the cursor, a message the pump
 		// took while history was being read can be older than the seed, and
@@ -1882,10 +1878,13 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 	}
 
 	// Replies come back oldest first, so what is left is newer than everything
-	// read — and the cursor stops at the newest reply this walk reached. The
-	// rest is waiting there for the walk after it, rather than behind a cursor
-	// that stepped over it.
-	log.Printf("stopped reading a thread after %d pages of replies; the rest is newer than the cursor and waits for the next walk",
+	// read. In a conversation outside the home channel that is the end of it:
+	// the cursor stops at the newest reply this walk reached, and the rest is
+	// waiting there for the walk after it. The home channel keeps one cursor
+	// for the whole pass, so anything newer in the same pass carries it past
+	// these replies — which is the bound the design note describes for that
+	// side.
+	log.Printf("stopped reading a thread after %d pages of replies; the rest waits for the next walk, unless something newer in the same pass has carried the home channel's cursor past it",
 		maxThreadCatchUpPages)
 	return messages, nil
 }
