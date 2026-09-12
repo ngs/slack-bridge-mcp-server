@@ -222,6 +222,36 @@ func (s *Store) SetThread(channel, threadTS, lastTS string) error {
 // coming back — deleted, or in a channel the bot has been removed from — where
 // leaving the record behind would mean reading it again on every reconnect of
 // every session from now on.
+// ResetThread forgets a conversation and records it as open again, in one
+// write. It is for a conversation given up on and mentioned into again: the
+// cursor of the old one must not survive into the new one, and the two steps
+// done separately leave a window where the file says the conversation does not
+// exist at all — a process that stopped there would come back with the
+// conversation gone and the mention that opened it already behind the cursor.
+func (s *Store) ResetThread(channel, threadTS, lastTS string) error {
+	if channel == "" || threadTS == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+
+	kept := state.Threads[:0]
+	for _, t := range state.Threads {
+		if t.Channel == channel && t.ThreadTS == threadTS {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	state.Threads = append(kept, ThreadState{Channel: channel, ThreadTS: threadTS, LastTS: lastTS})
+	return s.saveLocked(state)
+}
+
 func (s *Store) RemoveThread(channel, threadTS string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

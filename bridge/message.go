@@ -249,6 +249,17 @@ func splitTS(ts string) (seconds, sequence int64, ok bool) {
 // the same reconnect. Deduplicating here means the caller never sees it twice
 // no matter how the two races resolve. When after is empty, nothing is
 // filtered out by age.
+// messageDedupWindow bounds the memory of what has been handed over. It is the
+// same shape and size as the reaction one: enough to cover a redelivery, small
+// enough to be free.
+const messageDedupWindow = 1024
+
+// deliveredKey identifies a message across connections. A timestamp is unique
+// within a channel, and a redelivered envelope carries the same one.
+func deliveredKey(m Message) string {
+	return m.Channel + "\x00" + m.TS
+}
+
 // mergeLive merges what history returned with what the socket delivered, and
 // filters only the first by the cursor.
 //

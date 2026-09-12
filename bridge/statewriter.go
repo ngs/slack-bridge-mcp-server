@@ -258,14 +258,14 @@ func applyStateWrite(store *Store, w stateWrite) error {
 	switch {
 	case w.kind == writeThread && w.remove:
 		err = store.RemoveThread(w.channel, w.threadTS)
+	case w.kind == writeThread && w.reopened:
+		// One write, not a removal followed by a set. The removal is there to
+		// clear the cursor the old conversation left behind, which SetThread
+		// would otherwise keep — and done separately it leaves a moment where
+		// the file says the conversation does not exist, which is the state a
+		// process stopping there would come back to.
+		err = store.ResetThread(w.channel, w.threadTS, w.ts)
 	case w.kind == writeThread:
-		if w.reopened {
-			// Clears the cursor the old conversation left behind, which
-			// SetThread would otherwise keep.
-			if err = store.RemoveThread(w.channel, w.threadTS); err != nil {
-				break
-			}
-		}
 		err = store.SetThread(w.channel, w.threadTS, w.ts)
 	case w.kind == writeLastTS:
 		err = store.SetLastTS(w.channel, w.ts)

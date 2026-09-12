@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1788,5 +1789,123 @@ func TestARefusalDuringCatchUpStillDrainsTheQueue(t *testing.T) {
 	}
 	if len(second) != 1 || second[0].TS != "100.009999" {
 		t.Errorf("second batch = %v, want only the message that was refused", texts(second))
+	}
+}
+
+// Slack retries an envelope it has not been acknowledged for, and the receipt
+// goes out before the message reaches the stream: a receipt lost on the way
+// back brings the same message round again, on this connection or the next.
+// The cursor cannot answer for it, since a live message is deliberately not
+// filtered by the cursor, so what has been handed over is remembered instead.
+func TestARedeliveredMessageIsHandedOverOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	send(stream, testChannel, "100.000300", "", "ship it?")
+	if msgs := waitOnce(ctx, t, b).Messages; len(msgs) != 1 {
+		t.Fatalf("Wait() = %v, want the message", texts(msgs))
+	}
+
+	// The same envelope again, which is what an unacknowledged one comes back
+	// as.
+	send(stream, testChannel, "100.000300", "", "ship it?")
+
+	if msgs := waitOnce(ctx, t, b).Messages; len(msgs) != 0 {
+		t.Errorf("Wait() = %v, want nothing: the owner sent that message once", texts(msgs))
+	}
+}
+
+// A message refused while a catch-up is already outstanding still raises a
+// hole of its own. The catch-up in flight went to Slack before the refusal, so
+// it is not the one that answers for it — and on a stream that then goes quiet
+// there is no event coming to ask again.
+func TestAnOverflowWhileCatchUpIsDueStillAsksAgain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	holes := b.holeEpoch
+	b.mu.Unlock()
+
+	stream.pendingOverflow.Store(true)
+
+	eventually(t, "the refusal to be counted as a hole of its own", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.holeEpoch != holes
+	})
+
+	// And only once, however long the stream holds it.
+	b.mu.Lock()
+	raised := b.holeEpoch
+	b.mu.Unlock()
+	time.Sleep(3 * overflowPollWait)
+	b.mu.Lock()
+	again := b.holeEpoch
+	b.mu.Unlock()
+	if again != raised {
+		t.Errorf("hole count went from %d to %d while the stream held one overflow, want it raised once", raised, again)
+	}
+}
+
+// lockProbeStream answers the stream's optional questions and reports whether
+// it was asked with the bridge's lock held. A stream is somebody else's code:
+// asked under b.mu it could block, or call back into the bridge, and take the
+// pump and every tool call waiting on that lock down with it.
+type lockProbeStream struct {
+	*fakeStream
+	b            *Bridge
+	askedLocked  atomic.Bool
+	askedAtAll   atomic.Bool
+	pendingValue bool
+}
+
+func (s *lockProbeStream) PendingOverflow() bool {
+	s.askedAtAll.Store(true)
+	// TryLock rather than Lock, so a probe that finds the lock taken says so
+	// instead of joining the deadlock it is looking for.
+	if !s.b.mu.TryLock() {
+		s.askedLocked.Store(true)
+		return s.pendingValue
+	}
+	s.b.mu.Unlock()
+	return s.pendingValue
+}
+
+// The bridge asks a stream its questions with the lock let go. Everything else
+// about the pump holds b.mu for a whole batch, which is what makes a message
+// and its reaction arrive together — and holding it across a call into an
+// implementation this package does not own is how that becomes a deadlock.
+func TestAStreamIsNeverAskedAnythingUnderTheLock(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+
+	b := &Bridge{cfg: cfg, catchUpSlot: make(chan struct{}, 1)}
+	stream := &lockProbeStream{fakeStream: newFakeStream(), b: b, pendingValue: true}
+
+	b.mu.Lock()
+	b.connGeneration = 1
+	b.connected = true
+	b.mu.Unlock()
+
+	b.endStream(1, stream, nil, stream.events, stream.interactions, stream.reactions, nil)
+
+	if !stream.askedAtAll.Load() {
+		t.Fatal("the closing connection never asked the stream whether it was holding an overflow")
+	}
+	if stream.askedLocked.Load() {
+		t.Error("the stream was asked with b.mu held; an implementation that blocks there takes the pump and every tool call with it")
 	}
 }

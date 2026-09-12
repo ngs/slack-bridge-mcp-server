@@ -136,6 +136,23 @@ type Bridge struct {
 	// per episode.
 	pendingFull bool
 	threadsFull bool
+	// deliveredMessages remembers what has been handed over, so a message the
+	// socket delivers twice is queued once.
+	//
+	// Slack retries an envelope it has not been acknowledged for, and the
+	// acknowledgement goes out before the message is put on the stream: a
+	// receipt lost on the way back brings the message round again, on this
+	// connection or the next. The cursor cannot answer for it — a live message
+	// is deliberately not filtered by the cursor, because on the run that
+	// seeds it the owner's message can be older than the seed — so what has
+	// actually been delivered is remembered instead.
+	deliveredMessages map[string]struct{}
+	deliveredOrder    []string
+	// overflowNoted marks an overflow the stream is holding that has already
+	// been answered with a request to read the window again. The stream keeps
+	// reporting it until it has room to announce it, and this is what keeps
+	// the pump from raising a fresh hole on every look.
+	overflowNoted atomic.Bool
 	// holeEpoch counts the holes the live stream has been found to have: a
 	// reconnect, an overflow, a message the socket refused. It is stamped on a
 	// catch-up in flight the same way catchUpEpoch is, but it means something
@@ -308,6 +325,41 @@ func (b *Bridge) requestCatchUpLocked() {
 	b.needCatchUp = true
 	b.catchUpEpoch++
 	b.notifyPendingLocked()
+}
+
+// noteDeliveredLocked remembers a batch on its way to the agent. The caller
+// must hold b.mu.
+func (b *Bridge) noteDeliveredLocked(batches ...[]Message) {
+	for _, batch := range batches {
+		for _, m := range batch {
+			if m.TS == "" {
+				continue
+			}
+			key := deliveredKey(m)
+			if _, ok := b.deliveredMessages[key]; ok {
+				continue
+			}
+			if b.deliveredMessages == nil {
+				b.deliveredMessages = make(map[string]struct{}, messageDedupWindow)
+			}
+			b.deliveredMessages[key] = struct{}{}
+			b.deliveredOrder = append(b.deliveredOrder, key)
+			if len(b.deliveredOrder) > messageDedupWindow {
+				delete(b.deliveredMessages, b.deliveredOrder[0])
+				b.deliveredOrder = b.deliveredOrder[1:]
+			}
+		}
+	}
+}
+
+// alreadyDeliveredLocked reports whether this message has been handed over
+// already. The caller must hold b.mu.
+func (b *Bridge) alreadyDeliveredLocked(m Message) bool {
+	if m.TS == "" {
+		return false
+	}
+	_, ok := b.deliveredMessages[deliveredKey(m)]
+	return ok
 }
 
 // requestCatchUpForHoleLocked asks for the window to be re-read because the
@@ -487,24 +539,33 @@ func (b *Bridge) Close() error {
 	return lock.Release()
 }
 
-// lockHoldWait bounds how long a lock is held for a write that will not end.
-// It is generous: the alternative to waiting is another session writing the
-// same file, and a write that takes this long has something worse wrong with
-// it than the wait.
-const lockHoldWait = time.Minute
+// lockHoldReport is how long a lock is held for a write before the wait is
+// worth a line in the log. It is not a deadline: letting go while that write is
+// still running is the one thing the lock is being held for.
+const lockHoldReport = time.Minute
 
 // releaseWhenWritesEnd holds the single-instance lock until the write that
 // outlasted shutdown has finished, and only then lets it go. The reference
 // matters as much as the timing: an os.File that becomes unreachable is closed
 // by the runtime, and the close releases the lock.
 func (b *Bridge) releaseWhenWritesEnd(lock *Lock) {
-	deadline := time.Now().Add(lockHoldWait)
-	for time.Now().Before(deadline) {
+	// No deadline. A write still inside the store can rename the file at any
+	// moment, and the lock is the only thing standing between that rename and
+	// the session that would otherwise have taken this file over: giving up on
+	// the wait gives up on the guarantee. The wait ends when the write does,
+	// and if it never does the process is going nowhere either.
+	reported := false
+	started := time.Now()
+	for {
 		b.stateWriteMu.Lock()
 		writing := b.stateWriting
 		b.stateWriteMu.Unlock()
 		if !writing {
 			break
+		}
+		if !reported && time.Since(started) > lockHoldReport {
+			reported = true
+			log.Printf("a state file write has been running for over a minute; the single-instance lock is being held until it ends, so another session cannot start against this directory")
 		}
 		time.Sleep(stateWriteIdlePoll)
 	}
@@ -885,6 +946,13 @@ func (b *Bridge) absorbLocked(evt StreamEvent) {
 		if !ok {
 			return
 		}
+		if b.alreadyDeliveredLocked(msg) {
+			// The same message twice. Slack retries an envelope it has not
+			// been acknowledged for, and the receipt can be lost after the
+			// message itself arrived — so this is the owner's message coming
+			// round again, not a second one.
+			return
+		}
 		// The socket's buffer used to be the limit, because nothing moved a
 		// message off it until a call asked; the pump moves every one, so the
 		// limit has to be here instead.
@@ -1188,6 +1256,10 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	if takeReactions {
 		reactions = b.drainReactionsLocked()
 	}
+
+	// Remembered before it goes, so a redelivered envelope is recognised as
+	// the message it already is.
+	b.noteDeliveredLocked(home, threads)
 
 	if len(home) == 0 && len(threads) == 0 {
 		return nil, reactions, nil

@@ -52,6 +52,9 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 	clicks := stream.Interactions()
 	reactions := reactionsOf(stream)
 
+	// Whatever the connection before this one was holding is not this one's.
+	b.overflowNoted.Store(false)
+
 	// carried holds reactions taken from the socket that are waiting for the
 	// messages ahead of them to be applied.
 	var carried []Reaction
@@ -170,7 +173,8 @@ func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
 	// implementation of the stream, and one of them clears what it reports.
 	lostReactions := streamDroppedReactions(stream)
 	overflow := streamPendingOverflow(stream)
-	if !lostReactions && !overflow {
+	if !lostReactions && !overflow && !b.overflowNoted.Load() {
+		// Nothing lost, nothing refused, and nothing outstanding to clear.
 		return
 	}
 
@@ -183,24 +187,31 @@ func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
 		b.noteReactionsDropped()
 	}
 
-	if !overflow {
-		return
-	}
-	b.underLive(generation, func() { b.noteOverflowLocked() })
+	b.underLive(generation, func() { b.noteOverflowLocked(overflow) })
 }
 
 // noteOverflowLocked raises the catch-up request an overflow calls for. The
 // caller must hold b.mu and must be on the live connection.
-func (b *Bridge) noteOverflowLocked() {
-	if !b.needCatchUp {
-		// The messages behind it are only recoverable by reading the window
-		// again, and the reactions that came after them are held until that
-		// has happened. Only when nothing has been asked for already: the
-		// overflow stands until the stream can announce it, and asking again
-		// every time round would keep moving the epoch out from under the
-		// catch-up that is answering it.
-		b.requestCatchUpForHoleLocked()
+func (b *Bridge) noteOverflowLocked(overflow bool) {
+	if !overflow {
+		// The stream has room again and has said what it lost. The next
+		// refusal is a new one.
+		b.overflowNoted.Store(false)
+		return
 	}
+	if b.overflowNoted.Load() {
+		// Already accounted for. The flag stands until the stream can
+		// announce it, and raising a hole on every poll would keep moving the
+		// epoch out from under the catch-up that is answering this one.
+		return
+	}
+	b.overflowNoted.Store(true)
+
+	// A hole, even when a catch-up is already due. The one in flight went to
+	// Slack before this message was refused, so it may not be the one that
+	// answers for it — and on a stream that then goes quiet there is no
+	// StreamDropped event coming to ask again.
+	b.requestCatchUpForHoleLocked()
 }
 
 // finishStream ends a connection whose events channel has not closed yet. The
@@ -450,10 +461,13 @@ const streamCloseWait = 250 * time.Millisecond
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
 func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
-	// Asked once, before the lock, and kept whichever branch this takes: it is
-	// a question for somebody else's implementation, and asking clears the
-	// answer, so asking twice would lose it.
+	// Asked once, before the lock, and kept whichever branch this takes: they
+	// are questions for somebody else's implementation of the stream — asking
+	// one of them clears the answer, so asking twice would lose it, and asking
+	// either under b.mu hands the lock the pump and every tool call needs to
+	// code this package does not own.
 	lost := streamDroppedReactions(stream)
+	overflow := streamPendingOverflow(stream)
 
 	b.mu.Lock()
 	if lost {
@@ -535,11 +549,11 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		b.noteReactionsDroppedLocked()
 	}
 
-	// An overflow the stream recorded but never had room to announce. The
-	// messages it refused are in the window and nowhere else, and the cursor
-	// has just moved over the ones that did fit — so the request to read that
-	// window again outlives the connection that lost them.
-	if streamPendingOverflow(stream) {
+	if overflow {
+		// An overflow the stream recorded but never had room to announce. The
+		// messages it refused are in the window and nowhere else, and the
+		// cursor has just moved over the ones that did fit — so the request to
+		// read that window again outlives the connection that lost them.
 		b.requestCatchUpForHoleLocked()
 	}
 	b.mu.Unlock()

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestStoreRoundTrip(t *testing.T) {
@@ -371,4 +372,73 @@ func TestAChannelWithACursorCountsAsSeeded(t *testing.T) {
 	if seeded, err := store.Seeded("C2"); err != nil || seeded {
 		t.Errorf("Seeded() = %v (err %v), want a channel nothing is recorded for to count as unseen", seeded, err)
 	}
+}
+
+// Reopening a conversation clears the cursor the old one left behind, and does
+// it in one write. Two writes leave a moment where the file says the
+// conversation does not exist: a process stopping there comes back with the
+// conversation gone and the mention that opened it already behind the cursor.
+func TestResetThreadForgetsTheOldCursorInOneWrite(t *testing.T) {
+	store := NewStore(t.TempDir())
+
+	if err := store.SetThread("C1", "100.000100", "100.000500"); err != nil {
+		t.Fatalf("SetThread() error = %v", err)
+	}
+	if err := store.ResetThread("C1", "100.000100", ""); err != nil {
+		t.Fatalf("ResetThread() error = %v", err)
+	}
+
+	threads, err := store.Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	if len(threads) != 1 {
+		t.Fatalf("Threads() = %+v, want the conversation open once", threads)
+	}
+	if threads[0].LastTS != "" {
+		t.Errorf("thread cursor = %q, want the old conversation's reading forgotten", threads[0].LastTS)
+	}
+}
+
+// The single-instance lock is held until the write that outlasted shutdown has
+// finished, with no deadline: letting go while that write can still rename the
+// file is the one thing the lock is being held for.
+func TestTheLockIsHeldUntilTheLastWriteEnds(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := AcquireLock(dir)
+	if err != nil {
+		t.Fatalf("AcquireLock() error = %v", err)
+	}
+
+	b := &Bridge{}
+	if !b.beginStateWrite() {
+		t.Fatal("beginStateWrite() = false on a writer nobody has fenced")
+	}
+
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		b.releaseWhenWritesEnd(lock)
+	}()
+
+	// While the write is running the lock stays taken, so nobody else may have
+	// this directory.
+	time.Sleep(100 * time.Millisecond)
+	if other, err := AcquireLock(dir); err == nil {
+		_ = other.Release()
+		t.Fatal("another session took the lock while a state file write was still running")
+	}
+
+	b.endStateWrite()
+
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lock was never released after the write finished")
+	}
+	other, err := AcquireLock(dir)
+	if err != nil {
+		t.Fatalf("AcquireLock() after the write finished: %v", err)
+	}
+	_ = other.Release()
 }
