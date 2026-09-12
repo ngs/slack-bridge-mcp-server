@@ -1437,14 +1437,31 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		}
 		b.lastTS = newest
 	}
+	// A conversation the walk could not reach keeps its cursor, whatever this
+	// pass hands over from it. The socket can deliver a reply in a conversation
+	// the walk skipped, and moving the cursor to that reply steps over
+	// everything the walk was going to go back for — which is the promise the
+	// skipped list makes. The reply is still handed over; only the cursor
+	// waits, and the walk that reads that conversation moves it.
+	missed := make(map[threadKey]struct{}, len(scan.skippedKeys))
+	for _, key := range scan.skippedKeys {
+		missed[key] = struct{}{}
+	}
+	reached := func(m Message) bool {
+		_, skipped := missed[threadKey{m.Channel, m.ThreadTS}]
+		return !skipped
+	}
+
 	for _, m := range threads {
-		b.noteThreadDeliveredLocked(m)
+		if reached(m) {
+			b.noteThreadDeliveredLocked(m)
+		}
 	}
 	// The replies this pass read and did not hand on, for the same reason: they
 	// were handed on by the pass that gave up in the storm, and a cursor left
 	// behind them would fetch them again on every hole.
 	for _, m := range readThreads {
-		if b.alreadyDeliveredLocked(m) {
+		if reached(m) && b.alreadyDeliveredLocked(m) {
 			b.noteThreadDeliveredLocked(m)
 		}
 	}

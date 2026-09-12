@@ -2462,3 +2462,91 @@ func TestTheCursorFollowsWhatAPassReadNotOnlyWhatItHandedOn(t *testing.T) {
 		t.Errorf("Wait() after a restart = %v, want nothing: it was handed over before the session ended", texts(msgs))
 	}
 }
+
+// A conversation the walk skipped for want of budget still has replies behind
+// its cursor. A live reply in that conversation, delivered by the same pass,
+// moves the cursor past them, and the walk that follows starts after them.
+func TestASkippedConversationKeepsItsCursorWhenALiveReplyArrives(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	cursors := map[threadKey]string{}
+	for i := 0; i < maxThreadsPerCatchUp+1; i++ {
+		ts := "50.00000" + strconv.Itoa(i)
+		if err := store.SetThread("CPROJ", ts, "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+		cursors[threadKey{"CPROJ", ts}] = "60.000000"
+	}
+	order := threadWalkOrder(cursors, nil)
+	target := order[len(order)-1] // the one a full walk skips
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+		replies: []candidate{
+			{Channel: "CPROJ", User: testOwner, Text: "unread one", TS: "70.000000", ThreadTS: target.threadTS},
+			{Channel: "CPROJ", User: testOwner, Text: "unread two", TS: "80.000000", ThreadTS: target.threadTS},
+		},
+		historyGate: make(chan struct{}),
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// A live reply in the skipped conversation, queued while the first
+	// catch-up is held open on the home history.
+	send(stream, "CPROJ", "90.000000", target.threadTS, "live")
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b.pendingThreadCount() == 1 {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		close(api.historyGate)
+	}()
+
+	result, err := b.Wait(ctx, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	t.Logf("first Wait delivered %v", texts(result.Messages))
+
+	b.mu.Lock()
+	cursor := b.threadCursors[target]
+	skipped := b.threadsSkipped
+	b.mu.Unlock()
+	t.Logf("after the first pass: target cursor=%q threadsSkipped=%v", cursor, skipped)
+
+	var got []string
+	for i := 0; i < 3; i++ {
+		r, err := b.Wait(ctx, 50*time.Millisecond)
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+		got = append(got, texts(r.Messages)...)
+	}
+	t.Logf("the walks after it delivered %v", got)
+	api.mu.Lock()
+	t.Logf("replies calls: %d", len(api.replyCalls))
+	api.mu.Unlock()
+
+	if cursor != "60.000000" {
+		t.Errorf("the skipped conversation's cursor moved to %q on a live reply; the replies behind it were never read", cursor)
+	}
+	if len(got) != 2 {
+		t.Errorf("replies in the skipped conversation delivered = %v, want [unread one unread two]", got)
+	}
+}
