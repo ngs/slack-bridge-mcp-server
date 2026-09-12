@@ -281,11 +281,6 @@ func applyStateWrite(store *Store, w stateWrite) error {
 // taken its place, and asks for another attempt after a pause.
 func (b *Bridge) requeueStateWrites(failed []stateWrite) {
 	b.mu.Lock()
-	if b.stateDirty == nil {
-		// The writer is on its way out and nobody will read this again.
-		b.mu.Unlock()
-		return
-	}
 	for _, w := range failed {
 		newer, taken := b.stateDirty[w.stateKey]
 		if !taken {
@@ -363,10 +358,10 @@ func (b *Bridge) reportUnwrittenState() {
 const stateWriteRetryWait = 200 * time.Millisecond
 
 // stopStateWriter tells the writer to flush what it has and stop, and waits
-// briefly for it. It reports whether the writer actually stopped, and must be
-// called without b.mu held.
-// stopStateWriter reports whether the writer finished what it had, and whether
-// the single-instance lock may be released. The two are not the same: a writer
+// briefly for it. It must be called without b.mu held.
+//
+// It reports whether the writer finished what it had, and whether the
+// single-instance lock may be released. The two are not the same: a writer
 // that has been fenced with nothing in flight is finished as far as the file is
 // concerned, while one still inside the store cannot be interrupted at all —
 // and releasing the lock under it would let the session that takes it next have

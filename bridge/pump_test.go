@@ -901,11 +901,12 @@ func TestAnEventAppliesTheCarriedReactionWithIt(t *testing.T) {
 	}
 }
 
-// A catch-up asked for again while this one was fetching means there is a hole
-// after the window it read. The live messages queued behind that hole are newer
-// than it, and handing them over would move the cursor past it — so that
-// catch-up leaves them where they are, for the one that covers the hole.
-func TestAGappedCatchUpKeepsTheLiveBacklog(t *testing.T) {
+// A hole found while a catch-up was fetching throws that whole pass away.
+// Nobody knows where the hole is, so nothing the pass read can be trusted to
+// belong after it: the queues are left as they are, the cursor does not move,
+// and the request stands for the next call, which reads the window with the
+// hole already in the past.
+func TestAHoleDuringACatchUpThrowsThePassAway(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -962,10 +963,8 @@ func TestAGappedCatchUpKeepsTheLiveBacklog(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("drainCatchUp() error = %v", got.err)
 	}
-	for _, m := range got.msgs {
-		if m.TS == "100.000300" {
-			t.Fatal("the message behind the hole was handed over, which moves the cursor past what the hole swallowed")
-		}
+	if len(got.msgs) != 0 {
+		t.Fatalf("drainCatchUp() = %v, want nothing: what it read cannot be placed against a hole it did not see", texts(got.msgs))
 	}
 	if got := b.Status().LastTS; got != "100.000100" {
 		t.Errorf("last_ts = %q, want it left behind the hole", got)
@@ -1015,10 +1014,8 @@ func TestAClickFromALaterConnectionDoesNotAnswerAnOlderQuestion(t *testing.T) {
 	}
 }
 
-// The cursor has to move on an ordinary delivery. A guard written for the
-// gapped case, where the queue is deliberately kept, would otherwise see the
-// batch it is handing over still sitting in that queue and never advance —
-// leaving every reconnect to replay what was just delivered.
+// The cursor has to move on an ordinary delivery, or every reconnect replays
+// what was just handed over.
 func TestAnOrdinaryDeliveryAdvancesTheCursor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1539,11 +1536,13 @@ func TestALostReactionWakesTheWaitThatIsBlocked(t *testing.T) {
 	}
 }
 
-// The seed's exemption belongs to the messages it was taken alongside, and
-// behind a gap those messages deliberately stay queued. Clearing the exemption
-// on the pass that leaves them there would have the next pass filter them
-// against the seed, and every one of them arrived before it.
-func TestAGappedSeedKeepsTheExemptionForTheQueueItLeftBehind(t *testing.T) {
+// A hole found while the cursor was being seeded throws the pass away, but not
+// the seed: where the channel was when this session found it is not something a
+// hole changes, and seeding again would read a channel that has moved on. The
+// message that arrived while the seed was being read is queued, and it is older
+// than the seed — which is exactly why a live message is never filtered by the
+// cursor.
+func TestAHoleDuringTheSeedKeepsBothTheSeedAndTheMessage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1581,10 +1580,8 @@ func TestAGappedSeedKeepsTheExemptionForTheQueueItLeftBehind(t *testing.T) {
 	b.absorb(StreamEvent{Kind: StreamConnected})
 	close(gate)
 
-	// The pass that found the gap leaves the queue alone and asks for another.
-	// That second pass is the one that merges it, and it can only do so if the
-	// exemption survived the first: the message is older than the seed, and
-	// against the seed it would be filtered out as the channel's past.
+	// The pass that found the hole leaves the queue alone and asks for another.
+	// That second pass is the one that hands it over.
 	select {
 	case result := <-done:
 		if len(result.Messages) != 1 || result.Messages[0].TS != "100.000150" {
@@ -1672,4 +1669,124 @@ func TestAQuietStreamsOverflowIsStillNoticed(t *testing.T) {
 	stream.pendingOverflow.Store(true)
 
 	eventually(t, "the refused message to be asked for", func() bool { return b.catchUpDue() })
+}
+
+// absorb folds one stream event into the bridge's pending state, taking b.mu
+// the way the pump does. It is for tests that drive the queues directly: in
+// the bridge itself the pump is the only thing that applies an event, and it
+// holds the lock across a whole batch.
+func (b *Bridge) absorb(evt StreamEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.absorbLocked(evt)
+}
+
+// routeInteraction hands one click on under b.mu, for tests that deliver a
+// click without a pump.
+func (b *Bridge) routeInteraction(in Interaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deliverInteraction(in)
+}
+
+// A message refused for want of room is not a hole. The queue was full, so the
+// refused message is newer than everything in it, and everything read alongside
+// it is still good: the batch is handed over, the cursor moves, and the request
+// to read the window again stands for the message that did not fit.
+//
+// Treated as a hole, this was absorbing. The queue was kept, so it stayed full,
+// so the next live message was refused too — and every pass delivered the same
+// window again while the queue it duplicated never drained.
+func TestARefusalDuringCatchUpStillDrainsTheQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{botUserID: testBotUser}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// The home queue filled to the brim and one more refused, which is what
+	// asks for the window to be read.
+	var history []candidate
+	for i := 0; i <= maxPendingMessages; i++ {
+		ts := fmt.Sprintf("100.%06d", i+1000)
+		history = append(history, ownerMsg(ts, "flood"))
+		b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+			TS: ts, Channel: testChannel, User: testOwner, Text: "flood",
+		}})
+	}
+	if !b.catchUpDue() || b.pendingHomeCount() != maxPendingMessages {
+		t.Fatalf("setup: catch-up due = %v, queued = %d", b.catchUpDue(), b.pendingHomeCount())
+	}
+
+	gate := make(chan struct{})
+	api.mu.Lock()
+	api.history = history
+	api.historyGate = gate
+	calls := len(api.historyCalls)
+	api.mu.Unlock()
+
+	generation := b.currentGeneration()
+	first := make(chan []Message, 1)
+	go func() {
+		msgs, _, err := b.drainCatchUp(ctx, generation, true, 5*time.Second)
+		if err != nil {
+			t.Errorf("drainCatchUp() error = %v", err)
+		}
+		first <- msgs
+	}()
+
+	eventually(t, "the catch-up to reach Slack", func() bool { return len(api.calls()) > calls })
+
+	// One more owner message while history is in flight. The queue is full, so
+	// it is refused — and that refusal used to gap the pass that was about to
+	// drain the queue it could not join.
+	b.absorb(StreamEvent{Kind: StreamMessage, Message: Message{
+		TS: "100.009999", Channel: testChannel, User: testOwner, Text: "refused",
+	}})
+	close(gate)
+
+	delivered := <-first
+	if got := b.pendingHomeCount(); got != 0 {
+		t.Fatalf("queued messages = %d after the pass that delivered them, want the queue drained: a full queue refuses the next message, which would gap the next pass in turn", got)
+	}
+
+	api.mu.Lock()
+	api.historyGate = nil
+	api.history = append(history, ownerMsg("100.009999", "refused"))
+	api.mu.Unlock()
+
+	// The refusal is still owed a pass, and that pass brings back the message
+	// that did not fit — and nothing that was already handed over.
+	second, _, err := b.drainCatchUp(ctx, generation, true, 5*time.Second)
+	if err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+	seen := make(map[string]bool, len(delivered))
+	for _, m := range delivered {
+		seen[m.TS] = true
+	}
+	duplicates := 0
+	for _, m := range second {
+		if seen[m.TS] {
+			duplicates++
+		}
+	}
+	if duplicates > 0 {
+		t.Errorf("%d of the %d messages in the second batch had already been handed over", duplicates, len(second))
+	}
+	if len(second) != 1 || second[0].TS != "100.009999" {
+		t.Errorf("second batch = %v, want only the message that was refused", texts(second))
+	}
 }

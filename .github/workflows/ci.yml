@@ -58,6 +58,16 @@ jobs:
       env:
         CI: true
 
+    # The race detector on one platform rather than all three: it is what the
+    # single-owner design is about, and it costs more time than the other two
+    # jobs have to spare.
+    - name: Run tests under the race detector
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: go test -race -timeout=300s ./...
+      env:
+        CI: true
+
     - name: Upload coverage to Codecov
       if: matrix.os == 'ubuntu-latest'
       uses: codecov/codecov-action@v3

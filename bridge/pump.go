@@ -174,28 +174,32 @@ func (b *Bridge) noteStreamLosses(generation uint64, stream Stream) {
 		return
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if lostReactions {
 		// Before the staleness check, and deliberately. The marker clears when
 		// it is read, so a connection replaced between the question and this
 		// lock would take the answer with it — and a reaction lost on a
 		// connection that has since died is still a reaction the agent's count
 		// is missing.
-		b.noteReactionsDroppedLocked()
+		b.noteReactionsDropped()
 	}
-	if b.stale(generation) {
+
+	if !overflow {
 		return
 	}
-	if overflow && !b.needCatchUp {
+	b.underLive(generation, func() { b.noteOverflowLocked() })
+}
+
+// noteOverflowLocked raises the catch-up request an overflow calls for. The
+// caller must hold b.mu and must be on the live connection.
+func (b *Bridge) noteOverflowLocked() {
+	if !b.needCatchUp {
 		// The messages behind it are only recoverable by reading the window
 		// again, and the reactions that came after them are held until that
 		// has happened. Only when nothing has been asked for already: the
 		// overflow stands until the stream can announce it, and asking again
 		// every time round would keep moving the epoch out from under the
 		// catch-up that is answering it.
-		b.requestCatchUpLocked()
+		b.requestCatchUpForHoleLocked()
 	}
 }
 
@@ -223,20 +227,17 @@ func (b *Bridge) finishStream(generation uint64, stream Stream, events <-chan St
 // on the channel is a reaction judged against a scope that message has not had
 // its say in.
 func (b *Bridge) applyReady(generation uint64, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (applied int, keep []Reaction) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.stale(generation) {
-		return 0, carried
-	}
-
-	applied = drainLocked(events, maxSweep, b.absorbLocked)
-	if applied == maxSweep {
-		return applied, carried
-	}
-
-	more, keep := b.takeReactionsLocked(events, reactions, carried, maxSweep-applied)
-	return applied + more, keep
+	keep = carried
+	b.underLive(generation, func() {
+		applied = drainLocked(events, maxSweep, b.absorbLocked)
+		if applied == maxSweep {
+			return
+		}
+		more, left := b.takeReactionsLocked(events, reactions, carried, maxSweep-applied)
+		applied += more
+		keep = left
+	})
+	return applied, keep
 }
 
 // takeReactionsLocked applies the reactions that are ready, once the messages
@@ -276,10 +277,14 @@ func (b *Bridge) takeReactionsLocked(events <-chan StreamEvent, reactions <-chan
 }
 
 // carryOne holds one reaction over to the next turn, within the bound.
+//
+// The oldest goes, not the newest, which is what the queue it is waiting for a
+// place in does: the newest votes are the ones still worth reading, and the
+// marker is what tells the agent the count is short either way.
 func (b *Bridge) carryOne(carried []Reaction, r Reaction) []Reaction {
 	if len(carried) >= maxPendingReactions {
 		b.noteReactionsDropped()
-		return carried
+		return append(carried[1:], r)
 	}
 	return append(carried, r)
 }
@@ -291,7 +296,10 @@ func (b *Bridge) carryOne(carried []Reaction, r Reaction) []Reaction {
 func (b *Bridge) carryLocked(carried, ready []Reaction) []Reaction {
 	for _, r := range ready {
 		if len(carried) >= maxPendingReactions {
+			// The oldest goes, as it does everywhere a queue of these is
+			// bounded: the newest votes are the ones still worth reading.
 			b.noteReactionsDroppedLocked()
+			carried = append(carried[1:], r)
 			continue
 		}
 		carried = append(carried, r)
@@ -303,13 +311,7 @@ func (b *Bridge) carryLocked(carried, ready []Reaction) []Reaction {
 // with messages, so this is safe at any point — including in the middle of a
 // flood, which is the one time it matters.
 func (b *Bridge) drainReadyClicks(generation uint64, clicks <-chan Interaction) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.stale(generation) {
-		return
-	}
-	drainLocked(clicks, maxSweep, b.deliverInteraction)
+	b.underLive(generation, func() { drainLocked(clicks, maxSweep, b.deliverInteraction) })
 }
 
 // stale reports whether this pump's connection has already been replaced. The
@@ -329,6 +331,27 @@ func (b *Bridge) stale(generation uint64) bool {
 	return b.connGeneration != generation
 }
 
+// underLive runs fn with b.mu held, unless the connection it belongs to has
+// been replaced. It reports whether fn ran.
+//
+// Every "am I still the live connection?" check the pump makes goes through
+// here, because the answer has to mean the same thing every time: a replaced
+// connection applies nothing, routes nothing, and commits nothing. What it
+// must still do is record what it has already observed — a reaction lost on a
+// connection that has since died is a reaction the agent's count is missing,
+// and the marker that says so clears when it is read. Those go in before this
+// is called rather than inside fn; noteStreamLosses is the one that does it.
+func (b *Bridge) underLive(generation uint64, fn func()) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(generation) {
+		return false
+	}
+	fn()
+	return true
+}
+
 // applyEvent applies one message together with any reactions already on the
 // wire.
 //
@@ -341,13 +364,16 @@ func (b *Bridge) stale(generation uint64) bool {
 // Messages first within the pair, as always — the mention that opens a
 // conversation has to be applied before a reaction is judged against it.
 func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (keep []Reaction) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	keep = carried
+	b.underLive(generation, func() {
+		keep = b.applyEventLocked(evt, events, reactions, carried)
+	})
+	return keep
+}
 
-	if b.stale(generation) {
-		return carried
-	}
-
+// applyEventLocked is applyEvent once the connection is known to be the live
+// one and b.mu is held.
+func (b *Bridge) applyEventLocked(evt StreamEvent, events <-chan StreamEvent, reactions <-chan Reaction, carried []Reaction) (keep []Reaction) {
 	b.absorbLocked(evt)
 	// The rest of the ready events before any reaction, not just this one. The
 	// events channel is in order, so a reaction on a mention two places behind
@@ -370,13 +396,7 @@ func (b *Bridge) applyEvent(generation uint64, evt StreamEvent, events <-chan St
 // been replaced. A click from a connection nobody owns is an answer to a
 // question that is over, and letting it through could answer the next one.
 func (b *Bridge) applyClick(generation uint64, in Interaction) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.stale(generation) {
-		return
-	}
-	b.deliverInteraction(in)
+	b.underLive(generation, func() { b.deliverInteraction(in) })
 }
 
 // awaitStreamClose waits, briefly, for the socket to finish closing its
@@ -520,7 +540,7 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// has just moved over the ones that did fit — so the request to read that
 	// window again outlives the connection that lost them.
 	if streamPendingOverflow(stream) {
-		b.requestCatchUpLocked()
+		b.requestCatchUpForHoleLocked()
 	}
 	b.mu.Unlock()
 	b.noteStreamClosed(generation, stream)

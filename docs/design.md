@@ -512,11 +512,23 @@ them for the wait that reports them.
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again
 since it started; otherwise a reconnect, or a message refused for want of room,
-would be answered by a fetch that never knew about it. The same epoch decides
-what that fetch may hand over: a request raised while it was in flight means
-there is a hole after the window it read, so the live messages queued behind
-that hole stay queued — delivering them would move the cursor past what the hole
-swallowed.
+would be answered by a fetch that never knew about it.
+
+What such a fetch may hand over depends on what asked. A hole — a reconnect, an
+overflow, a stream that refused a message and could not say so — has no known
+position, so a catch-up that was reading while one opened cannot tell whether
+what it has belongs before it or after: it throws the whole pass away, queues
+and cursor untouched, and the next call reads the window with the hole already
+in the past. One round trip is the entire cost, and the pass was going to be
+repeated anyway. A message this bridge refused for want of room is the other way
+round: the queue was full, so the refused message is newer than everything in
+it, and everything read alongside it is still good. That batch is handed over,
+the cursor moves, and the request stands for the message that did not fit.
+
+The distinction is what makes a full queue drain. Treating a refusal as a hole
+was absorbing: the queue was kept, so it stayed full, so the next live message
+was refused too, and every pass delivered the same window again while the queue
+it duplicated never emptied.
 
 **One writer for the state file.** Every cursor the bridge keeps — how far the
 home channel has been read, how far each conversation outside it has, how far

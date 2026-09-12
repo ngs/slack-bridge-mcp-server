@@ -501,14 +501,6 @@ func (b *Bridge) resolve(api API, channel, ts, text string) {
 	}
 }
 
-// routeInteraction takes b.mu and hands the click on. It exists so the two
-// loops that read the stream do not have to know how a click is delivered.
-func (b *Bridge) routeInteraction(in Interaction) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.deliverInteraction(in)
-}
-
 // deliverInteraction hands a button click to the pending question, if it is
 // one of its buttons and the owner is the one who clicked. The caller must
 // hold b.mu.

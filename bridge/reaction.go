@@ -186,16 +186,12 @@ func (b *Bridge) noteReactionsDroppedLocked() {
 // Reactions have no cursor and no catch-up: they exist only on the live
 // connection, so the queue is the whole of what there is to hand over.
 func (b *Bridge) drainReactions(generation uint64) []Reaction {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	// The queue belongs to whichever connection is current, and a call on one
 	// that has been replaced would be taking the replacement's reactions —
 	// which the call that wants them would then never see.
-	if b.stale(generation) {
-		return nil
-	}
-	return b.drainReactionsLocked()
+	var kept []Reaction
+	b.underLive(generation, func() { kept = b.drainReactionsLocked() })
+	return kept
 }
 
 // drainReactionsLocked is drainReactions for a caller that already holds b.mu
