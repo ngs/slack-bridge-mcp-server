@@ -496,11 +496,11 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// the time a connection is being ended it has almost always been replaced
 	// already: a check after it would never run.
 	//
-	// Only for a stream that delivers reactions at all, and only when the wait
-	// expired. An ordinary close is the common case by a long way, and saying
-	// the count might be short every time the socket reconnected is how a
-	// marker stops meaning anything.
-	if !closed && reactions != nil {
+	// And only when something is actually left with it. A close that is merely
+	// slow abandons nothing, and saying the count might be short every time
+	// the socket took its time is how a marker stops meaning anything — the
+	// agent learns to ignore the one signal that says a vote went missing.
+	if !closed && (len(reactions) > 0 || len(carried) > 0) {
 		b.reactionsDropped = true
 	}
 	if b.stale(generation) {

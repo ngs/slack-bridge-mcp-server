@@ -2345,15 +2345,40 @@ func TestAStreamThatWillNotCloseReportsItsReactionsAsLost(t *testing.T) {
 	// is the path this has to work on.
 	stale := b.currentGeneration() - 1
 
-	// Channels of this test's own: the events one never closes, and the
-	// reactions one is empty — a reaction arriving after the last drain is
-	// exactly what cannot be seen from here.
+	// Channels of this test's own: the events one never closes, and a reaction
+	// is left on the other — which is what makes this a loss rather than a
+	// slow close.
+	events := make(chan StreamEvent)
+	reactions := make(chan Reaction, 1)
+	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true}
+	b.finishStream(stale, stream, events, nil, reactions, nil)
+
+	if !b.droppedReactionMark() {
+		t.Error("the producer was still running with a reaction in hand when the wait for it expired, and nothing said the count might be short")
+	}
+}
+
+// A close that is merely slow abandons nothing. Saying the count might be
+// short every time the socket takes its time is how the one signal that means
+// a vote went missing stops meaning anything.
+func TestASlowCloseWithNothingLeftReportsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	stale := b.currentGeneration() - 1
+
+	// The events channel never closes, and there is nothing left behind on the
+	// others.
 	events := make(chan StreamEvent)
 	reactions := make(chan Reaction)
 	b.finishStream(stale, stream, events, nil, reactions, nil)
 
-	if !b.droppedReactionMark() {
-		t.Error("the producer was still running when the wait for it expired, and nothing said the count might be short")
+	if b.droppedReactionMark() {
+		t.Error("a slow close told the agent its count might be wrong with nothing missing")
 	}
 }
 
@@ -2950,4 +2975,68 @@ func TestProbeHowOftenTheHelloBeatsTheFirstRead(t *testing.T) {
 		cancel()
 	}
 	t.Logf("home-channel history reads on first connect over 30 sessions: once=%d twice=%d other=%d", once, twice, other)
+}
+
+// Conversations left unread are news for whoever is already waiting. A wait
+// blocked on a long timeout has nothing in either queue to wake it, so without
+// this the replies those conversations hold sit there until it gives up.
+func TestAWalkThatRanOutOfBudgetWakesTheWaitingCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxThreadsPerCatchUp+1; i++ {
+		if err := store.SetThread("CPROJ", "50.00000"+strconv.Itoa(i), "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// Back to a catch-up that has not run, with nothing waiting in the queues:
+	// the only news this pass can bring is the conversations it cannot reach.
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.threadsSkipped = false
+	b.skippedThreads = nil
+	b.mu.Unlock()
+
+	woken := make(chan struct{})
+	sub := b.subscribePending()
+	defer b.unsubscribePending(sub)
+	go func() {
+		<-sub
+		close(woken)
+	}()
+
+	if _, _, err := b.drainCatchUp(ctx, b.currentGeneration(), true, time.Second); err != nil {
+		t.Fatalf("drainCatchUp() error = %v", err)
+	}
+	if !b.threadsWaiting() {
+		t.Fatal("the walk reached every conversation; this test is about the ones it cannot")
+	}
+
+	select {
+	case <-woken:
+	case <-time.After(2 * time.Second):
+		t.Error("nothing woke: a call already blocked hears about those conversations only when it gives up")
+	}
 }

@@ -217,6 +217,12 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	askEnds := time.Now().Add(timeout)
+
+	// The conversations a walk could not reach are worth one look, not one per
+	// wakeup: what answers them is a round trip, and one that stays out of
+	// budget would buy another every time this question woke.
+	skippedLooked := false
 
 	for {
 		// Both of these are checked before blocking, not only on a wakeup. The
@@ -241,15 +247,16 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// answer whatever happened to the socket afterwards.
 			if choice, ok := b.lastChance(ask); ok {
 				return b.answered(ctx, api, answer{
-					channel: channel, threadTS: threadTS, ts: ts, generation: generation,
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation, budget: time.Until(askEnds),
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, errors.New("the Slack connection closed")
 		}
-		if !req.InterruptDisabled && b.backlogWaiting() {
-			if msgs := b.backlogWhileAsking(ctx, generation); len(msgs) > 0 {
+		if !req.InterruptDisabled && b.backlogWaiting(!skippedLooked) {
+			skippedLooked = true
+			if msgs := b.backlogWhileAsking(ctx, generation, time.Until(askEnds)); len(msgs) > 0 {
 				return b.interrupted(api, channel, ts, q, msgs), nil
 			}
 			// A reconnect rather than a message, or a drain that failed and
@@ -262,7 +269,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			if req.InterruptDisabled {
 				continue
 			}
-			msgs := b.backlogWhileAsking(ctx, generation)
+			msgs := b.backlogWhileAsking(ctx, generation, time.Until(askEnds))
 			if len(msgs) == 0 {
 				continue
 			}
@@ -270,7 +277,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 		case choice := <-ask.answered:
 			return b.answered(ctx, api, answer{
-				channel: channel, threadTS: threadTS, ts: ts, generation: generation,
+				channel: channel, threadTS: threadTS, ts: ts, generation: generation, budget: time.Until(askEnds),
 				q: q, labels: labels, options: options, choice: choice,
 			}), nil
 
@@ -279,7 +286,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// answer; the owner did decide, and honouring it costs nothing.
 			if choice, ok := b.settleDeadline(ask); ok {
 				return b.answered(ctx, api, answer{
-					channel: channel, threadTS: threadTS, ts: ts, generation: generation,
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation, budget: time.Until(askEnds),
 					q: q, labels: labels, options: options, choice: choice,
 				}), nil
 			}
@@ -297,7 +304,7 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			// A question nobody answered leaves the agent with nothing to act
 			// on, which is exactly when a message waiting behind it matters
 			// most.
-			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx, generation)}, nil
+			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx, generation, askLastLookWait)}, nil
 
 		case <-ctx.Done():
 			// The client gave up on the call. Nobody is left to receive an
@@ -327,13 +334,29 @@ func callerGone(call, session context.Context) error {
 // not on a request that has clearly gone wrong.
 const backlogSlotWait = 5 * time.Second
 
+// askLastLookWait is what a backlog drain gets once the question is over: its
+// deadline has passed, so this is a courtesy rather than a budget — long enough
+// for a request that is nearly done, short enough that the answer is prompt.
+const askLastLookWait = 250 * time.Millisecond
+
 // backlogWaiting reports whether there is anything for a question to be
 // interrupted by: messages the pump has queued, or a catch-up that has not run
 // and may find some.
-func (b *Bridge) backlogWaiting() bool {
+//
+// withSkipped adds the conversations a walk ran out of budget for. Their
+// replies are in neither queue yet and only a walk will bring them, so a
+// question that ignored them would be asked over the top of something the
+// owner said. It is asked at most once per question: the walk that answers it
+// is a round trip, and a conversation that stays out of budget would otherwise
+// buy one on every wakeup.
+func (b *Bridge) backlogWaiting(withSkipped bool) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.pending) > 0 || len(b.pendingThreads) > 0 || b.needCatchUp
+
+	if len(b.pending) > 0 || len(b.pendingThreads) > 0 || b.needCatchUp {
+		return true
+	}
+	return withSkipped && b.threadsSkipped
 }
 
 // answer is everything the settled question needs to report itself, gathered so
@@ -342,6 +365,9 @@ type answer struct {
 	channel  string
 	threadTS string
 	ts       string
+	// budget is what is left of the question's own timeout, which bounds the
+	// backlog the answer carries with it.
+	budget time.Duration
 	// generation is the connection the question was asked on, which is what
 	// decides whether the backlog it collects is still its to collect.
 	generation uint64
@@ -364,7 +390,7 @@ func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
 		ChoiceIndex: a.choice,
 		ChoiceLabel: a.options[a.choice],
 		TS:          a.ts,
-		Messages:    b.backlogWhileAsking(ctx, a.generation),
+		Messages:    b.backlogWhileAsking(ctx, a.generation, a.budget),
 	}
 }
 
@@ -404,9 +430,30 @@ func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Mes
 // It is called only once a question has settled. A call abandoned or a socket
 // that closed has no session left to hand a backlog to, and moving the cursor
 // there would consume messages nobody ever received.
-func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64) []Message {
-	msgs, _, err := b.drainCatchUp(ctx, generation, false, backlogSlotWait)
+func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64, budget time.Duration) []Message {
+	// Bounded by what the question has left. The slot wait was already, but
+	// the request itself was not: a history call that hangs would hold the
+	// tool past the timeout the caller asked for, which is the one promise
+	// every tool makes. Nothing is committed until the messages are in hand,
+	// so a drain cut short here costs a round trip and no messages.
+	if budget < askLastLookWait {
+		budget = askLastLookWait
+	}
+	drainCtx, cancelDrain := context.WithTimeout(ctx, budget)
+	defer cancelDrain()
+
+	slotWait := backlogSlotWait
+	if budget < slotWait {
+		slotWait = budget
+	}
+
+	msgs, _, err := b.drainCatchUp(drainCtx, generation, false, slotWait)
 	if err != nil {
+		if ctx.Err() == nil && drainCtx.Err() != nil {
+			// The question's own deadline, not the caller's. The next
+			// slack_wait reads the same window.
+			return nil
+		}
 		log.Printf("could not collect the messages that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
 		return nil
 	}

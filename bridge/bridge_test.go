@@ -1120,3 +1120,11 @@ func (b *Bridge) currentStream() Stream {
 	defer b.mu.Unlock()
 	return b.stream
 }
+
+// replyCallsSnapshot copies the thread reads, so a test can count them without
+// holding the fake's lock.
+func (f *fakeAPI) replyCallsSnapshot() []RepliesRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]RepliesRequest(nil), f.replyCalls...)
+}

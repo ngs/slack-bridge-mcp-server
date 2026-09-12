@@ -506,6 +506,12 @@ conversations raise `threadsSkipped`, and what answers that is a walk through
 those conversations alone — not the window, not the search for mentions, and not
 the conversations the pass before it already read.
 
+Raising it wakes whoever is waiting, and a question counts it as a backlog: the
+replies those conversations hold are in neither queue, and a question asked over
+the top of them is one the owner has already answered somewhere else. A question
+looks once, though. The walk is a round trip, and a conversation that stays out
+of budget would otherwise buy one every time the question woke.
+
 **A connection's own hello is not a reconnect, and not nothing either.** Every
 connection announces itself once, and the catch-up for what was missed while the
 session was down is asked for where the connection is opened — so treating that
@@ -556,6 +562,12 @@ the message and yields, the second takes the reaction that came with it, and
 each hands over half. A question is the exception — it collects the messages
 that arrived while it was up and has nowhere to put a reaction, so it leaves
 them for the wait that reports them.
+
+What a question collects is bounded by the question's own timeout, requests to
+Slack included. That timeout is a promise about when the tool returns, and a
+history call that hangs would otherwise outlast it; nothing is committed until
+the messages are in hand, so a collection cut short costs a round trip and no
+messages.
 
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again

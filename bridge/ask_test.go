@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -695,5 +696,152 @@ func TestInteractiveEnvelopesAreAcknowledgedAndTranslated(t *testing.T) {
 	}
 	if len(stream.interactions) != 0 {
 		t.Errorf("the unusable payload was queued as %d interaction(s), want 0", len(stream.interactions))
+	}
+}
+
+// The timeout a question is given is a promise about when the tool returns,
+// and the backlog it collects on the way out is made of Slack requests. One
+// that hangs used to hold the call open indefinitely: the wait for a turn at
+// catch-up was bounded and the request itself was not.
+func TestAQuestionAnswersOnTimeEvenWithSlackNotAnswering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+
+	// Connect first, so the question is asked on a live connection.
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// Slack stops answering, and a catch-up is due — so the question's backlog
+	// collection has somewhere to hang.
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	type answered struct {
+		result AskResult
+		err    error
+	}
+	done := make(chan answered, 1)
+	go func() {
+		result, err := b.Ask(ctx, AskRequest{
+			Question: "ship it?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		})
+		done <- answered{result, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Ask() error = %v, want the ordinary timed-out answer", got.err)
+		}
+		if !got.result.TimedOut {
+			t.Errorf("Ask() = %+v, want it to report the timeout it promised", got.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ask() never came back: its own deadline did not bound the backlog it was collecting")
+	}
+}
+
+// A conversation the walk could not reach holds replies that are in neither
+// queue. A question asked over the top of them is a question the owner has
+// already answered somewhere else, so the walk that brings them counts as a
+// backlog — once per question, because it is a round trip.
+func TestAQuestionCollectsTheRepliesAWalkCouldNotReach(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatal(err)
+	}
+	// More than two passes can reach, so one is still waiting by the time the
+	// question is asked: the first catch-up walks its budget, the last look
+	// behind it walks another, and one conversation is left.
+	cursors := map[threadKey]string{}
+	for i := 0; i < 2*maxThreadsPerCatchUp+1; i++ {
+		ts := "50.0000" + fmt.Sprintf("%02d", i)
+		if err := store.SetThread("CPROJ", ts, "60.000000"); err != nil {
+			t.Fatal(err)
+		}
+		cursors[threadKey{"CPROJ", ts}] = "60.000000"
+	}
+	order := threadWalkOrder(cursors, nil)
+	target := order[len(order)-1] // the one a full walk skips
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		questionTS:     askTS,
+		postTS:         "100.000900",
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "old")}},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	// The first catch-up reads what it has budget for and leaves one behind.
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	// The owner says something in one of those conversations, and the walk
+	// that would read it has run out of budget: the reply is in Slack, in
+	// neither queue, and only a walk will bring it.
+	api.mu.Lock()
+	api.replies = []candidate{
+		{Channel: "CPROJ", User: testOwner, Text: "said in the conversation the walk skipped", TS: "70.000000", ThreadTS: target.threadTS},
+	}
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.threadsSkipped = true
+	b.skippedThreads = map[threadKey]struct{}{target: {}}
+	b.mu.Unlock()
+
+	result, err := b.Ask(ctx, AskRequest{
+		Question: "ship it?",
+		Options:  []string{"yes", "no"},
+		Timeout:  2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if len(result.Messages) != 1 || result.Messages[0].TS != "70.000000" {
+		t.Errorf("Ask() = %v, want the reply from the conversation the walk could not reach", texts(result.Messages))
+	}
+	// Handed over instead of the question, not alongside the timeout it would
+	// otherwise have run out to: the owner has already said something, and the
+	// question was about to talk over it.
+	if result.TimedOut {
+		t.Errorf("Ask() timed out with the reply attached, want the question interrupted by it")
+	}
+
+	// Once per question. The walk is a round trip, and a conversation that
+	// stays out of budget would otherwise buy one on every wakeup.
+	reads := len(api.replyCallsSnapshot())
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  200 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	if got := len(api.replyCallsSnapshot()) - reads; got > maxThreadsPerCatchUp {
+		t.Errorf("the second question cost %d thread reads, want one walk at most", got)
 	}
 }

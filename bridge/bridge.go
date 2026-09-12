@@ -1405,6 +1405,12 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// Threads the walk could not reach. Recorded on their own flag, which asks
 	// for another walk and nothing else.
 	if needCatchUp || threadsOnly {
+		// News, when it becomes true: a call already blocked has nothing in
+		// either queue to wake it, and the replies these conversations hold
+		// would wait out its whole timeout otherwise.
+		if scan.skipped && !b.threadsSkipped {
+			b.notifyPendingLocked()
+		}
 		b.threadsSkipped = scan.skipped
 		b.skippedThreads = nil
 		if len(scan.skippedKeys) > 0 {
