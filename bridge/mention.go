@@ -168,10 +168,11 @@ func (b *Bridge) skippedThreadKeys() map[threadKey]struct{} {
 	return waiting
 }
 
-// catchUpSkippedThreads walks the open conversations and nothing else. It is
-// what a walk that ran out of budget asks for: the home channel's window and
-// the search for mentions were read by the catch-up that skipped them, and
-// reading either again would spend two API calls a wake to learn nothing.
+// catchUpSkippedThreads walks the conversations the last walk could not reach,
+// and nothing else. It is what a walk that ran out of budget asks for: the home
+// channel's window and the search for mentions were read by the catch-up that
+// skipped them, and reading either again would spend two API calls a wake to
+// learn nothing — as would reading the conversations that walk did reach.
 func (b *Bridge) catchUpSkippedThreads(ctx context.Context, api API, owner string, generation uint64, scan *scanChanges) ([]Message, error) {
 	if api == nil {
 		return nil, nil
@@ -180,7 +181,28 @@ func (b *Bridge) catchUpSkippedThreads(ctx context.Context, api API, owner strin
 		return nil, nil
 	}
 
-	replies, err := b.catchUpThreadConversations(ctx, api, owner, b.openThreads(), b.skippedThreadKeys(), scan)
+	// The ones that were skipped, and only those. Walking every open
+	// conversation would spend the same budget the full catch-up just spent,
+	// on the same conversations, and come back with the same one unread: the
+	// walk would never settle.
+	waiting := b.skippedThreadKeys()
+	if len(waiting) == 0 {
+		return nil, nil
+	}
+	open := b.openThreads()
+	cursors := make(map[threadKey]string, len(waiting))
+	for key := range waiting {
+		if cursor, still := open[key]; still {
+			cursors[key] = cursor
+		}
+	}
+	if len(cursors) == 0 {
+		// Every one of them has been closed since. Nothing to read, and
+		// nothing left waiting.
+		return nil, nil
+	}
+
+	replies, err := b.catchUpThreadConversations(ctx, api, owner, cursors, waiting, scan)
 	if err != nil {
 		if !errors.Is(err, ErrMissingScope) {
 			return nil, err

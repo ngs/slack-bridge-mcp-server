@@ -2096,12 +2096,17 @@ func TestMoreOpenThreadsThanOnePassReadsStillSettles(t *testing.T) {
 	if result := waitOnce(ctx, t, b); !result.TimedOut {
 		t.Fatalf("Wait() = %+v, want a timeout", result)
 	}
-	if !b.catchUpDue() {
-		t.Skip("catch-up cleared; the skipped rule did not fire")
-	}
 	api.mu.Lock()
 	replies0 := len(api.replyCalls)
 	api.mu.Unlock()
+	// The first catch-up reads what it has budget for and the walk behind it
+	// reads the rest, so by now every conversation has been reached once.
+	if replies0 > maxThreadsPerCatchUp+1 {
+		t.Fatalf("the first catch-up and the walk after it cost %d thread reads", replies0)
+	}
+	if b.threadsWaiting() {
+		t.Fatalf("a conversation is still waiting after %d reads; the walk that follows a full catch-up should reach the ones it skipped", replies0)
+	}
 
 	for i := 0; i < 3; i++ {
 		stream.events <- StreamEvent{Kind: StreamMessage, Message: Message{
@@ -2114,10 +2119,18 @@ func TestMoreOpenThreadsThanOnePassReadsStillSettles(t *testing.T) {
 	api.mu.Lock()
 	replies := len(api.replyCalls) - replies0
 	api.mu.Unlock()
-	t.Logf("three live messages cost %d conversations.replies calls (catch-up still due: %v)", replies, b.catchUpDue())
-	if replies >= 3*maxThreadsPerCatchUp {
-		t.Errorf("every delivery re-walks %d threads because needCatchUp never clears", maxThreadsPerCatchUp)
+	t.Logf("three live messages cost %d conversations.replies calls", replies)
+	if replies != 0 {
+		t.Errorf("three deliveries cost %d thread reads; nothing was waiting to be read", replies)
 	}
+}
+
+// threadsWaiting reports whether a conversation was left unread for want of
+// budget, which is its own errand rather than a catch-up.
+func (b *Bridge) threadsWaiting() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.threadsSkipped
 }
 
 // the socket's own Connected event on first connect discards the
@@ -2302,14 +2315,41 @@ func TestAStreamThatWillNotCloseReportsItsReactionsAsLost(t *testing.T) {
 	if result := waitOnce(ctx, t, b); !result.TimedOut {
 		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
 	}
-	generation := b.currentGeneration()
+	// A connection being ended has almost always been replaced already, which
+	// is the path this has to work on.
+	stale := b.currentGeneration() - 1
 
-	// Channels of this test's own, and the events one never closes.
+	// Channels of this test's own: the events one never closes, and the
+	// reactions one is empty — a reaction arriving after the last drain is
+	// exactly what cannot be seen from here.
 	events := make(chan StreamEvent)
-	b.finishStream(generation, stream, events, nil, nil, nil)
+	reactions := make(chan Reaction)
+	b.finishStream(stale, stream, events, nil, reactions, nil)
 
 	if !b.droppedReactionMark() {
 		t.Error("the producer was still running when the wait for it expired, and nothing said the count might be short")
+	}
+}
+
+// An ordinary close says nothing. A marker that is set on every reconnect is a
+// marker the agent learns to ignore.
+func TestAStreamThatClosesInTimeReportsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, _, stream := mentionBridge(ctx, t)
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+	stale := b.currentGeneration() - 1
+
+	events := make(chan StreamEvent)
+	close(events)
+	reactions := make(chan Reaction)
+	b.finishStream(stale, stream, events, nil, reactions, nil)
+
+	if b.droppedReactionMark() {
+		t.Error("an ordinary close told the agent its count might be wrong")
 	}
 }
 
@@ -2350,5 +2390,75 @@ func TestAReactionWaitsOutTheMomentBeforeAnOverflowIsAnnounced(t *testing.T) {
 
 	if kept := b.drainReactions(generation); len(kept) != 1 {
 		t.Errorf("drainReactions() = %+v, want the vote on the mention the overflow was hiding", kept)
+	}
+}
+
+// A pass that hands the queue over in a storm leaves those messages in the
+// window without moving the cursor. The pass that follows finds them in
+// history and drops them as delivered — and if it took its cursor from what
+// survived that, the cursor would stay behind them: the next restart would
+// hand them over again, and every hole until then would fetch them again.
+func TestTheCursorFollowsWhatAPassReadNotOnlyWhatItHandedOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream})
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// The owner's message, handed over the way a storm hands it over: from the
+	// queue, with no cursor moving.
+	send(stream, testChannel, "100.000200", "", "hello?")
+	eventually(t, "the pump to take it", func() bool { return b.pendingHomeCount() == 1 })
+	b.mu.Lock()
+	handed, _, err := b.handOverQueuesLocked(true)
+	b.mu.Unlock()
+	if err != nil || len(handed) != 1 {
+		t.Fatalf("handOverQueuesLocked() = %v (err %v), want the queued message", texts(handed), err)
+	}
+
+	// History has it now, as it would by the time the storm passed.
+	api.mu.Lock()
+	api.channelHistory[testChannel] = append(api.channelHistory[testChannel], ownerMsg("100.000200", "hello?"))
+	api.mu.Unlock()
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	if msgs := waitOnce(ctx, t, b).Messages; len(msgs) != 0 {
+		t.Fatalf("Wait() = %v, want nothing: it was handed over in the storm", texts(msgs))
+	}
+	if got := b.Status().LastTS; got != "100.000200" {
+		t.Errorf("last_ts = %q, want the message this pass read even though it handed none of it on", got)
+	}
+
+	// And it stays handed over across a restart, which is where a cursor left
+	// behind would show.
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	eventuallyOnDisk(t, "the cursor to reach the state file", func() bool {
+		stored, err := NewStore(cfg.StateDir).LastTS(testChannel)
+		return err == nil && stored == "100.000200"
+	})
+
+	next := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream()})
+	t.Cleanup(func() { _ = next.Close() })
+	if msgs := waitOnce(ctx, t, next).Messages; len(msgs) != 0 {
+		t.Errorf("Wait() after a restart = %v, want nothing: it was handed over before the session ended", texts(msgs))
 	}
 }

@@ -462,8 +462,10 @@ interface.
 | Owner message | `pending` / `pendingThreads` | the next `slack_wait`, or a settled `slack_ask` |
 | Reaction | `pendingReactions` | the next `slack_wait` |
 | Button click | routed straight to the pending question | the `slack_ask` waiting for it |
-| Reconnect or overflow | `needCatchUp` | the next call to run catch-up |
-| Overflow the stream cannot announce yet | `needCatchUp`, asked of the stream | the next call to run catch-up |
+| Reconnect or overflow | `needCatchUp` and `holeEpoch` | the next call to run catch-up |
+| Overflow the stream cannot announce yet | the same, asked of the stream | the next call to run catch-up |
+| A message refused for want of room | `needCatchUp` | the next call to run catch-up |
+| Conversations left unread for want of budget | `threadsSkipped` | the next call, which walks those and nothing else |
 | Disconnect | `connected`, cleared | whoever is blocked, as an error |
 
 Every write wakes the subscribers, so a call blocked on an empty queue hears
@@ -475,9 +477,36 @@ each time round whether it is holding a refusal it has not been able to report,
 rather than waiting to be told — between the refusal and the announcement the
 bridge would otherwise believe it had missed nothing, and a reaction judged in
 that window is judged against the conversations a message nobody saw would have
-opened. A reaction that matches nothing is held while a catch-up is outstanding
-for the same reason: the catch-up recovers messages, and nothing recovers
-reactions.
+opened. A reaction that matches nothing is held for the same reason: the catch-up
+recovers messages, and nothing recovers reactions.
+
+It is held for one catch-up, in a queue of its own, and then judged again. Still
+matching nothing, it is dropped without a word — it is somebody else's emoji in
+a channel the session is only sitting in, which is a tally rather than an event,
+and `slack_reactions` reads tallies. The separate queue is what keeps those from
+crowding out the reactions waiting to be delivered, or from setting the marker
+that tells the agent its count is wrong; when it is full the oldest goes, as
+everywhere else. One turn of grace applies even with no catch-up outstanding,
+because the moment between a refusal and its announcement is exactly the moment
+where nothing has been asked for yet.
+
+**Three reasons to go and look, and three flags.** A hole in the stream, a
+message refused for want of room, and conversations left unread for want of
+budget used to share one flag, and the third kept the other two permanently
+raised: a session with more open conversations than one pass can read ran a full
+catch-up on every wake, and held every unmatched reaction for ever. They are
+separate now. A hole moves `holeEpoch` as well as the catch-up stamp, which is
+what makes a pass that was reading while one opened throw its work away. A
+refusal moves only the stamp, so that pass may hand over what it read. Skipped
+conversations raise `threadsSkipped`, and what answers that is a walk through
+those conversations alone — not the window, not the search for mentions, and not
+the conversations the pass before it already read.
+
+**A connection's own hello is not a reconnect.** Every connection announces
+itself once, after `Connect` returns, and the catch-up for what was missed while
+the session was down is asked for where the connection is opened. Treating that
+hello as a hole discarded the first catch-up of every session; it is consumed
+instead, as long as the catch-up it belongs to is still outstanding.
 
 **Ordering.** Messages first, always: the pump applies everything waiting on the
 events channel before it will take a reaction at all, and it applies the pair it
@@ -520,7 +549,18 @@ position, so a catch-up that was reading while one opened cannot tell whether
 what it has belongs before it or after: it throws the whole pass away, queues
 and cursor untouched, and the next call reads the window with the hole already
 in the past. One round trip is the entire cost, and the pass was going to be
-repeated anyway. A message this bridge refused for want of room is the other way
+repeated anyway.
+
+Once, though. A socket that flaps faster than a catch-up takes would otherwise
+throw every pass away, and a message the owner had already sent would wait in
+the queue for the flapping to stop. The second discard in a row hands over the
+queues and nothing else: those messages came off the socket, so no hole
+swallowed them. Nothing fetched is handed over while the storm lasts, and no
+cursor moves — which means the window is read again afterwards, and what comes
+back has been handed over already. That is what the record of delivered
+messages is for, and why the cursor is taken from what a pass *read* rather than
+from what it handed on: a pass that reads only messages it has already
+delivered still moves the cursor past them. A message this bridge refused for want of room is the other way
 round: the queue was full, so the refused message is newer than everything in
 it, and everything read alongside it is still good. That batch is handed over,
 the cursor moves, and the request stands for the message that did not fit.

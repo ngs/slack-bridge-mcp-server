@@ -471,6 +471,19 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	if lost {
 		b.reactionsDropped = true
 	}
+	// The producer had not finished when the wait for it ran out, so it can
+	// still put a reaction on a channel nobody will read again — and one that
+	// fits sets no marker of its own. Before the staleness check, because by
+	// the time a connection is being ended it has almost always been replaced
+	// already: a check after it would never run.
+	//
+	// Only for a stream that delivers reactions at all, and only when the wait
+	// expired. An ordinary close is the common case by a long way, and saying
+	// the count might be short every time the socket reconnected is how a
+	// marker stops meaning anything.
+	if !closed && reactions != nil {
+		b.reactionsDropped = true
+	}
 	if b.stale(generation) {
 		// A connection that has already been replaced hands nothing over:
 		// what is left on its channels belongs to a connection nobody owns,
@@ -544,15 +557,6 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 		b.absorbReactionLocked(r)
 	}
 	if len(reactions) > 0 {
-		b.noteReactionsDroppedLocked()
-	}
-
-	// The producer had not finished when the wait for it ran out, so it can
-	// still put a reaction on a channel nobody will read again — and one that
-	// fits sets no marker of its own. The count is reported as short rather
-	// than left to be wrong quietly: re-reading a tally costs a call, and not
-	// knowing a vote was lost costs the vote.
-	if !closed {
 		b.noteReactionsDroppedLocked()
 	}
 

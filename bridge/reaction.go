@@ -285,9 +285,14 @@ func (b *Bridge) drainReactionsLocked() []Reaction {
 			kept = append(kept, reaction)
 			continue
 		}
-		if len(held) < maxHeldReactions {
-			held = append(held, heldReaction{r: r, at: b.catchUpRuns})
+		if len(held) >= maxHeldReactions {
+			// The oldest goes, as it does in every other queue of these. A
+			// reaction waiting on a mention that a hole swallowed is one of
+			// the newer ones, and the older it is the likelier it belongs to
+			// nothing at all.
+			held = held[1:]
 		}
+		held = append(held, heldReaction{r: r, at: b.catchUpRuns})
 	}
 	b.heldReactions = held
 	if len(kept) == 0 {

@@ -254,6 +254,15 @@ func splitTS(ts string) (seconds, sequence int64, ok bool) {
 // enough to be free.
 const messageDedupWindow = 1024
 
+// newestTS reports the last timestamp in a batch the merge has sorted, or
+// empty for an empty one.
+func newestTS(msgs []Message) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	return msgs[len(msgs)-1].TS
+}
+
 // deliveredKey identifies a message across connections. A timestamp is unique
 // within a channel, and a redelivered envelope carries the same one.
 func deliveredKey(m Message) string {

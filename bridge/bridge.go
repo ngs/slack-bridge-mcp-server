@@ -697,8 +697,9 @@ func (b *Bridge) ensure() error {
 	}
 	b.stopConnection = stopConnection
 	b.connCtx = connCtx
-	// This connection has not said hello yet.
+	// This connection has not said hello yet, and has thrown nothing away.
 	b.connectAnnounced = false
+	b.holeDiscards = 0
 
 	b.api = api
 	// Its own user ID is how the bridge recognises a mention. Without it the
@@ -1372,6 +1373,7 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// catches most of it, but a storm hands the queue over without moving one
 	// — so history returns those messages on the next pass, and this is what
 	// stops them arriving a second time.
+	read, readThreads := fetched, conversations
 	fetched = b.undeliveredLocked(fetched)
 	conversations = b.undeliveredLocked(conversations)
 
@@ -1398,15 +1400,26 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	// the message it already is.
 	b.noteDeliveredLocked(home, threads)
 
-	if len(home) == 0 && len(threads) == 0 {
+	// The cursor moves over everything this pass read, not only over what it
+	// handed on. Nothing is being held back behind it — a hole would have
+	// thrown the whole pass away above, and a refusal leaves nothing older
+	// than the queue unread — and what it read but did not hand on was
+	// dropped for one reason: it had been handed over already.
+	//
+	// The distinction is the storm's. A pass that hands the queue over without
+	// moving the cursor leaves those messages in the window, and the pass that
+	// comes after finds them there and drops them as delivered; taking the
+	// cursor from what survived that would leave it behind them for good.
+	newest := newestTS(home)
+	if last := newestTS(read); tsLess(newest, last) {
+		newest = last
+	}
+
+	if len(home) == 0 && len(threads) == 0 && newest == "" {
 		return nil, reactions, nil
 	}
 
-	// The cursor moves over everything being handed over, and nothing is being
-	// held back behind it: a hole would have thrown this whole pass away above,
-	// and a refusal leaves nothing older than the queue unread.
-	if len(home) > 0 {
-		newest := home[len(home)-1].TS
+	if newest != "" {
 		// Never backwards. On the run that seeds the cursor, a message the pump
 		// took while history was being read can be older than the seed, and
 		// moving the cursor back to it would have the next reconnect re-read
@@ -1427,7 +1440,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 	for _, m := range threads {
 		b.noteThreadDeliveredLocked(m)
 	}
+	// The replies this pass read and did not hand on, for the same reason: they
+	// were handed on by the pass that gave up in the storm, and a cursor left
+	// behind them would fetch them again on every hole.
+	for _, m := range readThreads {
+		if b.alreadyDeliveredLocked(m) {
+			b.noteThreadDeliveredLocked(m)
+		}
+	}
 
+	if len(home) == 0 && len(threads) == 0 {
+		return nil, reactions, nil
+	}
 	return mergeConversations(home, threads), reactions, nil
 }
 
