@@ -616,7 +616,8 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 	// the next one tries again — which is the difference between a message
 	// somebody else will go back for and one nobody will.
 	if err := b.tryResolve(api, orphan.channel, found, orphanExpiredText, time.Until(ends)); err != nil {
-		if !errors.Is(err, context.DeadlineExceeded) || orphan.attempts >= maxOrphanAttempts {
+		orphan.attempts++
+		if !errors.Is(err, context.DeadlineExceeded) || orphan.attempts > maxOrphanAttempts {
 			// Slack refused it rather than running out of time, or it has been
 			// tried often enough. Either way the next question is not the one
 			// to keep paying for this: said plainly and let go of.
@@ -624,7 +625,6 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 			return
 		}
 		log.Printf("ran out of time retiring a question whose post was given up on; the next question will try again: %s", logSafe(err.Error(), maxLoggedError))
-		orphan.attempts++
 		b.mu.Lock()
 		if b.orphan == nil {
 			b.orphan = orphan
@@ -636,16 +636,17 @@ func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.
 // findOrphanQuestion looks for the message an abandoned post may have left, and
 // reports its timestamp.
 //
-// What identifies it is when it was posted, not what it says. The bridge posted
-// nothing else in that window — the post that was given up on was the last
-// thing it tried — so its own message, after the moment it tried, is the one.
-// Matching on the text cannot be relied on: Slack rewrites what it stores,
+// What identifies it is the block the bridge puts its buttons in, inside a
+// window around the attempt. Not the text: Slack rewrites what it stores,
 // turning & into &amp; and a bare link into <link>, so a comparison that looked
-// exact would quietly find nothing at all.
+// exact would quietly find nothing at all. And not the newest thing this app
+// posted either — after a post that failed it posts others, the indicator
+// saying it is working and the reply to whatever prompted the question — and
+// expiring one of those rewrites a message the owner is reading.
 //
-// A question that has already been retired is passed over, which is what the
-// marks under a retired question are for. In that window there should be none —
-// nothing else went up after the attempt — and skipping them costs nothing.
+// A question that has already been retired has no such block: retiring one
+// replaces the block list. So the one thing this looks for says both that the
+// message is the bridge's own question and that its buttons are still live.
 func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphanQuestion, me string) (string, error) {
 	var messages []candidate
 	if orphan.threadTS != "" {
@@ -699,9 +700,11 @@ func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphan
 	return found, nil
 }
 
-// orphanSearchLimit is how far back the search for an abandoned question
-// looks. It ran moments ago, so this is generous.
-const orphanSearchLimit = 20
+// orphanSearchLimit is how many messages the search for an abandoned question
+// reads. The window it reads is only as wide as a post can take, so this is
+// generous for it — and it is one request either way, which is what the budget
+// is being spent on.
+const orphanSearchLimit = 100
 
 // orphanExpiredText is what an abandoned question is retired with. Its own
 // text is not repeated: what Slack stored may not be what was sent.

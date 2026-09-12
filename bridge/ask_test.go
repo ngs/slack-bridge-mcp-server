@@ -1527,3 +1527,99 @@ func TestAnAbandonedQuestionIsFoundBehindABusyChannel(t *testing.T) {
 		t.Error("the abandoned question was behind a busy channel's later traffic; the window has to have a far end as well as a near one")
 	}
 }
+
+// A retirement that runs out of time is worth trying again, and a question
+// that cannot be reached is not worth every later question's budget. Three
+// goes, and a refusal from Slack is not one of them.
+func TestAnAbandonedQuestionIsRetriedThreeTimesAndNoMore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	stuck := make(chan struct{})
+	defer close(stuck)
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, HasAskButtons: true},
+	}}
+	// The retirement never answers, which is what running out of time looks
+	// like from here.
+	api.resolveGate = stuck
+	api.mu.Unlock()
+
+	ask := func() {
+		t.Helper()
+		if _, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  300 * time.Millisecond,
+		}); err != nil {
+			t.Fatalf("Ask() error = %v", err)
+		}
+	}
+
+	b.noteOrphanQuestion(testChannel, "", attempted)
+	for i := 1; i <= maxOrphanAttempts; i++ {
+		ask()
+		if !b.hasOrphanQuestion() {
+			t.Fatalf("the abandoned question was let go of after %d tries, want %d", i, maxOrphanAttempts)
+		}
+	}
+	ask()
+	if b.hasOrphanQuestion() {
+		t.Errorf("the abandoned question is still being tried after %d goes; every later question pays for one that cannot be reached", maxOrphanAttempts)
+	}
+}
+
+// A refusal is not a timeout. Slack saying no to the retirement means the next
+// question has nothing to gain by asking again.
+func TestAnAbandonedQuestionRefusedIsNotRetried(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: slackTS(attempted.Add(time.Millisecond)), HasAskButtons: true},
+	}}
+	api.resolveErr = errors.New("cant_update_message")
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	if _, err := b.Ask(ctx, AskRequest{
+		Question: "and now?",
+		Options:  []string{"yes", "no"},
+		Timeout:  300 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+
+	if b.hasOrphanQuestion() {
+		t.Error("a retirement Slack refused is being tried again; the answer will be the same one")
+	}
+}
+
+// hasOrphanQuestion reports whether a question whose post was given up on is
+// still waiting to be retired.
+func (b *Bridge) hasOrphanQuestion() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.orphan != nil
+}

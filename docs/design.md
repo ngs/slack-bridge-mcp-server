@@ -624,7 +624,13 @@ out. A question whose buttons are in the channel for a call that is already over
 is worse than a question never asked. If there is not enough left the question goes
 back on the shelf and the next call tries again, three times over before it is
 let go of; a Slack that refuses the retirement outright is not tried again at
-all. That is what makes this different from retiring a question the call owns,
+all.
+
+One thing it can get wrong, harmlessly: if the post never landed but an earlier
+question of the bridge's is still live inside the window — one whose own
+retirement failed — the search finds that one and expires it. It was a question
+nothing was going to answer either, so what it costs is a message saying it
+expired a little before it would have. That is what makes this different from retiring a question the call owns,
 where nothing else will ever go back for it and the request gets a floor of a
 second and a half.
 
