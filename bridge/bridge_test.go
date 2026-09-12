@@ -68,6 +68,9 @@ type fakeAPI struct {
 	// questionDelay makes posting a question take time, so a test can watch a
 	// call give up on it.
 	questionDelay time.Duration
+	// resolveGate, when set, holds every chat.update that retires a question
+	// open until the test closes it.
+	resolveGate chan struct{}
 	// beforeQuestionReturns runs inside PostQuestion, after Slack would have
 	// created the message but before the caller learns its ts.
 	beforeQuestionReturns func()
@@ -357,7 +360,21 @@ func (f *fakeAPI) PostQuestion(ctx context.Context, channel, threadTS string, q 
 	return ts, nil
 }
 
-func (f *fakeAPI) ResolveQuestion(_ context.Context, channel, ts, text string) error {
+func (f *fakeAPI) ResolveQuestion(ctx context.Context, channel, ts, text string) error {
+	f.mu.Lock()
+	gate := f.resolveGate
+	f.mu.Unlock()
+
+	if gate != nil {
+		// Held open so a test can watch a caller give up on retiring a
+		// question, the way it would on a Slack that has stopped answering.
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

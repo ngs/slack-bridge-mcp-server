@@ -1011,11 +1011,16 @@ func TestAQuestionWhosePostWasAbandonedIsRetiredLater(t *testing.T) {
 		t.Fatal("Ask() returned no error, want the post given up on")
 	}
 
-	// It landed after all, which is what an abandoned request does.
+	// It landed after all, which is what an abandoned request does — and what
+	// Slack stored is not what was sent: the ampersand and the link have been
+	// rewritten, which is why the search does not go by the text.
+	landed := slackTS(time.Now())
 	api.mu.Lock()
 	api.questionDelay = 0
 	api.channelHistory = map[string][]candidate{testChannel: {
-		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: "100.000800"},
+		// Older than the attempt, and answered: not this call's business.
+		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: "100.000300"},
+		{Channel: testChannel, User: testBotUser, Text: "ship it? see &amp; &lt;https://example.com&gt;", TS: landed},
 	}}
 	api.mu.Unlock()
 
@@ -1033,16 +1038,22 @@ func TestAQuestionWhosePostWasAbandonedIsRetiredLater(t *testing.T) {
 	}()
 	<-done
 
-	var retired bool
+	var retired, touchedOld bool
 	api.mu.Lock()
 	for _, u := range api.resolutions {
-		if u.TS == "100.000800" {
+		switch u.TS {
+		case landed:
 			retired = true
+		case "100.000300":
+			touchedOld = true
 		}
 	}
 	api.mu.Unlock()
 	if !retired {
 		t.Error("the question left standing by an abandoned post still has its buttons; a click on it answers nothing")
+	}
+	if touchedOld {
+		t.Error("a question from before the attempt was rewritten as expired")
 	}
 }
 
@@ -1127,7 +1138,7 @@ func TestTheSearchForAnAbandonedQuestionIsBounded(t *testing.T) {
 
 	// A question was given up on mid-post, and Slack has stopped answering
 	// history — which is where the search for it goes.
-	b.noteOrphanQuestion(testChannel, "", "ship it?")
+	b.noteOrphanQuestion(testChannel, "", time.Now())
 	gate := make(chan struct{})
 	defer close(gate)
 	api.mu.Lock()
@@ -1173,13 +1184,16 @@ func TestAnAnsweredQuestionIsNotMistakenForAnAbandonedOne(t *testing.T) {
 		t.Fatalf("Wait() error = %v", err)
 	}
 
-	// The same question, asked and answered before this one.
+	// Inside the window the search looks at, and already answered: the mark
+	// under it is what says so.
+	attempted := time.Now()
+	answeredTS := slackTS(attempted.Add(time.Millisecond))
 	api.mu.Lock()
 	api.channelHistory = map[string][]candidate{testChannel: {
-		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: "100.000800"},
+		{Channel: testChannel, User: testBotUser, Text: "ship it?\n\n✅ yes", TS: answeredTS},
 	}}
 	api.mu.Unlock()
-	b.noteOrphanQuestion(testChannel, "", "ship it?")
+	b.noteOrphanQuestion(testChannel, "", attempted)
 
 	if _, err := b.Ask(ctx, AskRequest{
 		Question: "and now?",
@@ -1192,7 +1206,7 @@ func TestAnAnsweredQuestionIsNotMistakenForAnAbandonedOne(t *testing.T) {
 	api.mu.Lock()
 	defer api.mu.Unlock()
 	for _, r := range api.resolutions {
-		if r.TS == "100.000800" {
+		if r.TS == answeredTS {
 			t.Error("a question the owner had already answered was rewritten as expired")
 		}
 	}
@@ -1207,15 +1221,27 @@ func TestAnAbandonedQuestionInAThreadIsLookedForInTheThread(t *testing.T) {
 	b, api, _ := askBridge(ctx, t)
 	api.mu.Lock()
 	api.botUserID = testBotUser
-	api.replies = []candidate{
-		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: "100.000800", ThreadTS: "100.000500"},
-	}
 	api.mu.Unlock()
 	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
 
-	b.noteOrphanQuestion(testChannel, "100.000500", "ship it?")
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	api.mu.Lock()
+	// A long conversation, with the abandoned question at the end of it.
+	api.replies = nil
+	for i := 0; i < 50; i++ {
+		api.replies = append(api.replies, candidate{
+			Channel: testChannel, User: colleague, Text: "chatter",
+			TS: fmt.Sprintf("100.0006%02d", i), ThreadTS: "100.000500",
+		})
+	}
+	api.replies = append(api.replies, candidate{
+		Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS, ThreadTS: "100.000500",
+	})
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "100.000500", attempted)
 
 	if _, err := b.Ask(ctx, AskRequest{
 		Question: "and now?",
@@ -1228,7 +1254,7 @@ func TestAnAbandonedQuestionInAThreadIsLookedForInTheThread(t *testing.T) {
 	var retired bool
 	api.mu.Lock()
 	for _, r := range api.resolutions {
-		if r.TS == "100.000800" {
+		if r.TS == orphanTS {
 			retired = true
 		}
 	}
@@ -1255,7 +1281,7 @@ func TestNoQuestionIsPostedWithNoTimeLeft(t *testing.T) {
 
 	// The search for the abandoned question takes longer than the question
 	// about to be asked has to live.
-	b.noteOrphanQuestion(testChannel, "", "ship it?")
+	b.noteOrphanQuestion(testChannel, "", time.Now())
 	gate := make(chan struct{})
 	api.mu.Lock()
 	api.historyGate = gate
@@ -1282,5 +1308,65 @@ func TestNoQuestionIsPostedWithNoTimeLeft(t *testing.T) {
 	defer api.mu.Unlock()
 	if len(api.questions) != posted {
 		t.Error("a question went up for a call that was already over; its buttons answer nobody")
+	}
+}
+
+// The search for an abandoned question and the retirement that follows it are
+// one budget between them, not one each. A Slack that answers the first slowly
+// and the second not at all would otherwise hold the question that paid for
+// both.
+func TestRetiringAnAbandonedQuestionIsInsideTheSameBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := askBridge(ctx, t)
+	api.mu.Lock()
+	api.botUserID = testBotUser
+	api.mu.Unlock()
+	if _, err := b.Wait(ctx, 50*time.Millisecond); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	attempted := time.Now()
+	orphanTS := slackTS(attempted.Add(time.Millisecond))
+	history := make(chan struct{})
+	resolve := make(chan struct{})
+	defer close(resolve)
+	api.mu.Lock()
+	api.channelHistory = map[string][]candidate{testChannel: {
+		{Channel: testChannel, User: testBotUser, Text: "ship it?", TS: orphanTS},
+	}}
+	api.historyGate = history
+	api.resolveGate = resolve
+	api.mu.Unlock()
+	b.noteOrphanQuestion(testChannel, "", attempted)
+
+	// The search answers late, and the retirement never does.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		close(history)
+	}()
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Ask(ctx, AskRequest{
+			Question: "and now?",
+			Options:  []string{"yes", "no"},
+			Timeout:  time.Second,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ask() error = %v", err)
+		}
+		if took := time.Since(started); took > time.Second+askLastLookWait {
+			t.Errorf("Ask() took %v for a question given a second; the search and the retirement each took a budget of their own", took)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Ask() never came back: retiring the abandoned question is not inside the budget the search shares")
 	}
 }
