@@ -74,7 +74,15 @@ const maxEarlyClicks = 8
 type AskRequest struct {
 	Question string
 	Options  []string
-	Timeout  time.Duration
+	// Timeout is how long the owner has to answer, and it covers the whole
+	// call: posting the question, waiting for a click, and collecting whatever
+	// was said instead of clicking.
+	//
+	// The call can outrun it by a moment at the end. Taking the buttons away
+	// is a request of its own, and one abandoned before Slack could answer
+	// would leave them standing for good — so it is given a second and a half
+	// even when nothing is left, and the answer comes back after it.
+	Timeout time.Duration
 	// ThreadTS asks inside a thread instead of on the channel surface.
 	ThreadTS string
 	// Channel is the conversation to ask in. Empty means the home channel.
