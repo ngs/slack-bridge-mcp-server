@@ -154,6 +154,10 @@ type Bridge struct {
 	// actually been delivered is remembered instead.
 	deliveredMessages map[string]struct{}
 	deliveredOrder    []string
+	// orphan is a question whose post was abandoned before its timestamp came
+	// back. It may be standing in the channel with live buttons that nothing
+	// can answer, and the next question looks for it.
+	orphan *orphanQuestion
 	// holeDiscards counts the catch-ups thrown away in a row because a hole
 	// opened while they were reading. One is ordinary; a run of them is a
 	// socket flapping, and what it costs is the messages already queued.
@@ -1165,10 +1169,18 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 		return nil, nil, ctx.Err()
 	case <-wait.C:
 		// Somebody else's request is still out, and this call has its own
-		// deadline to keep. It hands back what that deadline asked for —
-		// nothing — rather than answering late on the strength of a fetch it
-		// never made.
-		return nil, nil, nil
+		// deadline to keep. What is already in the queues does not depend on
+		// that request, though: it came off this connection's socket and is
+		// waiting to be handed over, and making it wait for a history call it
+		// has nothing to do with is how a message the owner sent sits behind
+		// somebody else's slow Slack.
+		//
+		// No cursor moves with it, as in a storm: this call read nothing, so
+		// it cannot say where history has been read to. The window is read
+		// again by whoever gets the slot, and what comes back has been handed
+		// over already.
+		msgs, reactions := b.queuedWithoutReading(generation, takeReactions)
+		return msgs, reactions, nil
 	}
 	defer func() { <-b.catchUpSlot }()
 
@@ -1531,6 +1543,16 @@ func (b *Bridge) drainCatchUp(ctx context.Context, generation uint64, takeReacti
 			b.noteThreadDeliveredLocked(m)
 		}
 	}
+	// And how far each conversation the walk reached was read, which counts
+	// every reply rather than only the owner's. A conversation where somebody
+	// else has been talking has been read; left behind, it is the same replies
+	// fetched again on every catch-up, for ever.
+	for _, mark := range scan.threadsRead {
+		if _, skipped := missed[mark.key]; skipped {
+			continue
+		}
+		b.noteThreadReadLocked(mark.key, mark.read)
+	}
 
 	if newest != "" {
 		// Never backwards. On the run that seeds the cursor, a message the pump
@@ -1594,8 +1616,17 @@ func (b *Bridge) noteThreadDeliveredLocked(m Message) {
 	if m.Channel == "" || m.ThreadTS == "" || m.TS == "" {
 		return
 	}
+	b.noteThreadReadLocked(threadKey{m.Channel, m.ThreadTS}, m.TS)
+}
 
-	key := threadKey{m.Channel, m.ThreadTS}
+// noteThreadReadLocked moves a conversation's cursor to a reply that has been
+// read, whether or not it was handed over. The caller must hold b.mu.
+func (b *Bridge) noteThreadReadLocked(key threadKey, ts string) {
+	if key.channel == "" || key.threadTS == "" || ts == "" {
+		return
+	}
+
+	m := Message{Channel: key.channel, ThreadTS: key.threadTS, TS: ts}
 	if current := b.threadCursors[key]; current != "" && !tsLess(current, m.TS) {
 		return
 	}
@@ -1623,6 +1654,23 @@ func (b *Bridge) oldestPendingLocked() string {
 		}
 	}
 	return oldest
+}
+
+// queuedWithoutReading hands over what is already in the queues, for a call
+// that could not get its turn at catch-up. It reads nothing and moves no
+// cursor.
+func (b *Bridge) queuedWithoutReading(generation uint64, takeReactions bool) ([]Message, []Reaction) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.stale(generation) {
+		return nil, nil
+	}
+	if len(b.pending) == 0 && len(b.pendingThreads) == 0 {
+		return nil, nil
+	}
+	msgs, reactions, _ := b.handOverQueuesLocked(takeReactions)
+	return msgs, reactions
 }
 
 // takeQueues hands over what the connection delivered before it died, without
@@ -1936,7 +1984,8 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 		}
 		walked++
 
-		replies, err := readThread(ctx, api, channel, owner, parent.TS, after)
+		got, err := readThread(ctx, api, channel, owner, parent.TS, after)
+		replies := got.messages
 		if err != nil {
 			if !errors.Is(err, ErrThreadUnreadable) {
 				// Slack said "not now" rather than "not there". Failing the
@@ -1972,9 +2021,10 @@ func catchUpThreads(ctx context.Context, api API, channel, owner, after string) 
 // again. The page budget is set where a thread stops being a conversation
 // someone had and starts being a data set — and reaching it is reported, since
 // the same loss applies there.
-func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) ([]Message, error) {
+func readThread(ctx context.Context, api API, channel, owner, threadTS, after string) (threadRead, error) {
 	var (
 		messages []Message
+		read     string
 		cursor   string
 	)
 	for page := 0; page < maxThreadCatchUpPages; page++ {
@@ -1986,10 +2036,17 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 			Limit:    historyPageLimit,
 		})
 		if err != nil {
-			return nil, err
+			return threadRead{}, err
 		}
 
 		for _, c := range replies.Messages {
+			// Every reply counts towards how far this read got, not only the
+			// ones it can hand over: a conversation where somebody else has
+			// been talking has been read, and a cursor left behind it is the
+			// same replies fetched again on every catch-up.
+			if c.TS != "" && tsLess(read, c.TS) {
+				read = c.TS
+			}
 			if msg, ok := accept(c, channel, owner); ok {
 				messages = append(messages, msg)
 			}
@@ -1997,7 +2054,7 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 
 		cursor = replies.NextCursor
 		if cursor == "" {
-			return messages, nil
+			return threadRead{messages: messages, read: read}, nil
 		}
 	}
 
@@ -2010,7 +2067,16 @@ func readThread(ctx context.Context, api API, channel, owner, threadTS, after st
 	// side.
 	log.Printf("stopped reading a thread after %d pages of replies; the rest waits for the next walk, unless something newer in the same pass has carried the home channel's cursor past it",
 		maxThreadCatchUpPages)
-	return messages, nil
+	return threadRead{messages: messages, read: read}, nil
+}
+
+// threadRead is one read of a conversation: the replies it may hand over, and
+// how far it got. The two are not the same — a conversation where somebody
+// else has been talking has been read whether or not any of it was the
+// owner's — and the cursor follows the second.
+type threadRead struct {
+	messages []Message
+	read     string
 }
 
 // ClampTimeout turns the tool's timeout_seconds argument into a duration,

@@ -40,6 +40,12 @@ const (
 // and leaving live buttons behind is exactly what this call is preventing.
 const askResolveTimeout = 5 * time.Second
 
+// askResolveFloor is the least a retiring question gets, however little of the
+// call's timeout is left. Below this the request would be given up on before
+// Slack could answer it, and the buttons the owner has already clicked would
+// stay in the channel inviting another.
+const askResolveFloor = 500 * time.Millisecond
+
 // askPostTimeout bounds posting the question. It runs detached from the tool
 // call, so this is what keeps a Slack that never answers from holding the call
 // open past its own timeout.
@@ -156,6 +162,11 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 	question, options := req.Question, req.Options
 	threadTS, timeout := req.ThreadTS, req.Timeout
+	// The clock the caller asked about starts here, before the question is
+	// posted. Posting is a Slack request like any other and can take its time,
+	// and a timeout measured from after it is a timeout the call can outlast
+	// without ever having waited for an answer.
+	callEnds := time.Now().Add(timeout)
 
 	q, labels, err := buildQuestion(question, options)
 	if err != nil {
@@ -179,6 +190,12 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 	defer b.clearAsk(ask)
 
+	// A question from a call that was given up on mid-post may still be
+	// standing in the channel with live buttons. Looked for here, before
+	// another one goes up beside it: a click on the old one would answer
+	// nothing.
+	b.retireOrphanQuestion(ctx, api)
+
 	if api == nil {
 		return AskResult{}, errors.New("the bridge is not connected to Slack")
 	}
@@ -189,8 +206,15 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	// above leaves it alone, since nothing about the agent's work changed.
 	retired := b.stopIndicator()
 
-	ts, err := postQuestion(b.ctx, api, channel, threadTS, q)
+	ts, err := postQuestion(b.ctx, api, channel, threadTS, q, time.Until(callEnds))
 	if err != nil {
+		// A post given up on can still have landed: the request was
+		// abandoned, not cancelled at Slack. What is lost with it is the ts,
+		// which is the only thing that could take the buttons away — so the
+		// question is remembered instead, and the next one looks for it.
+		if errors.Is(err, context.DeadlineExceeded) {
+			b.noteOrphanQuestion(channel, q.Text)
+		}
 		// No question went up, so the agent is still the one working and the
 		// channel should say so again.
 		b.restoreIndicator(ctx, retired)
@@ -215,9 +239,11 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	sub := b.subscribePending()
 	defer b.unsubscribePending(sub)
 
-	deadline := time.NewTimer(timeout)
+	// What is left of it, rather than the whole of it again: posting has
+	// already spent some, and the caller was promised one timeout and not two.
+	askEnds := callEnds
+	deadline := time.NewTimer(time.Until(askEnds))
 	defer deadline.Stop()
-	askEnds := time.Now().Add(timeout)
 
 	// The conversations a walk could not reach are worth one look, not one per
 	// wakeup: what answers them is a round trip, and one that stays out of
@@ -384,7 +410,7 @@ type answer struct {
 // question was asked in, which is where the owner just clicked and where they
 // are watching for what follows.
 func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
-	b.resolve(api, a.channel, a.ts, answeredText(a.q.Text, a.labels[a.choice]))
+	b.resolveWithin(api, a.channel, a.ts, answeredText(a.q.Text, a.labels[a.choice]), a.budget)
 	b.startIndicator(a.channel, a.threadTS)
 	return AskResult{
 		ChoiceIndex: a.choice,
@@ -436,8 +462,15 @@ func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64, budg
 	// tool past the timeout the caller asked for, which is the one promise
 	// every tool makes. Nothing is committed until the messages are in hand,
 	// so a drain cut short here costs a round trip and no messages.
-	if budget < askLastLookWait {
-		budget = askLastLookWait
+	//
+	// A budget already spent buys nothing at all, and a small one buys only
+	// what it is: the courtesy of a quarter of a second belongs to the call
+	// that has run out of time and has nothing else to return, and it is that
+	// call which asks for it by name. A call holding an answer has something
+	// better to do with the moment, and the next slack_wait reads the same
+	// window.
+	if budget <= 0 {
+		return nil
 	}
 	drainCtx, cancelDrain := context.WithTimeout(ctx, budget)
 	defer cancelDrain()
@@ -461,6 +494,55 @@ func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64, budg
 	return msgs
 }
 
+// orphanQuestion is a question whose post was abandoned before its timestamp
+// came back. It may be standing in the channel with live buttons, and the
+// timestamp that would retire it went with the request.
+type orphanQuestion struct {
+	channel string
+	text    string
+}
+
+// noteOrphanQuestion remembers a post that was given up on.
+func (b *Bridge) noteOrphanQuestion(channel, text string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.orphan = &orphanQuestion{channel: channel, text: text}
+}
+
+// retireOrphanQuestion takes away the buttons of a question whose post was
+// abandoned, if it finds one. Best effort by nature: the question may never
+// have landed, and looking costs one history call — so it is looked for once,
+// on the next question, and forgotten either way.
+func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API) {
+	b.mu.Lock()
+	orphan := b.orphan
+	b.orphan = nil
+	b.mu.Unlock()
+
+	if orphan == nil || api == nil {
+		return
+	}
+
+	page, err := api.History(ctx, HistoryRequest{Channel: orphan.channel, Limit: orphanSearchLimit})
+	if err != nil {
+		log.Printf("could not look for a question whose post was given up on: %s", logSafe(err.Error(), maxLoggedError))
+		return
+	}
+	for _, c := range page.Messages {
+		// The bridge's own message, saying what that question said. Slack
+		// renders the text into blocks, so what comes back starts with it.
+		if c.User != b.botUserID || c.TS == "" || !strings.HasPrefix(c.Text, orphan.text) {
+			continue
+		}
+		b.resolve(api, orphan.channel, c.TS, orphan.text+"\n\n⌛ expired")
+		return
+	}
+}
+
+// orphanSearchLimit is how far back the search for an abandoned question
+// looks. It ran moments ago, so this is generous.
+const orphanSearchLimit = 20
+
 // postQuestion posts on a detached context with a deadline of its own.
 //
 // The reason is the same as the indicator's: a chat.postMessage abandoned in
@@ -469,8 +551,15 @@ func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64, budg
 // channel that no click can ever answer. The caller checks for cancellation
 // once the ts is known, which is the point at which it can do something about
 // it.
-func postQuestion(ctx context.Context, api API, channel, threadTS string, q Question) (string, error) {
-	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), askPostTimeout)
+func postQuestion(ctx context.Context, api API, channel, threadTS string, q Question, budget time.Duration) (string, error) {
+	// The smaller of the two: a post that outlasts the question's own timeout
+	// has already broken the promise the timeout is, and one that outlasts the
+	// bound below has stopped being worth waiting for either way.
+	if budget <= 0 || budget > askPostTimeout {
+		budget = askPostTimeout
+	}
+
+	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
 	return api.PostQuestion(postCtx, channel, threadTS, q)
 }
@@ -540,7 +629,25 @@ func (b *Bridge) clearAsk(ask *pendingAsk) {
 // effort: a failure here leaves stale buttons in the channel, which is worth a
 // log line but not worth failing an answer the agent already has.
 func (b *Bridge) resolve(api API, channel, ts, text string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), askResolveTimeout)
+	b.resolveWithin(api, channel, ts, text, askResolveTimeout)
+}
+
+// resolveWithin is resolve with a bound of its own, for the path that has an
+// answer in hand: the buttons have to go, but the owner is waiting for what
+// they clicked and a chat.update that takes its time would hold that up.
+// Whatever is left of the call's own timeout, and never longer than the usual
+// bound.
+func (b *Bridge) resolveWithin(api API, channel, ts, text string, budget time.Duration) {
+	if budget > askResolveTimeout {
+		budget = askResolveTimeout
+	}
+	if budget < askResolveFloor {
+		// Long enough to be worth trying. Below this the request would be
+		// abandoned before Slack could answer, and the buttons would stay.
+		budget = askResolveFloor
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), budget)
 	defer cancel()
 
 	if err := api.ResolveQuestion(ctx, channel, ts, text); err != nil {

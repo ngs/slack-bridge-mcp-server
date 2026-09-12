@@ -699,7 +699,7 @@ func TestAReplacedConnectionsLostReactionsAreStillReported(t *testing.T) {
 	reactions <- Reaction{TS: "100.000500", Channel: testChannel, User: colleague, Reaction: "tada", Added: true}
 	stale := b.currentGeneration() - 1
 
-	b.endStream(stale, b.currentStream(), nil, nil, nil, reactions, nil, true)
+	b.endStream(stale, b.currentStream(), nil, nil, nil, reactions, nil, true, false)
 
 	if !b.droppedReactionMark() {
 		t.Error("a reaction received on a replaced connection was dropped with nothing said; the agent's count is wrong and it cannot know")
@@ -867,7 +867,7 @@ func TestAnOrdinaryReconnectReportsNoLoss(t *testing.T) {
 	b.mu.Lock()
 	b.connGeneration++
 	b.mu.Unlock()
-	b.endStream(stale, b.currentStream(), nil, nil, nil, nil, nil, true)
+	b.endStream(stale, b.currentStream(), nil, nil, nil, nil, nil, true, false)
 
 	if b.droppedReactionMark() {
 		t.Error("an ordinary reconnect reported a lost reaction; nothing was in flight to lose")
@@ -1283,7 +1283,7 @@ func TestReactionsLeftOnAClosingConnectionAreReported(t *testing.T) {
 		}
 	}
 
-	b.endStream(generation, b.currentStream(), nil, nil, nil, reactions, nil, true)
+	b.endStream(generation, b.currentStream(), nil, nil, nil, reactions, nil, true, false)
 
 	if !b.droppedReactionMark() {
 		t.Error("reactions were left on a connection that closed with nothing said; the agent's count is wrong and it cannot know")
@@ -1401,7 +1401,7 @@ func TestReactionsAreReportedWhenTheClosingSweepCannotFinish(t *testing.T) {
 		TS: "300.000001", Channel: testChannel, User: colleague, Reaction: "eyes", Added: true,
 	}
 
-	b.endStream(generation, b.currentStream(), nil, events, nil, reactions, nil, true)
+	b.endStream(generation, b.currentStream(), nil, events, nil, reactions, nil, true, false)
 
 	if !b.droppedReactionMark() {
 		t.Error("a reaction was judged against a connection whose messages could not all be applied, with nothing said")
@@ -1879,15 +1879,32 @@ type lockProbeStream struct {
 }
 
 func (s *lockProbeStream) PendingOverflow() bool {
+	s.note()
+	return s.pendingValue
+}
+
+// ReactionsDropped and Finished are asked on the same path, and answer the
+// same way: what matters is whether the bridge was holding its lock.
+func (s *lockProbeStream) ReactionsDropped() bool {
+	s.note()
+	return false
+}
+
+func (s *lockProbeStream) Finished() <-chan struct{} {
+	s.note()
+	return nil
+}
+
+// note records the call, and whether the bridge's lock was held when it came.
+// TryLock rather than Lock, so a probe that finds the lock taken says so
+// instead of joining the deadlock it is looking for.
+func (s *lockProbeStream) note() {
 	s.askedAtAll.Store(true)
-	// TryLock rather than Lock, so a probe that finds the lock taken says so
-	// instead of joining the deadlock it is looking for.
 	if !s.b.mu.TryLock() {
 		s.askedLocked.Store(true)
-		return s.pendingValue
+		return
 	}
 	s.b.mu.Unlock()
-	return s.pendingValue
 }
 
 // The bridge asks a stream its questions with the lock let go. Everything else
@@ -1907,10 +1924,12 @@ func TestAStreamIsNeverAskedAnythingUnderTheLock(t *testing.T) {
 	b.connected = true
 	b.mu.Unlock()
 
-	b.endStream(1, stream, nil, stream.events, stream.interactions, stream.reactions, nil, true)
+	// Through finishStream, which is the path the pump takes: every question
+	// the bridge asks a stream on the way out goes through here.
+	b.finishStream(1, stream, stream.events, stream.interactions, stream.reactions, nil)
 
 	if !stream.askedAtAll.Load() {
-		t.Fatal("the closing connection never asked the stream whether it was holding an overflow")
+		t.Fatal("the closing connection never asked the stream anything")
 	}
 	if stream.askedLocked.Load() {
 		t.Error("the stream was asked with b.mu held; an implementation that blocks there takes the pump and every tool call with it")
@@ -3464,4 +3483,60 @@ func (b *Bridge) pumpStopped() <-chan struct{} {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.pumpDone
+}
+
+// A slow history call held by one wait is not a reason for another to come
+// back empty. What is already in the queues came off this connection's socket
+// and is waiting to be handed over; making it wait for somebody else's Slack
+// is how a message the owner sent sits behind a request it has nothing to do
+// with.
+func TestAWaitHandsOverItsQueueWhileAnotherHoldsTheCatchUpSlot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID:      testBotUser,
+		channelHistory: map[string][]candidate{testChannel: {ownerMsg("100.000100", "already answered")}},
+	}
+	stream := newFakeStream()
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if result := waitOnce(ctx, t, b); !result.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout on a quiet channel", result)
+	}
+
+	// One call goes to Slack and stays there, holding the slot.
+	gate := make(chan struct{})
+	defer close(gate)
+	api.mu.Lock()
+	api.historyGate = gate
+	calls := len(api.historyCalls)
+	api.mu.Unlock()
+
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+
+	generation := b.currentGeneration()
+	go func() {
+		_, _, _ = b.drainCatchUp(context.Background(), generation, true, 10*time.Second)
+	}()
+	eventually(t, "the first call to reach Slack", func() bool { return len(api.calls()) > calls })
+
+	// The owner says something, and a second wait comes along.
+	send(stream, testChannel, "100.000200", "", "behind somebody else's Slack")
+	eventually(t, "the pump to take it", func() bool { return b.pendingHomeCount() == 1 })
+
+	msgs := waitOnce(ctx, t, b).Messages
+	if len(msgs) != 1 || msgs[0].TS != "100.000200" {
+		t.Errorf("Wait() = %v, want the message already in the queue", texts(msgs))
+	}
 }

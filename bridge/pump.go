@@ -130,7 +130,7 @@ func (b *Bridge) pump(ctx context.Context, generation uint64, stream Stream) {
 
 		case evt, ok := <-events:
 			if !ok {
-				b.endStream(generation, stream, nil, events, clicks, reactions, carried, true)
+				b.endStream(generation, stream, nil, events, clicks, reactions, carried, true, streamFinished(stream) != nil)
 				return
 			}
 			carried = b.applyEvent(generation, evt, events, reactions, carried)
@@ -228,8 +228,12 @@ func (b *Bridge) noteOverflowLocked(overflow bool) {
 // the events are waited for rather than taken as they stand: what is on that
 // channel is the owner's messages, and the closure is not going anywhere.
 func (b *Bridge) finishStream(generation uint64, stream Stream, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction) {
-	late, closed := awaitStreamClose(events, streamFinished(stream))
-	b.endStream(generation, stream, late, events, clicks, reactions, carried, closed)
+	// Asked once, here, with no lock held: it is a question for somebody
+	// else's implementation, and the answer is wanted twice — for the wait and
+	// for what the wait's ending means.
+	finished := streamFinished(stream)
+	late, closed := awaitStreamClose(events, finished)
+	b.endStream(generation, stream, late, events, clicks, reactions, carried, closed, finished != nil)
 }
 
 // applyReady applies every message already waiting and, once they are
@@ -513,7 +517,7 @@ const streamCloseWait = 250 * time.Millisecond
 // the conversations that are open. It was all received before the socket died,
 // which is not the loss the live-only limitation describes — that is what never
 // arrived, not what arrived and was thrown away.
-func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction, closed bool) {
+func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent, events <-chan StreamEvent, clicks <-chan Interaction, reactions <-chan Reaction, carried []Reaction, closed, saysWhenItStops bool) {
 	// Asked once, before the lock, and kept whichever branch this takes: they
 	// are questions for somebody else's implementation of the stream — asking
 	// one of them clears the answer, so asking twice would lose it, and asking
@@ -543,7 +547,7 @@ func (b *Bridge) endStream(generation uint64, stream Stream, late []StreamEvent,
 	// that will not come. It is set anyway, because the alternative is a rule
 	// with an exception in it — and because a reconnect, which is the other
 	// way here, has a whole session still in front of it.
-	if !closed && streamFinished(stream) != nil {
+	if !closed && saysWhenItStops {
 		b.reactionsDropped = true
 	}
 

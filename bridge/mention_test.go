@@ -835,3 +835,52 @@ func mentionInThread(ts, threadTS, text string) candidate {
 	c.Channel = otherChannel
 	return c
 }
+
+// A conversation where somebody else has been talking has been read, whether
+// or not any of it was the owner's. Left behind, the same replies are fetched
+// again on every catch-up — so its cursor moves to the newest reply the walk
+// read, the way the home channel's does.
+func TestAConversationWithNoOwnerRepliesStillMovesItsCursor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	store := NewStore(cfg.StateDir)
+	if err := store.SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the home cursor: %v", err)
+	}
+	if err := store.SetMentionCursor("100.000100"); err != nil {
+		t.Fatalf("seeding the mention cursor: %v", err)
+	}
+	if err := store.SetThread(otherChannel, "200.000100", "200.000100"); err != nil {
+		t.Fatalf("seeding the conversation: %v", err)
+	}
+
+	api := &fakeAPI{
+		botUserID: testBotUser,
+		joined:    []string{testChannel, otherChannel},
+		channelHistory: map[string][]candidate{
+			testChannel:  {ownerMsg("100.000100", "already answered")},
+			otherChannel: nil,
+		},
+		// Only a colleague has said anything since the cursor.
+		replies: []candidate{
+			{Channel: otherChannel, User: colleague, Text: "not for us", TS: "200.000200", ThreadTS: "200.000100"},
+		},
+	}
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: newFakeStream(), quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	if msgs := waitFor(ctx, t, b); len(msgs) != 0 {
+		t.Fatalf("Wait() = %v, want nothing: none of it is the owner's", texts(msgs))
+	}
+
+	b.mu.Lock()
+	cursor := b.threadCursors[threadKey{otherChannel, "200.000100"}]
+	b.mu.Unlock()
+	if cursor != "200.000200" {
+		t.Errorf("the conversation's cursor = %q, want the newest reply the walk read", cursor)
+	}
+}

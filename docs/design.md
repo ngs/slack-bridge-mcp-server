@@ -477,6 +477,10 @@ Two invariants hold across all of it, whatever is arriving:
   are the one thing no history can give back — a question whose answer is lost
   times out — and the buffer they wait in is the smallest of the three. The
   sweep empties it rather than leaving it to the select.
+- **Every cursor follows what was read, not only what was handed over.** A page
+  of somebody else's conversation has been read, in the home channel and in a
+  thread alike, and a cursor left behind it is the same messages fetched again
+  on every catch-up.
 - **The home cursor follows what a pass read, and stops at what it did not hand
   over.** Every message in every page counts towards how far a read got, so a
   page of somebody else's conversation moves the cursor past itself; a message
@@ -581,7 +585,19 @@ What a question collects is bounded by the question's own timeout, requests to
 Slack included. That timeout is a promise about when the tool returns, and a
 history call that hangs would otherwise outlast it; nothing is committed until
 the messages are in hand, so a collection cut short costs a round trip and no
-messages.
+messages. The whole call is inside that promise: the clock starts before the
+question is posted, because posting is a Slack request like any other, and
+retiring the buttons on the way out is given what is left of it rather than a
+bound of its own. A budget already spent buys nothing — the quarter of a second
+a timed-out question gets for one last look belongs to the call that has run out
+of time and has nothing else to return.
+
+A post given up on can still land: the request was abandoned, not cancelled at
+Slack, and what is lost with it is the timestamp that could take the buttons
+away. The question is remembered instead, and the next one looks for it — the
+bridge's own message, saying what that question said, in the last twenty of the
+channel — and retires it before putting another up beside it. Once, and best
+effort: it may never have landed at all.
 
 A catch-up request carries an epoch. One already in flight went to Slack with
 the old window in mind, so it clears the flag only if nothing has asked again

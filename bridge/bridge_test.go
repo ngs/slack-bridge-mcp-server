@@ -65,6 +65,9 @@ type fakeAPI struct {
 	// is what makes each one distinct.
 	postCount  int
 	questionTS string
+	// questionDelay makes posting a question take time, so a test can watch a
+	// call give up on it.
+	questionDelay time.Duration
 	// beforeQuestionReturns runs inside PostQuestion, after Slack would have
 	// created the message but before the caller learns its ts.
 	beforeQuestionReturns func()
@@ -326,11 +329,22 @@ func (f *fakeAPI) PostPlain(_ context.Context, channel, threadTS, text string) (
 	return ts, nil
 }
 
-func (f *fakeAPI) PostQuestion(_ context.Context, channel, threadTS string, q Question) (string, error) {
+func (f *fakeAPI) PostQuestion(ctx context.Context, channel, threadTS string, q Question) (string, error) {
 	f.mu.Lock()
 	f.questions = append(f.questions, questionCall{Channel: channel, ThreadTS: threadTS, Question: q})
 	hook, ts, err := f.beforeQuestionReturns, f.questionTS, f.questionErr
+	delay := f.questionDelay
 	f.mu.Unlock()
+
+	// A Slack that takes its time, and a caller that can give up on it — which
+	// is what the question's own timeout does.
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 
 	// The message exists in Slack before this call returns, so a test can use
 	// the hook to click on it while the caller is still waiting.

@@ -292,6 +292,12 @@ func (b *Bridge) catchUpConversations(ctx context.Context, api API, owner string
 	return mergeConversations(mentions, replies), nil
 }
 
+// threadMark is how far one conversation was read by a walk.
+type threadMark struct {
+	key  threadKey
+	read string
+}
+
 // scanChanges is what a catch-up outside the home channel would change about
 // the bridge: the conversations it found, the ones it gave up on, and how far
 // it looked.
@@ -309,6 +315,9 @@ type scanChanges struct {
 	// skippedKeys are the conversations this walk ran out of budget for. The
 	// next walk starts with them.
 	skippedKeys []threadKey
+	// threadsRead is how far each conversation this walk reached was read,
+	// counting every reply rather than only the ones it can hand over.
+	threadsRead []threadMark
 	// skipped marks conversations left unread for want of budget. What they
 	// hold is still there, and only another catch-up will go and get it.
 	skipped bool
@@ -390,7 +399,7 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 		}
 		walked++
 
-		replies, err := readThread(ctx, api, key.channel, owner, key.threadTS, after)
+		got, err := readThread(ctx, api, key.channel, owner, key.threadTS, after)
 		if err != nil {
 			if !errors.Is(err, ErrThreadUnreadable) {
 				// Slack said "not now" rather than "not there", so the cursor
@@ -405,7 +414,14 @@ func (b *Bridge) catchUpThreadConversations(ctx context.Context, api API, owner 
 			scan.closed = append(scan.closed, key)
 			continue
 		}
-		messages = append(messages, replies...)
+		messages = append(messages, got.messages...)
+		if got.read != "" {
+			// How far this conversation was read, whether or not any of it was
+			// the owner's. Without it a conversation where somebody else has
+			// been talking is read again on every catch-up, for the same
+			// replies, for ever.
+			scan.threadsRead = append(scan.threadsRead, threadMark{key: key, read: got.read})
+		}
 	}
 
 	if len(scan.skippedKeys) > 0 {
