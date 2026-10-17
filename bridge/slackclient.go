@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"sync/atomic"
 
@@ -81,7 +82,7 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 		}
 	}()
 
-	return &webAPI{client: api, botUserID: auth.UserID}, stream, nil
+	return &webAPI{client: api, botUserID: auth.UserID, token: cfg.BotToken}, stream, nil
 }
 
 // webAPI adapts *slack.Client to the API interface.
@@ -90,6 +91,11 @@ type webAPI struct {
 	// botUserID comes from the auth.test made when the connection was opened,
 	// so recognising a mention costs no extra call.
 	botUserID string
+	// token and httpClient are for the one request slack-go does not make for
+	// us: sending a file's bytes to the upload URL Slack issued (see sendFile).
+	// A nil httpClient means http.DefaultClient.
+	token      string
+	httpClient *http.Client
 }
 
 func (w *webAPI) BotUserID() string { return w.botUserID }
@@ -396,11 +402,7 @@ func (w *webAPI) UploadFile(ctx context.Context, f FileUpload) (UploadedFile, er
 	}
 	defer func() { _ = file.Close() }()
 
-	if err := w.client.UploadToURL(ctx, slack.UploadToURLParameters{
-		UploadURL: upload.UploadURL,
-		Reader:    file,
-		Filename:  f.Filename,
-	}); err != nil {
+	if err := sendFile(ctx, w.httpClient, upload.UploadURL, w.token, f.Filename, file, f.Size); err != nil {
 		return UploadedFile{}, fmt.Errorf("sending the file to the upload URL: %w", err)
 	}
 

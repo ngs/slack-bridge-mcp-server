@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 )
@@ -103,4 +106,88 @@ func (b *Bridge) Upload(ctx context.Context, req UploadRequest) (UploadResult, e
 		return UploadResult{}, err
 	}
 	return UploadResult{FileID: file.ID, Title: file.Title, Channel: channel}, nil
+}
+
+// errFileShrank marks a file that had fewer bytes than its checked size by the
+// time it was sent.
+var errFileShrank = errors.New("the file shrank after its size was checked")
+
+// sendFile POSTs exactly size bytes of r to a Slack upload URL as the "file"
+// field of a multipart form.
+//
+// slack-go's UploadToURL is not used for this, for two reasons. It copies the
+// reader through EOF, so a file that grows after its size was checked — a log
+// still being written — sends more than the length the URL was issued for,
+// and more than MaxUploadBytes allows. And its writer goroutine reports on an
+// unbuffered channel that nobody reads once the request fails or is
+// cancelled, so every failed upload leaves a goroutine blocked forever.
+//
+// Here the body is bounded to size, a file that shrank is an error rather than
+// a short upload, and the function does not return until the writer has
+// finished: closing the pipe with the request's error unblocks it, and its
+// result goes to a buffered channel.
+func sendFile(ctx context.Context, client *http.Client, uploadURL, token, filename string, r io.Reader, size int64) error {
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	done := make(chan error, 1)
+	go func() {
+		err := func() error {
+			part, err := mw.CreateFormFile("file", filename)
+			if err != nil {
+				return err
+			}
+			n, err := io.Copy(part, io.LimitReader(r, size))
+			if err != nil {
+				return err
+			}
+			if n != size {
+				return fmt.Errorf("%w: %d bytes after it was checked at %d", errFileShrank, n, size)
+			}
+			return mw.Close()
+		}()
+		// A nil error closes the pipe with EOF, which ends the request body.
+		_ = pw.CloseWithError(err)
+		done <- err
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, pr)
+	if err != nil {
+		_ = pr.CloseWithError(err)
+		<-done
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		_ = pr.CloseWithError(err)
+		// A file that shrank is the cause when it happened; any other writer
+		// error is only the closed pipe, an echo of the request's own.
+		if writeErr := <-done; errors.Is(writeErr, errFileShrank) {
+			return writeErr
+		}
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+
+	// A server that answered before reading the whole body leaves the writer
+	// blocked on the pipe; closing it lets the writer finish with an error,
+	// which is reported, since then not every byte was taken.
+	_ = pr.CloseWithError(errors.New("the upload URL answered before the file was sent"))
+	writeErr := <-done
+	// A file that shrank also makes the server reject the body, so it is
+	// checked first: it says why.
+	if errors.Is(writeErr, errFileShrank) {
+		return writeErr
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("the upload URL answered %s", resp.Status)
+	}
+	return writeErr
 }
