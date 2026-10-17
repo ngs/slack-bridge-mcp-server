@@ -133,6 +133,16 @@ func sendFile(ctx context.Context, client *http.Client, uploadURL, token, filena
 
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
+
+	// The request is built before the writer starts, so a URL that cannot be
+	// used leaves nothing running to wait for.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, pr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+
 	done := make(chan error, 1)
 	go func() {
 		err := func() error {
@@ -153,15 +163,6 @@ func sendFile(ctx context.Context, client *http.Client, uploadURL, token, filena
 		_ = pw.CloseWithError(err)
 		done <- err
 	}()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, pr)
-	if err != nil {
-		_ = pr.CloseWithError(err)
-		<-done
-		return err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := client.Do(req)
 	if err != nil {
