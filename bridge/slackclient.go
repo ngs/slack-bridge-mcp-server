@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
 	"sync/atomic"
 
 	"github.com/slack-go/slack"
@@ -80,7 +82,7 @@ func (SocketModeConnector) Connect(ctx context.Context, cfg Config) (API, Stream
 		}
 	}()
 
-	return &webAPI{client: api, botUserID: auth.UserID}, stream, nil
+	return &webAPI{client: api, botUserID: auth.UserID, token: cfg.BotToken}, stream, nil
 }
 
 // webAPI adapts *slack.Client to the API interface.
@@ -89,6 +91,11 @@ type webAPI struct {
 	// botUserID comes from the auth.test made when the connection was opened,
 	// so recognising a mention costs no extra call.
 	botUserID string
+	// token and httpClient are for the one request slack-go does not make for
+	// us: sending a file's bytes to the upload URL Slack issued (see sendFile).
+	// A nil httpClient means http.DefaultClient.
+	token      string
+	httpClient *http.Client
 }
 
 func (w *webAPI) BotUserID() string { return w.botUserID }
@@ -372,6 +379,52 @@ func (w *webAPI) MessageReactions(ctx context.Context, channel, ts string) ([]Re
 			users = append(users, ReactionUser{ID: id})
 		}
 		out = append(out, ReactionSummary{Name: r.Name, Count: r.Count, Users: users})
+	}
+	return out, nil
+}
+
+// UploadFile shares a local file the way Slack now requires, in three calls:
+// files.getUploadURLExternal for a URL issued for the exact size, a POST of
+// the bytes to that URL, and files.completeUploadExternal to put the file into
+// the channel. The file is not shared anywhere until the last call succeeds.
+func (w *webAPI) UploadFile(ctx context.Context, f FileUpload) (UploadedFile, error) {
+	upload, err := w.client.GetUploadURLExternalContext(ctx, slack.GetUploadURLExternalParameters{
+		FileName: f.Filename,
+		FileSize: int(f.Size),
+	})
+	if err != nil {
+		return UploadedFile{}, apiError("files.getUploadURLExternal", err)
+	}
+
+	file, err := os.Open(f.Path)
+	if err != nil {
+		return UploadedFile{}, fmt.Errorf("opening %s: %w", f.Path, err)
+	}
+	defer func() { _ = file.Close() }()
+
+	if err := sendFile(ctx, w.httpClient, upload.UploadURL, w.token, f.Filename, file, f.Size); err != nil {
+		return UploadedFile{}, fmt.Errorf("sending the file to the upload URL: %w", err)
+	}
+
+	// An empty title would be sent as one, so default it to the file name,
+	// which is what Slack shows for a file uploaded without a title.
+	title := f.Title
+	if title == "" {
+		title = f.Filename
+	}
+	done, err := w.client.CompleteUploadExternalContext(ctx, slack.CompleteUploadExternalParameters{
+		Files:           []slack.FileSummary{{ID: upload.FileID, Title: title}},
+		Channel:         f.Channel,
+		ThreadTimestamp: f.ThreadTS,
+		InitialComment:  f.InitialComment,
+	})
+	if err != nil {
+		return UploadedFile{}, apiError("files.completeUploadExternal", err)
+	}
+
+	out := UploadedFile{ID: upload.FileID, Title: title}
+	if len(done.Files) > 0 {
+		out.ID, out.Title = done.Files[0].ID, done.Files[0].Title
 	}
 	return out, nil
 }

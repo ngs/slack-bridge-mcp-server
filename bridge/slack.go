@@ -133,6 +133,32 @@ type ReactionReader interface {
 	MessageReactions(ctx context.Context, channel, ts string) ([]ReactionSummary, error)
 }
 
+// FileUploader shares a local file into a conversation. Like ReactionReader it
+// is reached by type assertion, so implementations of API from outside this
+// repository keep compiling; what they lose is slack_upload, which says so.
+type FileUploader interface {
+	UploadFile(ctx context.Context, f FileUpload) (UploadedFile, error)
+}
+
+// FileUpload is one file to share. Path is read by the implementation, which
+// is told the size up front because Slack issues the upload URL for an exact
+// length.
+type FileUpload struct {
+	Path           string
+	Size           int64
+	Channel        string
+	ThreadTS       string
+	InitialComment string
+	Filename       string
+	Title          string
+}
+
+// UploadedFile is what Slack reports back once the file is shared.
+type UploadedFile struct {
+	ID    string
+	Title string
+}
+
 // StreamEventKind distinguishes the things that can happen on the Socket Mode
 // connection that the bridge cares about.
 type StreamEventKind int

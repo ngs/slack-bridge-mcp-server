@@ -54,6 +54,7 @@ at [Generate the two tokens](#generate-the-two-tokens).
    | `users:read` | `users.info`, which turns user IDs into names in [`slack_history`](../README.md#reading-the-channel) results. Optional: without it the tool falls back to raw IDs |
    | `app_mentions:read` | Required by the `app_mention` event subscription — Slack rejects a manifest, and the event subscription screen refuses the event, without it |
    | `files:read` | Downloading an [attachment](../README.md#attachments) from its `url_private`. Optional, and only for the download: Slack reports a message's files either way, so uploads are delivered with their names, sizes and links whether or not you add it — without it, fetching the file itself gets a login page instead |
+   | `files:write` | `files.getUploadURLExternal` and `files.completeUploadExternal`, for [`slack_upload`](../README.md#sending-files). Optional: without it that one tool fails with an error naming the scope |
 
    Nothing else is called. There is no user token, and the server never reads a
    channel it is not bound to.
