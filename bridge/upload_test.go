@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -194,6 +195,11 @@ type fakeUploadServer struct {
 	complete  map[string]string
 	urlError  string
 	doneError string
+	// onURL runs while files.getUploadURLExternal is being answered, which is
+	// the window in which a file can change after its size was checked.
+	onURL func()
+	// uploadErr is how the upload endpoint failed to read the body, if it did.
+	uploadErr error
 }
 
 func (s *fakeUploadServer) handler(t *testing.T, base func() string) http.Handler {
@@ -206,6 +212,9 @@ func (s *fakeUploadServer) handler(t *testing.T, base func() string) http.Handle
 		case "/files.getUploadURLExternal":
 			_ = r.ParseForm()
 			s.urlForm = map[string]string{"filename": r.Form.Get("filename"), "length": r.Form.Get("length")}
+			if s.onURL != nil {
+				s.onURL()
+			}
 			if s.urlError != "" {
 				_, _ = fmt.Fprintf(w, `{"ok":false,"error":%q}`, s.urlError)
 				return
@@ -214,7 +223,8 @@ func (s *fakeUploadServer) handler(t *testing.T, base func() string) http.Handle
 		case "/upload":
 			_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 			if err != nil {
-				t.Errorf("upload Content-Type: %v", err)
+				s.uploadErr = err
+				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
 			mr := multipart.NewReader(r.Body, params["boundary"])
@@ -224,7 +234,9 @@ func (s *fakeUploadServer) handler(t *testing.T, base func() string) http.Handle
 					break
 				}
 				if err != nil {
-					t.Errorf("reading the upload: %v", err)
+					// A short or broken body is what some tests send on purpose.
+					s.uploadErr = err
+					http.Error(w, "bad request", http.StatusBadRequest)
 					return
 				}
 				if p.FormName() == "file" {
@@ -330,5 +342,134 @@ func TestWebAPIUploadReportsAFailedCompletion(t *testing.T) {
 	_, err := w.UploadFile(context.Background(), FileUpload{Path: writeTemp(t, "a.txt", "x"), Size: 1, Channel: "C1", Filename: "a.txt"})
 	if err == nil || !strings.Contains(err.Error(), "files.completeUploadExternal") || !strings.Contains(err.Error(), "not_in_channel") {
 		t.Fatalf("UploadFile() error = %v, want files.completeUploadExternal: not_in_channel", err)
+	}
+}
+
+// A log still being written can grow between the size check and the upload.
+// Only the checked length goes, so the upload matches the length the URL was
+// issued for and cannot slip past MaxUploadBytes.
+func TestWebAPIUploadSendsOnlyTheCheckedLengthOfAGrowingFile(t *testing.T) {
+	path := writeTemp(t, "app.log", "first line\n")
+	s := &fakeUploadServer{onURL: func() {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("appending: %v", err)
+			return
+		}
+		_, _ = f.WriteString("written after the check\n")
+		_ = f.Close()
+	}}
+	w := startUploadServer(t, s)
+
+	if _, err := w.UploadFile(context.Background(), FileUpload{Path: path, Size: 11, Channel: "C1", Filename: "app.log"}); err != nil {
+		t.Fatalf("UploadFile() error = %v", err)
+	}
+	if s.uploaded != "first line\n" {
+		t.Errorf("uploaded %q, want only the 11 bytes that were checked", s.uploaded)
+	}
+}
+
+// A file that shrank cannot fill the length the URL was issued for, so the
+// upload fails before anything is shared.
+func TestWebAPIUploadFailsWhenTheFileShrank(t *testing.T) {
+	path := writeTemp(t, "app.log", "a longer body\n")
+	s := &fakeUploadServer{onURL: func() {
+		if err := os.Truncate(path, 3); err != nil {
+			t.Errorf("truncating: %v", err)
+		}
+	}}
+	w := startUploadServer(t, s)
+
+	_, err := w.UploadFile(context.Background(), FileUpload{Path: path, Size: 14, Channel: "C1", Filename: "app.log"})
+	if err == nil || !strings.Contains(err.Error(), "shrank") {
+		t.Fatalf("UploadFile() error = %v, want the shrunk file reported", err)
+	}
+	s.mu.Lock()
+	calls := append([]string(nil), s.calls...)
+	s.mu.Unlock()
+	for _, c := range calls {
+		if c == "/files.completeUploadExternal" {
+			t.Error("the upload was completed into the channel after a short send")
+		}
+	}
+}
+
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, f.err }
+
+// sendFile returns only once its writer goroutine has finished, so returning
+// at all is the proof nothing is left blocked. These two are the failures that
+// leaked one in slack-go's helper: the request failing before the body is
+// read, and the call being cancelled mid-transfer.
+func TestSendFileReturnsWhenTheRequestFails(t *testing.T) {
+	client := &http.Client{Transport: failingTransport{err: errors.New("connection refused")}}
+	body := strings.NewReader(strings.Repeat("x", 1<<20))
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- sendFile(context.Background(), client, "http://upload.invalid/", "xoxb-test", "a.bin", body, 1<<20)
+	}()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "connection refused") {
+			t.Fatalf("sendFile() error = %v, want the transport's error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendFile() did not return after the request failed; its writer is stuck")
+	}
+}
+
+func TestSendFileReturnsWhenCancelledMidTransfer(t *testing.T) {
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1024)
+		_, _ = io.ReadFull(r.Body, buf)
+		close(started)
+		// Keep reading until the client gives up, which is how the handler
+		// learns of the cancellation; then return so the server can close.
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body := strings.NewReader(strings.Repeat("x", 8<<20))
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- sendFile(ctx, srv.Client(), srv.URL, "xoxb-test", "a.bin", body, 8<<20)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upload never reached the server")
+	}
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sendFile() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendFile() did not return after cancellation; its writer is stuck")
+	}
+}
+
+// The body is a multipart form with the file under the "file" field, sent
+// with the bot token, and anything but 200 is an error.
+func TestSendFileReportsANon200Answer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if got := r.Header.Get("Authorization"); got != "Bearer xoxb-test" {
+			t.Errorf("Authorization = %q, want the bot token", got)
+		}
+		http.Error(w, "nope", http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	err := sendFile(context.Background(), srv.Client(), srv.URL, "xoxb-test", "a.txt", strings.NewReader("abc"), 3)
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("sendFile() error = %v, want the 403 reported", err)
 	}
 }
