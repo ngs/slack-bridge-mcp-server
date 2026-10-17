@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync/atomic"
 
 	"github.com/slack-go/slack"
@@ -372,6 +373,56 @@ func (w *webAPI) MessageReactions(ctx context.Context, channel, ts string) ([]Re
 			users = append(users, ReactionUser{ID: id})
 		}
 		out = append(out, ReactionSummary{Name: r.Name, Count: r.Count, Users: users})
+	}
+	return out, nil
+}
+
+// UploadFile shares a local file the way Slack now requires, in three calls:
+// files.getUploadURLExternal for a URL issued for the exact size, a POST of
+// the bytes to that URL, and files.completeUploadExternal to put the file into
+// the channel. The file is not shared anywhere until the last call succeeds.
+func (w *webAPI) UploadFile(ctx context.Context, f FileUpload) (UploadedFile, error) {
+	upload, err := w.client.GetUploadURLExternalContext(ctx, slack.GetUploadURLExternalParameters{
+		FileName: f.Filename,
+		FileSize: int(f.Size),
+	})
+	if err != nil {
+		return UploadedFile{}, apiError("files.getUploadURLExternal", err)
+	}
+
+	file, err := os.Open(f.Path)
+	if err != nil {
+		return UploadedFile{}, fmt.Errorf("opening %s: %w", f.Path, err)
+	}
+	defer func() { _ = file.Close() }()
+
+	if err := w.client.UploadToURL(ctx, slack.UploadToURLParameters{
+		UploadURL: upload.UploadURL,
+		Reader:    file,
+		Filename:  f.Filename,
+	}); err != nil {
+		return UploadedFile{}, fmt.Errorf("sending the file to the upload URL: %w", err)
+	}
+
+	// An empty title would be sent as one, so default it to the file name,
+	// which is what Slack shows for a file uploaded without a title.
+	title := f.Title
+	if title == "" {
+		title = f.Filename
+	}
+	done, err := w.client.CompleteUploadExternalContext(ctx, slack.CompleteUploadExternalParameters{
+		Files:           []slack.FileSummary{{ID: upload.FileID, Title: title}},
+		Channel:         f.Channel,
+		ThreadTimestamp: f.ThreadTS,
+		InitialComment:  f.InitialComment,
+	})
+	if err != nil {
+		return UploadedFile{}, apiError("files.completeUploadExternal", err)
+	}
+
+	out := UploadedFile{ID: upload.FileID, Title: title}
+	if len(done.Files) > 0 {
+		out.ID, out.Title = done.Files[0].ID, done.Files[0].Title
 	}
 	return out, nil
 }

@@ -32,6 +32,8 @@ Every message carries the channel it was sent in and, in a thread, its thread_ts
 back to slack_post so the reply lands in the conversation it answers: the owner's home
 channel is only one of the places they may be talking to you, and a reply that leaves out
 the channel goes to the home channel regardless of where the question came from.
+To share a file — a screenshot, a log, a report you made — use slack_upload with a local path,
+the same channel and thread_ts as a reply, and an optional initial_comment.
 A message may carry files: an attachment the owner sent, reported as metadata rather than
 content. When they ask you about one, fetch its url_private with the bot token in an
 Authorization: Bearer header — it is not a public link — and expect a login page instead of
@@ -77,6 +79,16 @@ type PostArgs struct {
 	Text     string `json:"text" jsonschema:"the message body to send, as standard Markdown: bold, headings, links, lists, tables and fenced code are rendered by Slack. Text over 12000 characters skips the Markdown rendering and goes as the message body, where only Slack mrkdwn applies"`
 	ThreadTS string `json:"thread_ts,omitempty" jsonschema:"reply inside this thread instead of the channel; pass the thread_ts of a message from slack_wait"`
 	Channel  string `json:"channel,omitempty" jsonschema:"the channel to speak in; pass the channel of the message you are answering, and leave it out for the home channel"`
+}
+
+// UploadArgs is the argument set for slack_upload.
+type UploadArgs struct {
+	Path           string `json:"path" jsonschema:"the local file to upload, as a path on the machine this server runs on"`
+	Channel        string `json:"channel,omitempty" jsonschema:"the channel to share the file in; pass the channel of the conversation you are answering, and leave it out for the home channel"`
+	ThreadTS       string `json:"thread_ts,omitempty" jsonschema:"share the file inside this thread instead of the channel"`
+	InitialComment string `json:"initial_comment,omitempty" jsonschema:"a message posted with the file"`
+	Filename       string `json:"filename,omitempty" jsonschema:"the name Slack shows for the file; defaults to the file's own name"`
+	Title          string `json:"title,omitempty" jsonschema:"the title shown above the file; defaults to the file name"`
 }
 
 // AckArgs is the argument set for slack_ack.
@@ -137,7 +149,7 @@ type AckResult struct {
 	Emoji string `json:"emoji"`
 }
 
-// New builds the MCP server and registers the eight bridge tools.
+// New builds the MCP server and registers the nine bridge tools.
 func New(b *bridge.Bridge) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    ServerName,
@@ -181,6 +193,26 @@ func New(b *bridge.Bridge) *mcp.Server {
 			channel = b.Status().Channel
 		}
 		return nil, PostResult{TS: ts, Channel: channel}, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "slack_upload",
+		Title:       "Upload a file to Slack",
+		Description: "Share a local file — a screenshot, a log, a generated report — in a conversation, optionally inside a thread and with a comment posted alongside it. Pass the channel and thread_ts of the conversation you are answering; without a channel it goes to the owner's home channel. The file has to exist, be a regular file and be under 1 GB. Needs the files:write bot scope; without it the call fails and says so. Returns the file ID and the channel it went to.",
+		Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args UploadArgs) (*mcp.CallToolResult, bridge.UploadResult, error) {
+		result, err := b.Upload(ctx, bridge.UploadRequest{
+			Path:           args.Path,
+			Channel:        args.Channel,
+			ThreadTS:       args.ThreadTS,
+			InitialComment: args.InitialComment,
+			Filename:       args.Filename,
+			Title:          args.Title,
+		})
+		if err != nil {
+			return nil, bridge.UploadResult{}, err
+		}
+		return nil, result, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

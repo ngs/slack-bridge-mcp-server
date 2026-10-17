@@ -59,6 +59,9 @@ oauth_config:
       # with or without this scope, so an upload is delivered either way, but
       # without it fetching the file itself lands on a login page.
       - files:read
+      # files.getUploadURLExternal and files.completeUploadExternal, for
+      # slack_upload. Optional: without it that one tool fails and says so.
+      - files:write
 settings:
   event_subscriptions:
     bot_events:

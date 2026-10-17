@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +65,7 @@ func TestServerExposesTheBridgeTools(t *testing.T) {
 		got[tool.Name] = tool
 	}
 
-	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_history", "slack_reactions", "slack_progress", "slack_status"}
+	want := []string{"slack_wait", "slack_post", "slack_ack", "slack_ask", "slack_history", "slack_reactions", "slack_progress", "slack_status", "slack_upload"}
 	if len(got) != len(want) {
 		t.Errorf("ListTools() returned %d tools, want %d", len(got), len(want))
 	}
@@ -239,6 +240,27 @@ func TestWaitReportsMissingConfigurationAsAToolError(t *testing.T) {
 	text := renderContent(result.Content)
 	if !strings.Contains(text, bridge.EnvBotToken) {
 		t.Errorf("slack_wait error = %q; want it to name %s", text, bridge.EnvBotToken)
+	}
+}
+
+// A wrong path is the model's mistake to correct, so it comes back as a tool
+// error naming the path, and is answered before the bridge tries Slack.
+func TestUploadToolReportsABadPathAsAToolError(t *testing.T) {
+	session := connect(t, unconfiguredBridge(t))
+
+	missing := filepath.Join(t.TempDir(), "nope.png")
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "slack_upload",
+		Arguments: map[string]any{"path": missing},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(slack_upload) error = %v; want the failure inside the result", err)
+	}
+	if !result.IsError {
+		t.Fatal("slack_upload succeeded with a missing file, want IsError")
+	}
+	if text := renderContent(result.Content); !strings.Contains(text, missing) {
+		t.Errorf("slack_upload error = %q; want it to name the path", text)
 	}
 }
 
