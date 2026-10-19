@@ -79,12 +79,6 @@ func TestCatchUpRecoversARepliedThreadWhileDisconnected(t *testing.T) {
 		t.Errorf("recovered reply thread_ts = %q, want 100.000200", threadReply.ThreadTS)
 	}
 
-	// A thread reply is often the newest thing in the channel, which is
-	// exactly what the cursor should now be pointing at.
-	if got := b.Status().LastTS; got != "100.000400" {
-		t.Errorf("last_ts = %q, want it advanced past the recovered reply", got)
-	}
-
 	// And it is not fetched a second time.
 	second, err := b.Wait(ctx, 20*testGrace)
 	if err != nil {
@@ -92,6 +86,18 @@ func TestCatchUpRecoversARepliedThreadWhileDisconnected(t *testing.T) {
 	}
 	if !second.TimedOut {
 		t.Errorf("second Wait() = %+v, want a timeout; the reply was already delivered", second)
+	}
+
+	// A thread reply is often the newest thing in the channel, which is
+	// exactly what the cursor should end up pointing at.
+	//
+	// Read after the second pass rather than the first. The walk can reach
+	// past the moment its own pass began, so how far it got is applied only on
+	// a pass nothing asked to have repeated — and the first pass of a session
+	// is asked to be repeated whenever the socket says hello after the window
+	// was read, which is a race with this test rather than what it is about.
+	if got := b.Status().LastTS; got != "100.000400" {
+		t.Errorf("last_ts = %q, want it advanced past the recovered reply", got)
 	}
 	if got := api.snapshotReactions(); len(got) != 0 {
 		t.Errorf("reactions = %+v with auto-ack off, want none", got)
@@ -485,6 +491,17 @@ func TestCatchUpPagesAThreadToItsEnd(t *testing.T) {
 	if len(result.Messages) != 13 {
 		t.Fatalf("Wait() returned %d messages, want the parent and all 12 replies", len(result.Messages))
 	}
+
+	// One more pass, and nothing new in it: the walk's reach lands on a pass
+	// nothing asked to have repeated, and the first pass of a session is asked
+	// to be repeated whenever the socket says hello after the window was read.
+	second, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if !second.TimedOut {
+		t.Errorf("second Wait() = %v, want a timeout; every reply was already delivered", texts(second.Messages))
+	}
 	if got := b.Status().LastTS; got != "100.000311" {
 		t.Errorf("last_ts = %q, want the newest reply; anything less means replies were skipped", got)
 	}
@@ -520,4 +537,148 @@ func TestRecoveredReplyIsNotDuplicatedByTheLiveStream(t *testing.T) {
 	if got := texts(result.Messages); !reflect.DeepEqual(got, want) {
 		t.Errorf("Wait() messages = %v, want %v exactly once each", got, want)
 	}
+}
+
+// colleagueReply is a reply in a thread from somebody who is not the owner.
+func colleagueReply(ts, threadTS, text string) candidate {
+	return candidate{Channel: testChannel, User: "U_COLLEAGUE", Text: text, TS: ts, ThreadTS: threadTS}
+}
+
+// A thread where only a colleague has spoken since the cursor hands nothing
+// over — the owner filter drops the reply — but it has still been read. Left
+// out of how far the pass got, latest_reply goes on saying "news here" for
+// ever: every catch-up walks that thread again, spends a round trip on it, and
+// learns the same thing.
+//
+// Fail-first: without the thread walk's read feeding the cursor, the second
+// catch-up below reads the same thread a second time.
+func TestAThreadReadAndFoundToBeSomebodyElsesIsNotReadAgain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, api, _ := threadBridge(ctx, t,
+		[]candidate{
+			threadedParent("100.000050", "here is the plan", "100.000400", 1),
+			ownerMsg("100.000100", "already answered"),
+		},
+		[]candidate{
+			colleagueReply("100.000400", "100.000050", "somebody else, thinking out loud"),
+		},
+	)
+
+	first, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if !first.TimedOut {
+		t.Fatalf("Wait() = %+v, want a timeout; the only new reply is somebody else's", first)
+	}
+	read := len(api.replyCallsSnapshot())
+	if read == 0 {
+		t.Fatal("the thread was never read, so this test is not exercising what it says it is")
+	}
+
+	// A second pass over the same channel, with nothing new in it.
+	b.mu.Lock()
+	b.needCatchUp = true
+	b.mu.Unlock()
+	second, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if !second.TimedOut {
+		t.Errorf("second Wait() = %+v, want a timeout", second)
+	}
+	if got := len(api.replyCallsSnapshot()) - read; got != 0 {
+		t.Errorf("the thread was read %d more times; a conversation the owner is not in costs a round trip on every catch-up, for ever", got)
+	}
+}
+
+// The contract the two tests above leave to chance, pinned down.
+//
+// The first pass of a session is normally interrupted: Connect returns before
+// the socket is up, so the window can be read before the socket says hello,
+// and that hello asks for the window to be read again. On such a pass the
+// walk's reach waits — it is the one read that can reach past the moment the
+// pass began — and the pass that answers the hello moves the cursor instead.
+//
+// Held open deliberately here, so the interruption lands in the middle of the
+// read every time rather than most times.
+//
+// Fail-first: without the epoch guard on the walk's reach, the cursor is at
+// the reply after the first pass rather than at the channel surface.
+func TestAnInterruptedPassLeavesTheWalksReachToTheNextOne(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t)
+	cfg.IndicatorDisabled = true
+	cfg.AutoAckDisabled = true
+	if err := NewStore(cfg.StateDir).SetLastTS(testChannel, "100.000100"); err != nil {
+		t.Fatalf("seeding the cursor: %v", err)
+	}
+
+	api := &fakeAPI{
+		history: []candidate{
+			ownerMsg("100.000200", "on the channel"),
+			threadedParent("100.000050", "an old thread", "100.000400", 1),
+		},
+		replies: []candidate{colleagueReply("100.000400", "100.000050", "somebody else, in the thread")},
+	}
+	gate := make(chan struct{})
+	api.historyGate = gate
+	stream := newFakeStream()
+	// quiet, so the hello lands where this test puts it.
+	b := New(ctx, cfg, &fakeConnector{api: api, stream: stream, quiet: true})
+	t.Cleanup(func() { _ = b.Close() })
+
+	first := make(chan WaitResult, 1)
+	go func() {
+		result, err := b.Wait(ctx, MaxWaitTimeout)
+		if err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+		first <- result
+	}()
+
+	// The socket comes up while the window is being read, which is the whole
+	// point: what that read found stops where it looked, and a message sent
+	// between the two is in history and nowhere else.
+	eventually(t, "the catch-up to reach Slack", func() bool { return len(api.calls()) > 0 })
+	stream.sayHello()
+	eventually(t, "the hello to be applied", b.helloSeen)
+	close(gate)
+
+	if got := texts((<-first).Messages); len(got) != 1 || got[0] != "on the channel" {
+		t.Fatalf("Wait() messages = %v, want the channel message", got)
+	}
+	if got := b.Status().LastTS; got != "100.000200" {
+		t.Errorf("last_ts after the interrupted pass = %q, want the channel surface at 100.000200; the walk's reach may not be claimed on a pass that has been asked to run again", got)
+	}
+
+	// The pass that answers the hello reads the same thread again, hands over
+	// nothing, and moves the cursor.
+	reads := len(api.replyCallsSnapshot())
+	second, err := b.Wait(ctx, 20*testGrace)
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if !second.TimedOut {
+		t.Errorf("second Wait() = %v, want a timeout; everything was delivered already", texts(second.Messages))
+	}
+	if got := len(api.replyCallsSnapshot()) - reads; got != 1 {
+		t.Errorf("the thread was read %d more times, want exactly one: one extra look per connection is what the deferral costs", got)
+	}
+	if got := b.Status().LastTS; got != "100.000400" {
+		t.Errorf("last_ts after the second pass = %q, want the reply the walk read", got)
+	}
+}
+
+// helloSeen reports whether the pump has applied this connection's own
+// announcement, which is what a test waits for when it wants the hello to land
+// inside a pass rather than around it.
+func (b *Bridge) helloSeen() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.connectAnnounced
 }

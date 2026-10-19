@@ -40,6 +40,12 @@ const (
 // and leaving live buttons behind is exactly what this call is preventing.
 const askResolveTimeout = 5 * time.Second
 
+// shutdownRetireWait is how long Close waits for a question's buttons to be
+// taken out of the channel. It is the request's own bound and a moment more,
+// so a retirement already in flight finishes rather than being cut off by the
+// process exiting.
+const shutdownRetireWait = askResolveTimeout + time.Second
+
 // askPostTimeout bounds posting the question. It runs detached from the tool
 // call, so this is what keeps a Slack that never answers from holding the call
 // open past its own timeout.
@@ -63,7 +69,15 @@ const maxEarlyClicks = 8
 type AskRequest struct {
 	Question string
 	Options  []string
-	Timeout  time.Duration
+	// Timeout is how long the owner has to answer, and it covers the whole
+	// call: posting the question, waiting for a click, collecting whatever was
+	// said instead of clicking, and taking the buttons away afterwards.
+	//
+	// The last of those is waited for only as long as there is. With nothing
+	// left — a question that ran out of time, say — the request is still sent
+	// and finishes on its own, and the call returns ahead of it rather than
+	// over the timeout it was given.
+	Timeout time.Duration
 	// ThreadTS asks inside a thread instead of on the channel surface.
 	ThreadTS string
 	// Channel is the conversation to ask in. Empty means the home channel.
@@ -121,6 +135,9 @@ type AskResult struct {
 // without caring whether the asking goroutine is still there to take it.
 type pendingAsk struct {
 	ts string
+	// generation is the connection the question was asked on. A click routed
+	// by a later one answers a question that connection never saw.
+	generation uint64
 	// channel is where the question was posted, which is where a click has to
 	// come from to be this question's answer.
 	channel string
@@ -153,6 +170,11 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 
 	question, options := req.Question, req.Options
 	threadTS, timeout := req.ThreadTS, req.Timeout
+	// The clock the caller asked about starts here, before the question is
+	// posted. Posting is a Slack request like any other and can take its time,
+	// and a timeout measured from after it is a timeout the call can outlast
+	// without ever having waited for an answer.
+	callEnds := time.Now().Add(timeout)
 
 	q, labels, err := buildQuestion(question, options)
 	if err != nil {
@@ -164,17 +186,34 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 		b.mu.Unlock()
 		return AskResult{}, err
 	}
-	if b.ask != nil {
+	if b.ask != nil || b.askReserved {
 		b.mu.Unlock()
 		return AskResult{}, errors.New("a question is already waiting for an answer; wait for it to be answered or to time out before asking another")
 	}
 	channel := b.channelOr(req.Channel)
-	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel}
-	b.ask = ask
-	api, stream := b.api, b.stream
+	ask := &pendingAsk{labels: labels, answered: make(chan int, 1), channel: channel, generation: b.connGeneration}
+	// The reservation only. Refusing a second question is this call's from
+	// here; being the thing a click answers is not, and will not be until
+	// there is a question of its own in the channel.
+	b.askReserved = true
+	api, generation := b.api, b.connGeneration
 	b.mu.Unlock()
 
-	defer b.clearAsk(ask)
+	defer b.releaseAsk(ask)
+
+	// A question from a call that was given up on mid-post may still be
+	// standing in the channel with live buttons. Looked for here, before
+	// another one goes up beside it: a click on the old one would answer
+	// nothing.
+	b.retireOrphanQuestion(ctx, api, time.Until(callEnds))
+
+	// That search is a round trip, and the caller can have given up during it.
+	// Asked before anything goes up, because a question posted for a call that
+	// has already ended is buttons in the channel nobody is waiting on — put
+	// there and taken away again in the same breath.
+	if err := ctx.Err(); err != nil {
+		return AskResult{}, err
+	}
 
 	if api == nil {
 		return AskResult{}, errors.New("the bridge is not connected to Slack")
@@ -186,8 +225,34 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	// above leaves it alone, since nothing about the agent's work changed.
 	retired := b.stopIndicator()
 
-	ts, err := postQuestion(b.ctx, api, channel, threadTS, q)
+	budget := time.Until(callEnds)
+	if budget <= 0 {
+		// The time the caller asked for went on getting here — the search for
+		// an abandoned question, most likely. Posting one now would put
+		// buttons in the channel for a call that is already over.
+		b.restoreIndicator(ctx, retired)
+		return AskResult{ChoiceIndex: -1, TimedOut: true}, nil
+	}
+
+	// Published here, and not when the call was accepted. From this moment a
+	// click on this block is plausibly this question's answer and is worth
+	// holding; before it, the only question in the channel with these buttons
+	// is an older one the search above was trying to retire, and holding a
+	// click on that would replay it against the message that replaces it.
+	b.publishAsk(ask)
+
+	// Taken before the post, because it is the window the search for an
+	// abandoned one is cut by: anything the bridge posted after this moment.
+	attempted := time.Now()
+	ts, err := postQuestion(b.ctx, api, channel, threadTS, q, budget)
 	if err != nil {
+		// A post given up on can still have landed: the request was
+		// abandoned, not cancelled at Slack. What is lost with it is the ts,
+		// which is the only thing that could take the buttons away — so the
+		// question is remembered instead, and the next one looks for it.
+		if errors.Is(err, context.DeadlineExceeded) {
+			b.noteOrphanQuestion(channel, threadTS, attempted)
+		}
 		// No question went up, so the agent is still the one working and the
 		// channel should say so again.
 		b.restoreIndicator(ctx, retired)
@@ -212,68 +277,101 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 	sub := b.subscribePending()
 	defer b.unsubscribePending(sub)
 
-	deadline := time.NewTimer(timeout)
+	// What is left of it, rather than the whole of it again: posting has
+	// already spent some, and the caller was promised one timeout and not two.
+	askEnds := callEnds
+	deadline := time.NewTimer(time.Until(askEnds))
 	defer deadline.Stop()
 
+	// The conversations a walk could not reach are worth one look, not one per
+	// wakeup: what answers them is a round trip, and one that stays out of
+	// budget would buy another every time this question woke.
+	skippedLooked := false
+
 	for {
+		// Both of these are checked before blocking, not only on a wakeup. The
+		// pump applies what the socket delivers as it arrives, and it can have
+		// done so — and sent its notification — while this question was still
+		// being posted, which is before there was anything subscribed to hear
+		// it.
+		//
+		// The caller giving up, or the session ending, comes first: both of
+		// those end the pump as well, and answering "the connection closed" to
+		// a cancelled call describes the consequence rather than the cause.
+		if err := callerGone(ctx, b.ctx); err != nil {
+			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			return AskResult{}, err
+		}
+		// No click can reach this question once the socket is gone, so the
+		// buttons go with it rather than standing there inviting an answer
+		// nothing could carry.
+		if b.streamGone(generation) {
+			// The connection hands over what it had before it says it is
+			// gone, so the owner's click can already be waiting here. It is an
+			// answer whatever happened to the socket afterwards.
+			if choice, ok := b.lastChance(ask); ok {
+				return b.answered(ctx, api, answer{
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation, ends: askEnds,
+					q: q, labels: labels, options: options, choice: choice,
+				}), nil
+			}
+			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			return AskResult{}, errors.New("the Slack connection closed")
+		}
+		if !req.InterruptDisabled && b.backlogWaiting(!skippedLooked) {
+			skippedLooked = true
+			if msgs := b.backlogWhileAsking(ctx, generation, time.Until(askEnds)); len(msgs) > 0 {
+				return b.interrupted(api, channel, ts, q, msgs, askEnds), nil
+			}
+			// A reconnect rather than a message, or a drain that failed and
+			// left the queue where it was. Either way there is nothing to act
+			// on, so the question stands and this waits like any other.
+		}
+
 		select {
 		case <-sub:
 			if req.InterruptDisabled {
 				continue
 			}
-			msgs := b.backlogWhileAsking(ctx)
+			msgs := b.backlogWhileAsking(ctx, generation, time.Until(askEnds))
 			if len(msgs) == 0 {
-				// A reconnect rather than a message, or a drain that failed and
-				// left the queue where it was. Either way there is nothing to
-				// act on, so the question stands.
 				continue
 			}
-			// The owner answered with words instead of a button. The question is
-			// no longer the thing being answered, so its buttons go — otherwise
-			// they sit there inviting a click nobody is waiting for any more.
-			b.resolve(api, channel, ts, q.Text+"\n\n⌛ superseded")
-			// The message is the new work, so the clock restarts where the owner
-			// sent it rather than where the question was asked.
-			b.startIndicator(newestConversation(msgs))
-			return AskResult{
-				ChoiceIndex: -1,
-				Interrupted: true,
-				TS:          ts,
-				Messages:    msgs,
-			}, nil
+			return b.interrupted(api, channel, ts, q, msgs, askEnds), nil
 
 		case choice := <-ask.answered:
-			b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
-			// The answer is new work handed to the agent, exactly like the
-			// messages slack_wait returns, so the clock starts again here —
-			// and in the thread the question was asked in, which is where the
-			// owner just clicked and where they are watching for what follows.
-			b.startIndicator(channel, threadTS)
-			return AskResult{
-				ChoiceIndex: choice,
-				ChoiceLabel: options[choice],
-				TS:          ts,
-				Messages:    b.backlogWhileAsking(ctx),
-			}, nil
+			return b.answered(ctx, api, answer{
+				channel: channel, threadTS: threadTS, ts: ts, generation: generation, ends: askEnds,
+				q: q, labels: labels, options: options, choice: choice,
+			}), nil
 
 		case <-deadline.C:
 			// A click landing in the same instant as the deadline is still an
 			// answer; the owner did decide, and honouring it costs nothing.
-			if choice, ok := b.settleDeadline(ask, stream); ok {
-				b.resolve(api, channel, ts, answeredText(q.Text, labels[choice]))
-				b.startIndicator(channel, threadTS)
-				return AskResult{
-					ChoiceIndex: choice,
-					ChoiceLabel: options[choice],
-					TS:          ts,
-					Messages:    b.backlogWhileAsking(ctx),
-				}, nil
+			if choice, ok := b.settleDeadline(ask); ok {
+				return b.answered(ctx, api, answer{
+					channel: channel, threadTS: threadTS, ts: ts, generation: generation, ends: askEnds,
+					q: q, labels: labels, options: options, choice: choice,
+				}), nil
 			}
-			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
+			// Within what is left, which by now is the floor: the call is
+			// over either way, and the promise about when it returns outlives
+			// the question it was about.
+			b.resolveWithin(api, channel, ts, q.Text+"\n\n⌛ expired", time.Until(askEnds))
+			// The deadline and the end of the connection can be ready at the
+			// same moment, and a timeout would be the wrong answer to the
+			// second: it says "ask again", which is not what a call does with
+			// a socket that has gone. A cancellation outranks both.
+			if err := callerGone(ctx, b.ctx); err != nil {
+				return AskResult{}, err
+			}
+			if b.streamGone(generation) {
+				return AskResult{}, errors.New("the Slack connection closed")
+			}
 			// A question nobody answered leaves the agent with nothing to act
 			// on, which is exactly when a message waiting behind it matters
 			// most.
-			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx)}, nil
+			return AskResult{ChoiceIndex: -1, TimedOut: true, Messages: b.backlogWhileAsking(ctx, generation, askLastLookWait)}, nil
 
 		case <-ctx.Done():
 			// The client gave up on the call. Nobody is left to receive an
@@ -285,33 +383,107 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 			b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
 			return AskResult{}, b.ctx.Err()
 
-		case in, ok := <-stream.Interactions():
-			if !ok {
-				b.drainStream(stream, reactionsOf(stream))
-				b.noteStreamClosed(stream)
-				// The click channel closes with the socket, and a closed
-				// channel is permanently ready — so this has to be handled
-				// here or the loop spins on it. No answer can arrive now.
-				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
-				return AskResult{}, errors.New("the Slack connection closed")
-			}
-			b.routeInteraction(in)
-
-		case evt, ok := <-stream.Events():
-			if !ok {
-				b.drainStream(stream, reactionsOf(stream))
-				b.noteStreamClosed(stream)
-				// The socket is gone, so no click can reach this call any
-				// more. The buttons have to go with it.
-				b.resolve(api, channel, ts, q.Text+"\n\n⌛ expired")
-				return AskResult{}, errors.New("the Slack connection closed")
-			}
-			// absorb routes the event: clicks reach this question, messages
-			// queue up for the next slack_wait.
-			if err := b.absorb(evt); err != nil {
-				return AskResult{}, err
-			}
 		}
+	}
+}
+
+// callerGone reports the cancellation, if either context has one. The call's
+// own comes first: it is the more specific answer to "why did this stop".
+func callerGone(call, session context.Context) error {
+	if err := call.Err(); err != nil {
+		return err
+	}
+	return session.Err()
+}
+
+// backlogSlotWait is how long collecting the backlog will wait for its turn at
+// catch-up. A settled question is answering the owner, so it waits a while, but
+// not on a request that has clearly gone wrong.
+const backlogSlotWait = 5 * time.Second
+
+// askLastLookWait is what a backlog drain gets once the question is over: its
+// deadline has passed, so this is a courtesy rather than a budget — long enough
+// for a request that is nearly done, short enough that the answer is prompt.
+const askLastLookWait = 250 * time.Millisecond
+
+// backlogWaiting reports whether there is anything for a question to be
+// interrupted by: messages the pump has queued, or a catch-up that has not run
+// and may find some.
+//
+// withSkipped adds the conversations a walk ran out of budget for. Their
+// replies are in neither queue yet and only a walk will bring them, so a
+// question that ignored them would be asked over the top of something the
+// owner said. It is asked at most once per question: the walk that answers it
+// is a round trip, and a conversation that stays out of budget would otherwise
+// buy one on every wakeup.
+func (b *Bridge) backlogWaiting(withSkipped bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.pending) > 0 || len(b.pendingThreads) > 0 || b.needCatchUp {
+		return true
+	}
+	return withSkipped && b.threadsSkipped
+}
+
+// answer is everything the settled question needs to report itself, gathered so
+// the three places a click can arrive say it the same way.
+type answer struct {
+	channel  string
+	threadTS string
+	ts       string
+	// ends is when the question's own timeout runs out, kept as the moment
+	// rather than as what was left of it at some earlier point. Retiring the
+	// buttons and collecting the backlog both come out of it, one after the
+	// other, and a remainder measured once and used twice would let the second
+	// of them start after the deadline had already passed.
+	ends time.Time
+	// generation is the connection the question was asked on, which is what
+	// decides whether the backlog it collects is still its to collect.
+	generation uint64
+	q          Question
+	labels     []string
+	options    []string
+	choice     int
+}
+
+// answered retires a question the owner clicked, and reports the choice.
+//
+// The answer is new work handed to the agent, exactly like the messages
+// slack_wait returns, so the clock starts again here — and in the thread the
+// question was asked in, which is where the owner just clicked and where they
+// are watching for what follows.
+func (b *Bridge) answered(ctx context.Context, api API, a answer) AskResult {
+	b.resolveWithin(api, a.channel, a.ts, answeredText(a.q.Text, a.labels[a.choice]), time.Until(a.ends))
+	b.startIndicator(a.channel, a.threadTS)
+	return AskResult{
+		ChoiceIndex: a.choice,
+		ChoiceLabel: a.options[a.choice],
+		TS:          a.ts,
+		// Measured again, not reused: retiring the buttons has just spent some
+		// of what was left, and the caller was promised one timeout.
+		Messages: b.backlogWhileAsking(ctx, a.generation, time.Until(a.ends)),
+	}
+}
+
+// interrupted retires a question the owner answered with words instead of a
+// button, and reports what they said.
+//
+// The buttons go: leaving them up invites a click on a question that is no
+// longer the thing being answered. The clock restarts where the owner sent the
+// message rather than where the question was asked, because that message is the
+// new work.
+func (b *Bridge) interrupted(api API, channel, ts string, q Question, msgs []Message, ends time.Time) AskResult {
+	// Inside the question's own deadline like every other settled outcome. The
+	// caller is waiting on this one — it has the owner's message in hand — so
+	// the retirement is dispatched and waited for only as long as there is.
+	b.resolveWithin(api, channel, ts, q.Text+"\n\n⌛ superseded", time.Until(ends))
+	b.startIndicator(newestConversation(msgs))
+	return AskResult{
+		ChoiceIndex: -1,
+		Interrupted: true,
+		TS:          ts,
+		Messages:    msgs,
 	}
 }
 
@@ -333,15 +505,288 @@ func (b *Bridge) Ask(ctx context.Context, req AskRequest) (AskResult, error) {
 // It is called only once a question has settled. A call abandoned or a socket
 // that closed has no session left to hand a backlog to, and moving the cursor
 // there would consume messages nobody ever received.
-func (b *Bridge) backlogWhileAsking(ctx context.Context) []Message {
-	msgs, err := b.drainCatchUp(ctx)
+func (b *Bridge) backlogWhileAsking(ctx context.Context, generation uint64, budget time.Duration) []Message {
+	// Bounded by what the question has left. The slot wait was already, but
+	// the request itself was not: a history call that hangs would hold the
+	// tool past the timeout the caller asked for, which is the one promise
+	// every tool makes. Nothing is committed until the messages are in hand,
+	// so a drain cut short here costs a round trip and no messages.
+	//
+	// A budget already spent buys nothing at all, and a small one buys only
+	// what it is: the courtesy of a quarter of a second belongs to the call
+	// that has run out of time and has nothing else to return, and it is that
+	// call which asks for it by name. A call holding an answer has something
+	// better to do with the moment, and the next slack_wait reads the same
+	// window.
+	if budget <= 0 {
+		return nil
+	}
+	drainCtx, cancelDrain := context.WithTimeout(ctx, budget)
+	defer cancelDrain()
+
+	slotWait := backlogSlotWait
+	if budget < slotWait {
+		slotWait = budget
+	}
+
+	msgs, _, err := b.drainCatchUp(drainCtx, generation, false, slotWait)
 	if err != nil {
+		if ctx.Err() == nil && drainCtx.Err() != nil {
+			// The question's own deadline, not the caller's. The next
+			// slack_wait reads the same window.
+			return nil
+		}
 		log.Printf("could not collect the messages that arrived while the question was pending: %s", logSafe(err.Error(), maxLoggedError))
 		return nil
 	}
 	b.autoAck(msgs)
 	return msgs
 }
+
+// orphanQuestion is a question whose post was abandoned before its timestamp
+// came back. It may be standing in the channel with live buttons, and the
+// timestamp that would retire it went with the request.
+type orphanQuestion struct {
+	channel string
+	// threadTS is set for a question asked inside a conversation, which is
+	// where it has to be looked for: a thread reply is in no channel history.
+	threadTS string
+	// since and until are the window the question can be in, as Slack
+	// timestamps. The first is the attempt, less a margin: the clock here is
+	// not Slack's, and both ends of a history window are exclusive. The second
+	// is as long after it as the post could possibly have taken, which keeps
+	// the page from filling with a busy channel's later traffic.
+	since string
+	until string
+	// attempts is how many calls have tried to retire it. A question that
+	// cannot be reached is not worth every later question's budget.
+	attempts int
+}
+
+// noteOrphanQuestion remembers a post that was given up on.
+func (b *Bridge) noteOrphanQuestion(channel, threadTS string, attempted time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.orphan = &orphanQuestion{
+		channel:  channel,
+		threadTS: threadTS,
+		since:    slackTS(attempted.Add(-orphanClockSlack)),
+		until:    slackTS(attempted.Add(askPostTimeout + orphanClockSlack)),
+	}
+}
+
+// slackTS renders a moment the way Slack timestamps one, which is what the
+// history and replies windows are cut by.
+func slackTS(at time.Time) string {
+	return fmt.Sprintf("%d.%06d", at.Unix(), at.Nanosecond()/1000)
+}
+
+// retireOrphanQuestion takes away the buttons of a question whose post was
+// abandoned, if it finds one. Best effort by nature: the question may never
+// have landed, and looking costs one history call — so it is looked for once,
+// on the next question, and forgotten either way.
+func (b *Bridge) retireOrphanQuestion(ctx context.Context, api API, budget time.Duration) {
+	b.mu.Lock()
+	orphan := b.orphan
+	b.orphan = nil
+	me := b.botUserID
+	b.mu.Unlock()
+
+	if orphan == nil {
+		return
+	}
+	if api == nil {
+		// Nothing was looked at, so nothing was learned. Put back for a call
+		// that has a connection to look with.
+		b.keepOrphanQuestion(orphan)
+		return
+	}
+	if me == "" {
+		// Without a user ID of its own the bridge cannot tell its message from
+		// anybody else's, and a search that guessed would retire somebody's.
+		// Said plainly: the question it was looking for keeps its buttons, and
+		// a click on them answers nothing.
+		log.Printf("cannot look for a question whose post was given up on: this app's own user ID is not known, so its buttons stay until somebody takes them away")
+		return
+	}
+	// Inside the question's own budget, like everything else the call does:
+	// looking for a question that may never have landed is not worth the
+	// timeout the caller was promised.
+	if budget <= 0 {
+		// Not looked at either, so the next question with time to spare is the
+		// one to look. No attempt counted: nothing was spent on this.
+		b.keepOrphanQuestion(orphan)
+		return
+	}
+	if budget > orphanSearchWait {
+		budget = orphanSearchWait
+	}
+	ends := time.Now().Add(budget)
+	searchCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	found, err := b.findOrphanQuestion(searchCtx, api, orphan, me)
+	if err != nil {
+		// A search that ran out of time, or a caller that gave up during it,
+		// has learned nothing about the question — so it goes back on the
+		// shelf for the next one, the same way a retirement that could not be
+		// finished does. Anything else is Slack saying no, which the next
+		// question is not going to talk it out of.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			orphan.attempts++
+			if orphan.attempts <= maxOrphanAttempts {
+				b.keepOrphanQuestion(orphan)
+				log.Printf("did not finish looking for a question whose post was given up on; the next question will look again: %s", logSafe(err.Error(), maxLoggedError))
+				return
+			}
+			// Tried often enough. A question that cannot be reached is not
+			// worth every later question's budget.
+		}
+		log.Printf("could not look for a question whose post was given up on: %s", logSafe(err.Error(), maxLoggedError))
+		return
+	}
+	if found == "" {
+		// Either it never landed, or it is outside the window, or somebody has
+		// taken it away already. Said plainly, because the one case that
+		// matters — a question standing in the channel that nothing will ever
+		// retire — looks exactly like the other two from here.
+		log.Printf("found no question to retire from a post that was given up on; if one did land, its buttons are still there")
+		return
+	}
+	// What is left of the budget, not what it was: the search has just spent
+	// some of it, and the two of them are one budget between them.
+	//
+	// No floor here, unlike a question this call owns. If there is not enough
+	// left, or Slack will not take it, the question goes back on the shelf and
+	// the next one tries again — which is the difference between a message
+	// somebody else will go back for and one nobody will.
+	//
+	// Remembered as retired before the request goes out, the same way a
+	// question this call owns is. Whether or not Slack takes it, those buttons
+	// are not the next question's answer — and this call is about to post that
+	// question, in the window where a tap on the old one cannot be told apart
+	// by timestamp.
+	b.mu.Lock()
+	b.noteRetiredLocked(found)
+	b.mu.Unlock()
+
+	if err := b.tryResolve(api, orphan.channel, found, orphanExpiredText, time.Until(ends)); err != nil {
+		orphan.attempts++
+		if !errors.Is(err, context.DeadlineExceeded) || orphan.attempts > maxOrphanAttempts {
+			// Slack refused it rather than running out of time, or it has been
+			// tried often enough. Either way the next question is not the one
+			// to keep paying for this: said plainly and let go of.
+			log.Printf("could not retire a question whose post was given up on, and will not try again: %s", logSafe(err.Error(), maxLoggedError))
+			return
+		}
+		log.Printf("ran out of time retiring a question whose post was given up on; the next question will try again: %s", logSafe(err.Error(), maxLoggedError))
+		b.keepOrphanQuestion(orphan)
+	}
+}
+
+// keepOrphanQuestion puts an abandoned question back for the next call to try,
+// leaving a newer one alone: this call's own post may have been given up on
+// too while it was busy with this, and that one is the more recent loss.
+func (b *Bridge) keepOrphanQuestion(orphan *orphanQuestion) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.orphan == nil {
+		b.orphan = orphan
+	}
+}
+
+// findOrphanQuestion looks for the message an abandoned post may have left, and
+// reports its timestamp.
+//
+// What identifies it is the block the bridge puts its buttons in, inside a
+// window around the attempt. Not the text: Slack rewrites what it stores,
+// turning & into &amp; and a bare link into <link>, so a comparison that looked
+// exact would quietly find nothing at all. And not the newest thing this app
+// posted either — after a post that failed it posts others, the indicator
+// saying it is working and the reply to whatever prompted the question — and
+// expiring one of those rewrites a message the owner is reading.
+//
+// A question that has already been retired has no such block: retiring one
+// replaces the block list. So the one thing this looks for says both that the
+// message is the bridge's own question and that its buttons are still live.
+func (b *Bridge) findOrphanQuestion(ctx context.Context, api API, orphan *orphanQuestion, me string) (string, error) {
+	var messages []candidate
+	if orphan.threadTS != "" {
+		// A reply is in no channel history, so the conversation is where it
+		// has to be looked for.
+		replies, err := api.Replies(ctx, RepliesRequest{
+			Channel:  orphan.channel,
+			ThreadTS: orphan.threadTS,
+			Oldest:   orphan.since,
+			Latest:   orphan.until,
+			Limit:    orphanSearchLimit,
+		})
+		if err != nil {
+			return "", err
+		}
+		messages = replies.Messages
+	} else {
+		// Both ends of the window. History comes back newest first and the
+		// limit counts from that end, so a channel that has been busy since
+		// would otherwise fill the page with what came after and leave the
+		// question outside it.
+		page, err := api.History(ctx, HistoryRequest{
+			Channel: orphan.channel,
+			Oldest:  orphan.since,
+			Latest:  orphan.until,
+			Limit:   orphanSearchLimit,
+		})
+		if err != nil {
+			return "", err
+		}
+		messages = page.Messages
+	}
+
+	found := ""
+	for _, c := range messages {
+		// The bridge's own question, with its buttons still on it. The block
+		// id says both: nobody else posts it, and retiring a question takes
+		// the block away. Without this the newest thing the bridge posted in
+		// the window would do — and after a post that failed, that is the
+		// indicator saying "Working…", or the reply to the message that
+		// prompted the question.
+		if c.User != me || c.TS == "" || !c.HasAskButtons {
+			continue
+		}
+		// The newest of them: history comes back newest first and replies
+		// oldest first, so the comparison rather than the order decides.
+		if tsLess(found, c.TS) {
+			found = c.TS
+		}
+	}
+	return found, nil
+}
+
+// orphanSearchLimit is how many messages the search for an abandoned question
+// reads. The window it reads is only as wide as a post can take, so this is
+// generous for it — and it is one request either way, which is what the budget
+// is being spent on.
+const orphanSearchLimit = 100
+
+// orphanExpiredText is what an abandoned question is retired with. Its own
+// text is not repeated: what Slack stored may not be what was sent.
+const orphanExpiredText = "⌛ expired"
+
+// maxOrphanAttempts is how many questions will pay for retiring an earlier
+// one that could not be reached.
+const maxOrphanAttempts = 3
+
+// orphanClockSlack is how far either side of the attempt the window reaches.
+// The moment is taken from this machine's clock and the timestamps come from
+// Slack's, and both ends of a window are exclusive — so a question posted in
+// the same second could sit just outside a window cut to the instant. Being
+// generous costs nothing now that the block id says which message is the
+// question.
+const orphanClockSlack = 5 * time.Second
+
+// orphanSearchWait bounds the search itself. It is one request, and the call
+// that pays for it is about to ask a question of its own.
+const orphanSearchWait = 2 * time.Second
 
 // postQuestion posts on a detached context with a deadline of its own.
 //
@@ -351,8 +796,16 @@ func (b *Bridge) backlogWhileAsking(ctx context.Context) []Message {
 // channel that no click can ever answer. The caller checks for cancellation
 // once the ts is known, which is the point at which it can do something about
 // it.
-func postQuestion(ctx context.Context, api API, channel, threadTS string, q Question) (string, error) {
-	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), askPostTimeout)
+func postQuestion(ctx context.Context, api API, channel, threadTS string, q Question, budget time.Duration) (string, error) {
+	// The smaller of the two: a post that outlasts the question's own timeout
+	// has already broken the promise the timeout is, and one that outlasts the
+	// bound below has stopped being worth waiting for either way. A caller
+	// with nothing left does not get here at all.
+	if budget > askPostTimeout {
+		budget = askPostTimeout
+	}
+
+	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
 	return api.PostQuestion(postCtx, channel, threadTS, q)
 }
@@ -376,44 +829,16 @@ func (b *Bridge) adoptQuestion(ask *pendingAsk, ts string) {
 	}
 }
 
-// drainInteractions takes everything already queued on the interaction channel
-// and routes it, without waiting for more.
-//
-// The closed check is not a formality: a closed channel is permanently ready,
-// so without it this loop would never reach its default and would spin for
-// ever the moment the socket went away.
-func (b *Bridge) drainInteractions(stream Stream) {
-	for {
-		select {
-		case in, ok := <-stream.Interactions():
-			if !ok {
-				return
-			}
-			b.routeInteraction(in)
-		default:
-			return
-		}
-	}
-}
-
 // settleDeadline decides whether the question was answered after all.
 //
-// Three things can be true at the moment the timer fires: the answer is
-// already waiting, a click is still sitting on the channel, or another
-// goroutine has taken a click off the channel and is on its way to delivering
-// it. select picks at random between a ready timer and a ready click, so the
-// first two need looking at rather than assuming; the third is why this waits
-// a moment and looks again, taking the mutex each time so that anything
-// mid-delivery has landed by the time it does.
-//
-// A single dispatcher owning the click channel would remove the third case
-// outright. It is not worth the machinery here: slack_wait already leaves the
-// channel alone while a question is pending, so a competing reader only exists
-// for the instant between the two.
-func (b *Bridge) settleDeadline(ask *pendingAsk, stream Stream) (int, bool) {
+// The pump routes clicks as it receives them, so a click that arrived in the
+// same instant as the deadline is already on its way to this question rather
+// than sitting on a channel waiting to be read. What is left is the moment
+// between the routing and the answer being taken, which is why this looks more
+// than once: the owner did decide, and honouring it costs nothing.
+func (b *Bridge) settleDeadline(ask *pendingAsk) (int, bool) {
 	deadline := time.Now().Add(deadlineSettleWindow)
 	for {
-		b.drainInteractions(stream)
 		if choice, ok := b.lastChance(ask); ok {
 			return choice, true
 		}
@@ -435,35 +860,156 @@ func (b *Bridge) lastChance(ask *pendingAsk) (int, bool) {
 	}
 }
 
-// clearAsk retires the question from the bridge, leaving a question that
-// replaced it alone. Nothing can replace it while it is pending, so the guard
-// is only there to keep a future change from clearing the wrong one.
-func (b *Bridge) clearAsk(ask *pendingAsk) {
+// publishAsk makes the question the one a click answers. Called once the
+// buttons are about to exist, which is the first moment a click on this block
+// could belong to it.
+func (b *Bridge) publishAsk(ask *pendingAsk) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ask = ask
+}
+
+// releaseAsk gives up both the reservation and the question itself, which is
+// the end of the call either way — whether it ever got as far as posting.
+//
+// The guard on the question is only there to keep a future change from
+// clearing the wrong one: nothing can replace it while the reservation is
+// held, and the reservation outlives it.
+func (b *Bridge) releaseAsk(ask *pendingAsk) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.ask == ask {
 		b.ask = nil
 	}
+	b.askReserved = false
 }
 
 // resolve rewrites the question so it can no longer be clicked. It is best
 // effort: a failure here leaves stale buttons in the channel, which is worth a
 // log line but not worth failing an answer the agent already has.
 func (b *Bridge) resolve(api API, channel, ts, text string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), askResolveTimeout)
-	defer cancel()
+	b.resolveWithin(api, channel, ts, text, askResolveTimeout)
+}
 
-	if err := api.ResolveQuestion(ctx, channel, ts, text); err != nil {
-		log.Printf("could not retire the question in the channel: %s", logSafe(err.Error(), maxLoggedError))
+// resolveWithin is resolve with a bound on how long the caller waits for it.
+//
+// The request itself always gets the whole of askResolveTimeout, on a detached
+// context and on a goroutine of its own. What budget bounds is the waiting,
+// not the retiring.
+//
+// Splitting the two is what lets both promises stand at once. The buttons have
+// to go — a question this call owns is one nothing else will ever go back for,
+// so a request abandoned because the timeout ran out would leave them standing
+// for good. And the timeout covers the whole call, so waiting the request out
+// past the deadline is the one promise every tool makes, broken at the last
+// step. Neither is necessary once the request outlives the wait: the caller
+// returns on time and the channel is tidied behind it.
+//
+// It is still waited for when there is time, because that is the ordinary
+// case: Slack answers in well under the budget, and the owner sees the answer
+// on the question rather than a moment after it.
+func (b *Bridge) resolveWithin(api API, channel, ts, text string, budget time.Duration) {
+	done := b.retireQuestion(api, channel, ts, text)
+	if budget <= 0 {
+		return
+	}
+
+	timeout := time.NewTimer(budget)
+	defer timeout.Stop()
+	select {
+	case <-done:
+	case <-timeout.C:
+		// Still in flight, and it will finish on its own. The caller has what
+		// it was waiting for and a deadline it was given.
 	}
 }
 
-// routeInteraction takes b.mu and hands the click on. It exists so the two
-// loops that read the stream do not have to know how a click is delivered.
-func (b *Bridge) routeInteraction(in Interaction) {
+// retireQuestion sends the chat.update that takes a question's buttons away,
+// and reports when it is over.
+//
+// On a goroutine because it deliberately outlives the call: see resolveWithin.
+// Counted so Close can wait for it, and not counted once Close has started
+// waiting — a count added behind the wait is the one way a WaitGroup can be
+// misused, and a retirement started that late is one the process is not going
+// to wait for anyway.
+func (b *Bridge) retireQuestion(api API, channel, ts, text string) <-chan struct{} {
+	done := make(chan struct{})
+
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.deliverInteraction(in)
+	// Remembered before the request goes out, so a tap on these buttons counts
+	// as stale from the moment the bridge decided they were.
+	b.noteRetiredLocked(ts)
+	counted := !b.retireSealed
+	if counted {
+		b.retiring.Add(1)
+	}
+	b.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		if counted {
+			defer b.retiring.Done()
+		}
+		if err := b.tryResolve(api, channel, ts, text, askResolveTimeout); err != nil {
+			log.Printf("could not retire the question in the channel: %s", logSafe(err.Error(), maxLoggedError))
+		}
+	}()
+	return done
+}
+
+// noteRetiredLocked records a question whose buttons have been sent away,
+// keeping the two most recent. The caller must hold b.mu.
+func (b *Bridge) noteRetiredLocked(ts string) {
+	if ts == "" || ts == b.retiredTS[0] {
+		return
+	}
+	b.retiredTS[1] = b.retiredTS[0]
+	b.retiredTS[0] = ts
+}
+
+// wasRetiredLocked reports whether a click landed on one of those. The caller
+// must hold b.mu.
+//
+// It does not look at the channel: a Slack timestamp is unique within one, and
+// a click from another channel has already been turned away by the time this
+// is asked.
+func (b *Bridge) wasRetiredLocked(ts string) bool {
+	return ts != "" && (ts == b.retiredTS[0] || ts == b.retiredTS[1])
+}
+
+// awaitRetirements waits for the question retirements still in flight, so a
+// process on its way out does not leave live buttons behind for the sake of
+// the moment they had left to run.
+func (b *Bridge) awaitRetirements() {
+	done := make(chan struct{})
+	go func() {
+		b.retiring.Wait()
+		close(done)
+	}()
+
+	timeout := time.NewTimer(shutdownRetireWait)
+	defer timeout.Stop()
+	select {
+	case <-done:
+	case <-timeout.C:
+		log.Printf("gave up waiting for a question's buttons to be taken out of the channel")
+	}
+}
+
+// tryResolve is the request itself, bounded and reported. The caller decides
+// what a failure means.
+func (b *Bridge) tryResolve(api API, channel, ts, text string, budget time.Duration) error {
+	if budget > askResolveTimeout {
+		budget = askResolveTimeout
+	}
+	if budget <= 0 {
+		return context.DeadlineExceeded
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), budget)
+	defer cancel()
+
+	return api.ResolveQuestion(ctx, channel, ts, text)
 }
 
 // deliverInteraction hands a button click to the pending question, if it is
@@ -476,6 +1022,12 @@ func (b *Bridge) routeInteraction(in Interaction) {
 func (b *Bridge) deliverInteraction(in Interaction) {
 	ask := b.ask
 	if ask == nil {
+		return
+	}
+	if ask.generation != b.connGeneration {
+		// The question was asked on a connection that has since been replaced,
+		// and is about to be told so. A click routed by the replacement is not
+		// its answer: it belongs to whatever is asked next.
 		return
 	}
 
@@ -491,6 +1043,20 @@ func (b *Bridge) deliverInteraction(in Interaction) {
 
 	if ask.ts == "" {
 		// The question is posted but its timestamp has not come back yet.
+		//
+		// One stale click can be recognised even here: the question whose
+		// buttons this session has just sent away. That request outlives the
+		// call that made it, so the old buttons can still be tappable while
+		// this question is going up, and taps on them would otherwise fill the
+		// buffer below and push out the click the owner actually meant.
+		//
+		// Only in this window. Once the question has a timestamp of its own,
+		// that timestamp is the authority and the comparison below is the one
+		// that decides.
+		if b.wasRetiredLocked(in.MessageTS) {
+			ask.warn(in)
+			return
+		}
 		// Holding the click keeps it out of the bin until it can be checked
 		// against the message it belongs to; the cap is there because a click
 		// that never matches must not accumulate.

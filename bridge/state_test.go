@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestStoreRoundTrip(t *testing.T) {
@@ -237,4 +238,207 @@ func TestThreadCursorsOnlyMoveForward(t *testing.T) {
 	if got, err := store.MentionCursor(); err != nil || got != "100.000300" {
 		t.Errorf("MentionCursor() = %q (err %v), want it never to go backwards", got, err)
 	}
+}
+
+// A removal that does not reach the disk still has to happen once the
+// conversation is opened again. The reopen was recorded while the removal was
+// in flight, so it carries no mark of its own: if the failed removal is simply
+// dropped, SetThread leaves the cursor of the conversation that was meant to be
+// forgotten, and the bridge comes back reading a dead thread from the middle.
+func TestAFailedRemovalIsCarriedIntoTheReopenBehindIt(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeThread, channel: "C1", threadTS: "100.000100"}
+
+	// The reopen was queued while the removal was being written.
+	b.stateDirty[key] = stateWrite{stateKey: key}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, remove: true}})
+
+	b.mu.Lock()
+	got, ok := b.stateDirty[key]
+	b.mu.Unlock()
+	if !ok {
+		t.Fatalf("stateDirty lost the conversation entirely")
+	}
+	if got.remove {
+		t.Errorf("stateDirty holds a removal, want the later reopen to stand")
+	}
+	if !got.reopened {
+		t.Errorf("stateDirty = %+v, want the reopen marked so the failed removal still happens", got)
+	}
+}
+
+// A failed write with nothing newer behind it goes back as it was.
+func TestAFailedWriteWithNothingNewerIsQueuedAgain(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeLastTS, channel: "C1"}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, ts: "100.000100"}})
+
+	b.mu.Lock()
+	got, ok := b.stateDirty[key]
+	b.mu.Unlock()
+	if !ok || got.ts != "100.000100" {
+		t.Errorf("stateDirty = %+v (present %v), want the failed cursor queued again", got, ok)
+	}
+}
+
+// A cursor that was overtaken while it was being written is not put back: the
+// later one covers it.
+func TestAFailedWriteOvertakenByANewerOneIsDropped(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeLastTS, channel: "C1"}
+	b.stateDirty[key] = stateWrite{stateKey: key, ts: "100.000200"}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, ts: "100.000100"}})
+
+	b.mu.Lock()
+	got := b.stateDirty[key]
+	b.mu.Unlock()
+	if got.ts != "100.000200" {
+		t.Errorf("stateDirty cursor = %q, want the newer one to stand", got.ts)
+	}
+}
+
+// Deciding that a write may start and marking it as started are one step.
+// Checked apart, shutdown could see an idle writer between the two, let go of
+// the lock that keeps another session off the file, and have that write land on
+// top of the new session's.
+func TestAFencedWriterStartsNothingMore(t *testing.T) {
+	b := &Bridge{}
+
+	if !b.beginStateWrite() {
+		t.Fatal("beginStateWrite() = false on a writer nobody has fenced")
+	}
+
+	// Fenced while that write is running: the fence stops the next one, and
+	// shutdown has to wait this one out rather than declare the file idle.
+	b.fenceStateWriter()
+	if b.awaitStateWriteIdle() {
+		t.Error("awaitStateWriteIdle() = true with a write still inside the store")
+	}
+	if b.beginStateWrite() {
+		t.Error("beginStateWrite() = true after the fence; another session may own the file by now")
+	}
+
+	b.endStateWrite()
+	if !b.awaitStateWriteIdle() {
+		t.Error("awaitStateWriteIdle() = false once the write had finished")
+	}
+	if b.beginStateWrite() {
+		t.Error("beginStateWrite() = true after the fence; the fence is for good")
+	}
+}
+
+// A reopen that does not reach the disk carries the removal it stood for. If
+// the next cursor for the same conversation simply replaced it, SetThread would
+// run without clearing the old one and a restart would resume in the dead
+// conversation instead of at the start of the new one.
+func TestAFailedReopenIsCarriedIntoTheCursorBehindIt(t *testing.T) {
+	b := &Bridge{stateDirty: make(map[stateKey]stateWrite), stateWake: make(chan struct{}, 1)}
+	key := stateKey{kind: writeThread, channel: "C1", threadTS: "100.000100"}
+
+	// The first reply in the reopened conversation, queued while the reopen
+	// itself was being written.
+	b.stateDirty[key] = stateWrite{stateKey: key, ts: "100.000200"}
+
+	b.requeueStateWrites([]stateWrite{{stateKey: key, reopened: true}})
+
+	b.mu.Lock()
+	got := b.stateDirty[key]
+	b.mu.Unlock()
+	if got.ts != "100.000200" {
+		t.Errorf("stateDirty cursor = %q, want the later write to stand", got.ts)
+	}
+	if !got.reopened {
+		t.Errorf("stateDirty = %+v, want the reopen it was queued behind carried into it", got)
+	}
+}
+
+// A state file written before the seeded mark existed records that a channel
+// has been looked at only through its cursor. Reading it as unseeded would seed
+// the channel again over a cursor that was already there.
+func TestAChannelWithACursorCountsAsSeeded(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, StateFileName),
+		[]byte(`{"channels":{"C1":{"last_ts":"100.000100"}}}`), 0o600); err != nil {
+		t.Fatalf("writing the old state file: %v", err)
+	}
+
+	store := NewStore(dir)
+	if seeded, err := store.Seeded("C1"); err != nil || !seeded {
+		t.Errorf("Seeded() = %v (err %v), want a channel with a cursor to count as looked at", seeded, err)
+	}
+	if seeded, err := store.Seeded("C2"); err != nil || seeded {
+		t.Errorf("Seeded() = %v (err %v), want a channel nothing is recorded for to count as unseen", seeded, err)
+	}
+}
+
+// Reopening a conversation clears the cursor the old one left behind, and does
+// it in one write. Two writes leave a moment where the file says the
+// conversation does not exist: a process stopping there comes back with the
+// conversation gone and the mention that opened it already behind the cursor.
+func TestResetThreadForgetsTheOldCursorInOneWrite(t *testing.T) {
+	store := NewStore(t.TempDir())
+
+	if err := store.SetThread("C1", "100.000100", "100.000500"); err != nil {
+		t.Fatalf("SetThread() error = %v", err)
+	}
+	if err := store.ResetThread("C1", "100.000100", ""); err != nil {
+		t.Fatalf("ResetThread() error = %v", err)
+	}
+
+	threads, err := store.Threads()
+	if err != nil {
+		t.Fatalf("Threads() error = %v", err)
+	}
+	if len(threads) != 1 {
+		t.Fatalf("Threads() = %+v, want the conversation open once", threads)
+	}
+	if threads[0].LastTS != "" {
+		t.Errorf("thread cursor = %q, want the old conversation's reading forgotten", threads[0].LastTS)
+	}
+}
+
+// The single-instance lock is held until the write that outlasted shutdown has
+// finished, with no deadline: letting go while that write can still rename the
+// file is the one thing the lock is being held for.
+func TestTheLockIsHeldUntilTheLastWriteEnds(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := AcquireLock(dir)
+	if err != nil {
+		t.Fatalf("AcquireLock() error = %v", err)
+	}
+
+	b := &Bridge{}
+	if !b.beginStateWrite() {
+		t.Fatal("beginStateWrite() = false on a writer nobody has fenced")
+	}
+
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		b.releaseWhenWritesEnd(lock)
+	}()
+
+	// While the write is running the lock stays taken, so nobody else may have
+	// this directory.
+	time.Sleep(100 * time.Millisecond)
+	if other, err := AcquireLock(dir); err == nil {
+		_ = other.Release()
+		t.Fatal("another session took the lock while a state file write was still running")
+	}
+
+	b.endStateWrite()
+
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lock was never released after the write finished")
+	}
+	other, err := AcquireLock(dir)
+	if err != nil {
+		t.Fatalf("AcquireLock() after the write finished: %v", err)
+	}
+	_ = other.Release()
 }

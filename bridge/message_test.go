@@ -242,3 +242,32 @@ func TestMergeMessagesHandlesEmptyInput(t *testing.T) {
 		t.Errorf("mergeMessages() = %+v, want messages without a ts dropped", got)
 	}
 }
+
+// The cursor describes how far history has been read, which says nothing about
+// a message the socket delivered. The case that makes it matter is the seed:
+// the cursor is taken from the newest message in the channel, and a message
+// posted while that read was in flight can be older than it.
+func TestALiveMessageIsNotFilteredByTheCursor(t *testing.T) {
+	fetched := []Message{{TS: "100.000200", Text: "read from history"}}
+	live := []Message{{TS: "100.000150", Text: "arrived on the socket"}}
+
+	merged := mergeLive("100.000180", fetched, live)
+
+	if len(merged) != 2 {
+		t.Fatalf("mergeLive() = %+v, want both: the live one is not the channel's past", merged)
+	}
+	if merged[0].TS != "100.000150" || merged[1].TS != "100.000200" {
+		t.Errorf("mergeLive() = %+v, want them in time order", merged)
+	}
+}
+
+// History and the socket both carrying the same message is one message.
+func TestAMessageInBothHistoryAndTheSocketIsMergedOnce(t *testing.T) {
+	same := Message{TS: "100.000200", Text: "said once"}
+
+	merged := mergeLive("100.000100", []Message{same}, []Message{same})
+
+	if len(merged) != 1 {
+		t.Errorf("mergeLive() = %+v, want the message once", merged)
+	}
+}

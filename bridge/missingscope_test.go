@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -211,13 +212,9 @@ func TestALaterConnectionRetriesTheScan(t *testing.T) {
 
 	// The scan that ran seeded its cursor, which is what makes the next one a
 	// search: proof it got as far as succeeding rather than being skipped.
-	cursor, err := NewStore(stateDir).MentionCursor()
-	if err != nil {
-		t.Fatalf("reading the mention cursor: %v", err)
-	}
-	if cursor == "" {
-		t.Error("the mention cursor is still unset, so the scan did not complete on the new connection")
-	}
+	eventuallyOnDisk(t, "the scan's cursor to reach the state file", func() bool {
+		return storedMentionCursor(stateDir) != ""
+	})
 }
 
 // Catch-up runs with the lock released, so a slow one can outlive the
@@ -283,7 +280,7 @@ func TestAStaleDrainDoesNotClearTheNewConnectionsCatchUp(t *testing.T) {
 	b.needCatchUp = true
 	b.mu.Unlock()
 
-	if _, err := b.drainCatchUp(ctx); err != nil {
+	if _, _, err := b.drainCatchUp(ctx, b.currentGeneration(), true, time.Second); err != nil {
 		t.Fatalf("drainCatchUp() error = %v", err)
 	}
 
